@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+
+# Go
+*.test
+*.out
+coverage/
+dist/
+
+# Node
+node_modules/
+*.tsbuildinfo
+.astro/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.auto.tfvars.example
+.terraform.lock.hcl
+
+# Env & secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!testdata/**/*.pem
+!testdata/**/*.key
+
+# Editors
+.idea/
+.vscode/
