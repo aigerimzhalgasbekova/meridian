@@ -1,0 +1,9 @@
+{{define "reauth.html"}}<!doctype html>
+<meta charset="utf-8">
+<title>bridge — confirm it's you</title>
+<h1>Confirm it's you</h1>
+<p>Linking a new provider requires a recent sign-in, and yours has aged out.
+Re-authenticate with <strong>{{.Provider}}</strong> first, then retry the
+link.</p>
+<p><a href="/login/{{.Provider}}">Sign in again with {{.Provider}}</a></p>
+{{end}}

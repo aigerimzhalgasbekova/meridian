@@ -1,0 +1,36 @@
+{{define "account.html"}}<!doctype html>
+<meta charset="utf-8">
+<title>bridge — account</title>
+<h1>{{.Identity.Name}}</h1>
+<p>{{.Identity.Email}} · bridge id <code>{{.Identity.ID}}</code></p>
+
+<h2>Linked accounts</h2>
+<ul>
+{{range .Links}}<li><strong>{{.Provider}}</strong> — {{.Email}} (subject <code>{{.Subject}}</code>)</li>{{end}}
+</ul>
+
+{{if .Linkable}}
+<h2>Link another provider</h2>
+{{if .CanLink}}
+{{range .Linkable}}
+  <form method="post" action="/link/{{.Name}}">
+    <button {{if not .Healthy}}disabled{{end}}>Link {{.DisplayName}}{{if not .Healthy}} (unavailable){{end}}</button>
+  </form>
+{{end}}
+{{else}}
+<p>Linking requires a recent sign-in. <a href="/">Sign in again</a> to link a provider.</p>
+{{end}}
+{{end}}
+
+{{if .Collisions}}
+<h2>Possible duplicate identities</h2>
+<p>Other identities here share your email address. Bridge never merges accounts
+automatically — if one of these is you, sign in to it and link your providers
+explicitly.</p>
+<ul>
+{{range .Collisions}}<li><code>{{.ID}}</code> — {{.Email}}</li>{{end}}
+</ul>
+{{end}}
+
+<form method="post" action="/logout"><button>Sign out</button></form>
+{{end}}
