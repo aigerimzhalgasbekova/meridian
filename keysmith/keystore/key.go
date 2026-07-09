@@ -4,15 +4,15 @@
 // The rotation model is a four-state machine designed so that verifiers never
 // see a token signed by a key they haven't had a chance to learn:
 //
-//	pending ──(dwell elapsed)──► active ──(new key promoted)──► retiring ──(verify window elapsed)──► retired
+//		pending ──(dwell elapsed)──► active ──(new key promoted)──► retiring ──(verify window elapsed)──► retired
 //
-//   - pending: published in the JWKS but never signs. Exists so that every
-//     downstream JWKS cache can pick the key up before the first token is
-//     signed with it. The dwell time must exceed the JWKS cache TTL.
-//   - active: the one key per algorithm that signs new tokens.
-//   - retiring: no longer signs, still published for verification until every
-//     token it could have signed has expired.
-//   - retired: unpublished; private material retained (encrypted) for audit.
+//	  - pending: published in the JWKS but never signs. Exists so that every
+//	    downstream JWKS cache can pick the key up before the first token is
+//	    signed with it. The dwell time must exceed the JWKS cache TTL.
+//	  - active: the one key per algorithm that signs new tokens.
+//	  - retiring: no longer signs, still published for verification until every
+//	    token it could have signed has expired.
+//	  - retired: unpublished; private material retained (encrypted) for audit.
 package keystore
 
 import (
