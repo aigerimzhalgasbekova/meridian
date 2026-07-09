@@ -1,0 +1,160 @@
+package store
+
+// The Lua scripts below are the only writers of session state. Each one runs
+// atomically inside Redis, which is what makes multi-node check-and-act
+// sequences safe: two nodes racing the same user's cap, or a touch racing a
+// revoke, serialize on the single point of truth instead of interleaving.
+//
+// The clock ("now") is always passed in from the caller rather than read via
+// redis TIME: it keeps the scripts deterministic under test (fake clocks,
+// miniredis FastForward) and pins expiry decisions to one clock per call.
+//
+// Session keys are derived inside create/revoke-user scripts ("sess:" .. id),
+// which is fine on a single Redis but would break cluster key hashing.
+// ponytail: single-node Redis assumed; hash-tag the keys if cluster ever matters.
+
+import "github.com/redis/go-redis/v9"
+
+// createScript enforces the per-user concurrent session cap and writes the
+// new session in one atomic step.
+//
+//	KEYS[1] = user index ZSET
+//	ARGV    = now_ms, idle_ttl_ms, deadline_ms, max, policy, id, uid, realm, ip, ua
+//
+// Returns the array of evicted session IDs (possibly empty), or the string
+// "LIMIT" when policy=reject and the user is at the cap.
+var createScript = redis.NewScript(`
+-- Prune index members whose session keys have already expired, so the cap
+-- counts live sessions only.
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+local live = {}
+for _, m in ipairs(members) do
+  if redis.call('EXISTS', 'sess:' .. m) == 1 then
+    live[#live + 1] = m
+  else
+    redis.call('ZREM', KEYS[1], m)
+  end
+end
+
+local max = tonumber(ARGV[4])
+local evicted = {}
+if #live >= max then
+  if ARGV[5] == 'reject' then
+    return 'LIMIT'
+  end
+  -- evict-oldest: ZRANGE is score-ascending, so live[] is oldest-first.
+  local need = #live - max + 1
+  for i = 1, need do
+    redis.call('DEL', 'sess:' .. live[i])
+    redis.call('ZREM', KEYS[1], live[i])
+    evicted[#evicted + 1] = live[i]
+  end
+end
+
+local now = tonumber(ARGV[1])
+local deadline = tonumber(ARGV[3])
+local key = 'sess:' .. ARGV[6]
+redis.call('HSET', key,
+  'uid', ARGV[7], 'realm', ARGV[8], 'ip', ARGV[9], 'ua', ARGV[10],
+  'created_ms', ARGV[1], 'seen_ms', ARGV[1], 'deadline_ms', ARGV[3])
+
+-- Sliding idle TTL, clamped so the key can never outlive its absolute deadline.
+local ttl = tonumber(ARGV[2])
+if deadline - now < ttl then ttl = deadline - now end
+redis.call('PEXPIRE', key, ttl)
+
+-- Index the session; deadlines grow with creation time, so this session's
+-- deadline is an upper bound on the whole index's useful life.
+redis.call('ZADD', KEYS[1], now, ARGV[6])
+redis.call('PEXPIRE', KEYS[1], deadline - now)
+return evicted
+`)
+
+// touchScript validates and renews a session in one atomic step.
+//
+//	KEYS[1] = session hash
+//	ARGV    = now_ms, idle_ttl_ms
+//
+// Returns the full session hash (flat field/value array) on success, or an
+// empty array if the session is missing or past its absolute deadline. The
+// deadline re-check matters: the key TTL is clamped at write time, but only
+// this check protects against a node whose clock ran ahead when it last
+// touched, or a Redis restore with stale TTLs.
+var touchScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
+local now = tonumber(ARGV[1])
+local deadline = tonumber(redis.call('HGET', KEYS[1], 'deadline_ms'))
+if now >= deadline then
+  redis.call('DEL', KEYS[1])
+  return {}
+end
+redis.call('HSET', KEYS[1], 'seen_ms', ARGV[1])
+local ttl = tonumber(ARGV[2])
+if deadline - now < ttl then ttl = deadline - now end
+redis.call('PEXPIRE', KEYS[1], ttl)
+return redis.call('HGETALL', KEYS[1])
+`)
+
+// rotateScript implements rotate-on-privilege-change: the old session ID dies
+// and a new one takes over its identity in the same atomic step, so there is
+// no window where both (fixation) or neither (dropped session) are valid.
+// created_ms and deadline_ms carry over — rotation never extends a lifetime.
+//
+//	KEYS[1] = old session hash, KEYS[2] = new session hash
+//	ARGV    = now_ms, idle_ttl_ms, old_id, new_id, ip, ua
+//
+// Returns the new session hash (flat array), or an empty array if the old
+// session is missing or expired.
+var rotateScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
+local now = tonumber(ARGV[1])
+local deadline = tonumber(redis.call('HGET', KEYS[1], 'deadline_ms'))
+local uid = redis.call('HGET', KEYS[1], 'uid')
+local realm = redis.call('HGET', KEYS[1], 'realm')
+local created = redis.call('HGET', KEYS[1], 'created_ms')
+local userkey = 'usersess:' .. realm .. ':' .. uid .. ':sessions'
+redis.call('DEL', KEYS[1])
+redis.call('ZREM', userkey, ARGV[3])
+if now >= deadline then return {} end
+
+redis.call('HSET', KEYS[2],
+  'uid', uid, 'realm', realm, 'ip', ARGV[5], 'ua', ARGV[6],
+  'created_ms', created, 'seen_ms', ARGV[1], 'deadline_ms', tostring(deadline))
+local ttl = tonumber(ARGV[2])
+if deadline - now < ttl then ttl = deadline - now end
+redis.call('PEXPIRE', KEYS[2], ttl)
+-- Keep the original creation time as the score so eviction order is by
+-- session age, not rotation time.
+redis.call('ZADD', userkey, tonumber(created), ARGV[4])
+return redis.call('HGETALL', KEYS[2])
+`)
+
+// revokeScript deletes one session and its index entry atomically. The user
+// key is derived from the record because callers may only know the ID.
+//
+//	KEYS[1] = session hash
+//	ARGV    = id
+var revokeScript = redis.NewScript(`
+local uid = redis.call('HGET', KEYS[1], 'uid')
+if not uid then return 0 end
+local realm = redis.call('HGET', KEYS[1], 'realm')
+redis.call('DEL', KEYS[1])
+redis.call('ZREM', 'usersess:' .. realm .. ':' .. uid .. ':sessions', ARGV[1])
+return 1
+`)
+
+// revokeUserScript deletes every session of a user atomically (global
+// logout), so a concurrent create cannot slip a session between the read of
+// the index and the deletes.
+//
+//	KEYS[1] = user index ZSET
+//
+// Returns the revoked session IDs.
+var revokeUserScript = redis.NewScript(`
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+for _, m in ipairs(members) do
+  redis.call('DEL', 'sess:' .. m)
+end
+redis.call('DEL', KEYS[1])
+return members
+`)
