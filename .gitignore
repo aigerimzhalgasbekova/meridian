@@ -32,3 +32,4 @@ node_modules/
 # Editors
 .idea/
 .vscode/
+__pycache__/
