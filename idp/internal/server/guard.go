@@ -23,10 +23,10 @@ type window struct {
 }
 
 const (
-	guardWindow      = 15 * time.Minute
-	guardMaxUser     = 10 // failures per username per window
-	guardMaxIP       = 50 // failures per IP per window (many users behind NAT)
-	guardMaxTracked  = 100_000
+	guardWindow     = 15 * time.Minute
+	guardMaxUser    = 10 // failures per username per window
+	guardMaxIP      = 50 // failures per IP per window (many users behind NAT)
+	guardMaxTracked = 100_000
 )
 
 // NewLocalGuard builds a LocalGuard with an injectable clock.

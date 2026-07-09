@@ -36,7 +36,7 @@ func TestHashIsSalted(t *testing.T) {
 func TestVerifyRejectsMalformed(t *testing.T) {
 	for _, bad := range []string{
 		"", "notahash", "$argon2id$v=19$m=1024$onlyfourfields",
-		"$argon2i$v=19$m=1024,t=1,p=1$c2FsdA$aGFzaA", // wrong variant
+		"$argon2i$v=19$m=1024,t=1,p=1$c2FsdA$aGFzaA",  // wrong variant
 		"$argon2id$v=18$m=1024,t=1,p=1$c2FsdA$aGFzaA", // wrong version
 		"$argon2id$v=19$m=x,t=1,p=1$c2FsdA$aGFzaA",    // unparseable params
 	} {
