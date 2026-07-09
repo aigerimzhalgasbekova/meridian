@@ -1,0 +1,17 @@
+{{define "home.html"}}<!doctype html>
+<meta charset="utf-8">
+<title>bridge — sign in</title>
+<h1>Sign in</h1>
+{{if .SignedIn}}<p>You are signed in. <a href="/account">Your account</a></p>{{end}}
+<ul>
+{{range .Providers}}
+  <li>
+    {{if .Healthy}}
+      <a href="/login/{{.Name}}{{if $.App}}?app={{$.App}}{{end}}">Continue with {{.DisplayName}}</a>
+    {{else}}
+      <span>{{.DisplayName}} — temporarily unavailable</span>
+    {{end}}
+  </li>
+{{end}}
+</ul>
+{{end}}

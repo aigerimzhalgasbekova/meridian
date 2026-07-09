@@ -1,0 +1,15 @@
+{{define "unavailable.html"}}<!doctype html>
+<meta charset="utf-8">
+<title>bridge — provider unavailable</title>
+<h1>{{.Provider}} is temporarily unavailable</h1>
+<p>Sign-in through this provider is failing right now, so bridge is not going
+to make you wait on it.</p>
+{{if .Alternates}}
+<p>These providers are healthy:</p>
+<ul>
+{{range .Alternates}}<li><a href="/login/{{.Name}}">Continue with {{.DisplayName}}</a></li>{{end}}
+</ul>
+{{else}}
+<p>No alternate providers are available. Try again in a minute.</p>
+{{end}}
+{{end}}
