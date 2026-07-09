@@ -32,12 +32,12 @@ type Client struct {
 	httpc       *http.Client
 	now         func() time.Time
 
-	mu         sync.RWMutex
-	keys       *jose.KeySet
-	etag       string
-	fetchedAt  time.Time
-	maxAge     time.Duration
-	refreshing bool
+	mu        sync.RWMutex
+	keys      *jose.KeySet
+	rawJWKS   []byte
+	etag      string
+	fetchedAt time.Time
+	maxAge    time.Duration
 }
 
 // Option configures the client.
@@ -195,6 +195,7 @@ func (c *Client) forceRefresh(ctx context.Context) (*jose.KeySet, error) {
 			return nil, err
 		}
 		c.keys = set
+		c.rawJWKS = raw
 		c.etag = resp.Header.Get("ETag")
 		c.fetchedAt = c.now()
 		c.maxAge = parseMaxAge(resp.Header.Get("Cache-Control"), 5*time.Minute)
@@ -202,6 +203,20 @@ func (c *Client) forceRefresh(ctx context.Context) (*jose.KeySet, error) {
 	default:
 		return nil, fmt.Errorf("keysmith client: jwks fetch: %s", resp.Status)
 	}
+}
+
+// RawJWKS returns the cached JWKS document bytes (refreshing if stale),
+// for services that re-publish the key set under their own endpoint.
+func (c *Client) RawJWKS(ctx context.Context) ([]byte, error) {
+	if _, err := c.keySet(ctx); err != nil {
+		return nil, err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.rawJWKS == nil {
+		return nil, ErrNoKeys
+	}
+	return c.rawJWKS, nil
 }
 
 func parseMaxAge(cacheControl string, fallback time.Duration) time.Duration {
