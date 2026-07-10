@@ -10,11 +10,11 @@ summary: idp — the RFC map, refresh-family reuse detection, single-statement a
 
 The coverage: RFC 6749 (core grants, with exact §5.2 error semantics), 6750 (bearer usage and `WWW-Authenticate`), 7636 (PKCE, S256 only — `plain` is rejected), 7662 (introspection), 7009 (revocation), 8414 + OIDC Discovery (per-realm metadata), 8628 (device flow), 7591 (dynamic registration, admin-gated), OIDC Core (ID tokens, userinfo, nonce, `auth_time`, `max_age`, consent), and RFC 9700, the OAuth 2.0 Security BCP.
 
-Just as important is what's absent. The implicit grant ("SHOULD NOT be used" — tokens in URL fragments leak via history and referrers) and the resource-owner password grant ("MUST NOT be used" — the client handling the user's password defeats delegated authorization entirely) are deliberately not implemented ([ADR 0002](https://github.com/aikazzh/portfolio/blob/main/idp/docs/adr/0002-no-implicit-no-ropc.md)). Implementing a grant the security BCP tells you to remove isn't completeness; it's a liability a reviewer should flag. The discovery document advertises only the supported grants, so clients can't even attempt the others.
+Just as important is what's absent. The implicit grant ("SHOULD NOT be used" — tokens in URL fragments leak via history and referrers) and the resource-owner password grant ("MUST NOT be used" — the client handling the user's password defeats delegated authorization entirely) are deliberately not implemented ([ADR 0002](https://github.com/aigerimzhalgasbekova/meridian/blob/main/idp/docs/adr/0002-no-implicit-no-ropc.md)). Implementing a grant the security BCP tells you to remove isn't completeness; it's a liability a reviewer should flag. The discovery document advertises only the supported grants, so clients can't even attempt the others.
 
 ## Refresh families and reuse detection
 
-Refresh tokens are long-lived credentials; if one leaks, the attacker mints access tokens until it expires. idp's containment ([ADR 0003](https://github.com/aikazzh/portfolio/blob/main/idp/docs/adr/0003-refresh-rotation.md)):
+Refresh tokens are long-lived credentials; if one leaks, the attacker mints access tokens until it expires. idp's containment ([ADR 0003](https://github.com/aigerimzhalgasbekova/meridian/blob/main/idp/docs/adr/0003-refresh-rotation.md)):
 
 - Tokens are opaque 256-bit random values, stored only as SHA-256 hashes, **rotated on every use**.
 - All generations descended from one authorization share a `family_id`, whose absolute lifetime is fixed at first issuance — rotation never extends it.
@@ -44,7 +44,7 @@ The server suite drives complete browser flows: fetch the login page, scrape the
 
 The problem: `return_to` is a URL with query parameters, rendered into an HTML attribute by Go's `html/template` — which correctly entity-escapes it, turning `&` into `&amp;`. The regex captured the *escaped* form, and the tests submitted `return_to=/realms/test/authorize?client_id=web-app&amp;redirect_uri=...` — a value no browser would ever send, because browsers HTML-decode attribute values before form submission. The tests were exercising a request flow that doesn't exist in reality, and failing (or worse, passing) for the wrong reasons.
 
-The fix is two lines in the harness, with the reasoning in the comment ([`testenv_test.go`](https://github.com/aikazzh/portfolio/blob/main/idp/internal/server/testenv_test.go)):
+The fix is two lines in the harness, with the reasoning in the comment ([`testenv_test.go`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/idp/internal/server/testenv_test.go)):
 
 ```go
 // A browser HTML-decodes attribute values before submitting them.
@@ -59,6 +59,6 @@ The general lesson: when you test a browser-mediated flow below the level of a r
 
 ## What to read
 
-[`internal/server/token.go`](https://github.com/aikazzh/portfolio/blob/main/idp/internal/server/token.go) for the §5.2 error discipline; [`internal/storage/postgres/stores.go`](https://github.com/aikazzh/portfolio/blob/main/idp/internal/storage/postgres/stores.go) for the single-statement stores; the [threat model](https://github.com/aikazzh/portfolio/blob/main/idp/THREAT_MODEL.md) for the full 14-row abuse-case table.
+[`internal/server/token.go`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/idp/internal/server/token.go) for the §5.2 error discipline; [`internal/storage/postgres/stores.go`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/idp/internal/storage/postgres/stores.go) for the single-statement stores; the [threat model](https://github.com/aigerimzhalgasbekova/meridian/blob/main/idp/THREAT_MODEL.md) for the full 14-row abuse-case table.
 
 **Verified by:** 98 tests under `-race` against the memory store with a real in-process keysmith; the same flows against Postgres under `-tags integration`.

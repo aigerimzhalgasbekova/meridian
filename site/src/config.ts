@@ -1,7 +1,7 @@
 // Central link configuration. When the platform is deployed to AWS, fill in
 // the demo URLs here — nothing else in the site needs to change.
 
-export const GITHUB_REPO = 'https://github.com/aikazzh/portfolio';
+export const GITHUB_REPO = 'https://github.com/aigerimzhalgasbekova/meridian';
 
 /** Path within the monorepo → full GitHub URL (tree = directory, blob = file). */
 export const repoTree = (path: string) => `${GITHUB_REPO}/tree/main/${path}`;
@@ -23,5 +23,5 @@ export const demoUrls: Record<string, string | null> = {
 
 export const AUTHOR = {
   name: 'aikazzh',
-  github: 'https://github.com/aikazzh',
+  github: 'https://github.com/aigerimzhalgasbekova',
 };

@@ -13,20 +13,20 @@ rate limit ──► lockout ──► risk score ──► decision ──► a
 
 ## Rate limiting: the algorithm choice is the threat model
 
-The requirements ([ADR 0001](https://github.com/aikazzh/portfolio/blob/main/sentinel/docs/adr/0001-sliding-window-counter.md)): O(1) memory per key across millions of keys, no boundary-burst artifact, an honest `Retry-After`, and state that maps onto Redis primitives for multi-instance sharing. Each rejected candidate fails one of these in an instructive way. Fixed windows admit 2× the limit around a boundary — unacceptable for a brute-force gate. A sliding log is exact but O(requests) per key, which means **an attacker inflates your memory by hammering you** — the defense inverted into a vulnerability. Token buckets are fine but need a Lua-wrapped read-modify-write and a second bucket for burst policy anyway.
+The requirements ([ADR 0001](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sentinel/docs/adr/0001-sliding-window-counter.md)): O(1) memory per key across millions of keys, no boundary-burst artifact, an honest `Retry-After`, and state that maps onto Redis primitives for multi-instance sharing. Each rejected candidate fails one of these in an instructive way. Fixed windows admit 2× the limit around a boundary — unacceptable for a brute-force gate. A sliding log is exact but O(requests) per key, which means **an attacker inflates your memory by hammering you** — the defense inverted into a vulnerability. Token buckets are fine but need a Lua-wrapped read-modify-write and a second bucket for burst policy anyway.
 
 The sliding-window counter keeps two integers per key (current + previous window) and estimates the effective count as `cur + prev × overlap_fraction`. Bounded error, and the state maps to Redis `INCR` + `EXPIRE` — the cheapest atomic primitives there are. Burst control is the same mechanism over a shorter window. Two honest details: `Retry-After` is computed by inverting the weighted formula rather than guessing, and denied requests still increment counters — hammering past your limit keeps you limited.
 
 ## Lockout that can't be turned against the victim
 
-Brute-force lockout has a classic failure mode: anyone who knows a victim's username can fail five logins on purpose and lock them out — repeatedly, forever, for free. NIST SP 800-63B warns about exactly this. [ADR 0002](https://github.com/aikazzh/portfolio/blob/main/sentinel/docs/adr/0002-lockout-anti-dos.md)'s design tracks failures in two independent dimensions with **asymmetric caps**:
+Brute-force lockout has a classic failure mode: anyone who knows a victim's username can fail five logins on purpose and lock them out — repeatedly, forever, for free. NIST SP 800-63B warns about exactly this. [ADR 0002](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sentinel/docs/adr/0002-lockout-anti-dos.md)'s design tracks failures in two independent dimensions with **asymmetric caps**:
 
 - **Per-account:** 5 failures → 1 minute, doubling, **capped at 15 minutes**.
 - **Per-IP:** same escalation, **capped at 24 hours**.
 
 The asymmetry is the point. The account dimension is attacker-controlled — unbounded escalation there converts lockout into a victim-DoS weapon, so the cap bounds the worst case at "victim inconvenienced", never "victim bricked", while still reducing online guessing to ~20 attempts/hour/account. The IP dimension only ever locks the attacker's own address, so it can escalate hard. Each dimension covers the other's blind spot: IP-only tracking misses a botnet focusing one victim; account-only tracking misses one host spraying many accounts.
 
-The residual gap is documented, not hidden: a distributed attacker can re-lock one account at the cap indefinitely, and *longer lockouts make that worse, not better*. The fix is a different control — `Tracker.ChallengeHook` is the seam for switching repeat offenders to CAPTCHA/step-up/notify instead of more lockout. Two more properties from the [threat model](https://github.com/aikazzh/portfolio/blob/main/sentinel/THREAT_MODEL.md): a success landing during a lockout does not unlock (a stolen password isn't a free pass), and `Check` does identical work locked or not, because a distinguishable locked-account response is a username oracle.
+The residual gap is documented, not hidden: a distributed attacker can re-lock one account at the cap indefinitely, and *longer lockouts make that worse, not better*. The fix is a different control — `Tracker.ChallengeHook` is the seam for switching repeat offenders to CAPTCHA/step-up/notify instead of more lockout. Two more properties from the [threat model](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sentinel/THREAT_MODEL.md): a success landing during a lockout does not unlock (a stolen password isn't a free pass), and `Check` does identical work locked or not, because a distinguishable locked-account response is a username oracle.
 
 ## Risk: deterministic and explainable
 
@@ -34,7 +34,7 @@ The risk stage only chooses between allow/challenge/deny when both hard gates pa
 
 ## The audit chain
 
-Every decision lands in an append-only log where each record embeds the hash of everything before it ([ADR 0003](https://github.com/aikazzh/portfolio/blob/main/sentinel/docs/adr/0003-hash-chained-audit.md)):
+Every decision lands in an append-only log where each record embeds the hash of everything before it ([ADR 0003](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sentinel/docs/adr/0003-hash-chained-audit.md)):
 
 ```go
 // hashRecord computes hex(SHA-256(prev hash hex || canonical JSON)).
@@ -52,6 +52,6 @@ The honest limit is documented in the ADR itself: a hash chain is tamper-*eviden
 
 ## Reading list
 
-[`audit/audit.go`](https://github.com/aikazzh/portfolio/blob/main/sentinel/audit/audit.go) — the canonical encoder and chain walker. [`tools/compliance/verify_chain.py`](https://github.com/aikazzh/portfolio/blob/main/sentinel/tools/compliance/verify_chain.py) — the independent verifier. [`lockout/`](https://github.com/aikazzh/portfolio/tree/main/sentinel/lockout) — the two-dimension tracker.
+[`audit/audit.go`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sentinel/audit/audit.go) — the canonical encoder and chain walker. [`tools/compliance/verify_chain.py`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sentinel/tools/compliance/verify_chain.py) — the independent verifier. [`lockout/`](https://github.com/aigerimzhalgasbekova/meridian/tree/main/sentinel/lockout) — the two-dimension tracker.
 
 **Verified by:** 59 Go tests under `-race` plus 11 Python tests; `tools/compliance/report.py` re-verifies chain integrity before reporting and exits non-zero on a tampered log.

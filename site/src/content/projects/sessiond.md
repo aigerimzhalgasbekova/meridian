@@ -13,7 +13,7 @@ Distributed browser sessions: opaque tokens whose SHA-256 hashes live in Redis, 
 
 ## The architectural challenge
 
-Any per-node cache reintroduces exactly the problem sessions exist to solve: a revoked session must die *everywhere*. And Redis pub/sub — the obvious invalidation transport — is fire-and-forget; a design that needs delivery for correctness is broken the day it ships. sessiond's answer ([ADR 0003](https://github.com/aikazzh/portfolio/blob/main/sessiond/docs/adr/0003-pubsub-invalidation-bounded-cache.md)) is a consistency argument that never mentions pub/sub:
+Any per-node cache reintroduces exactly the problem sessions exist to solve: a revoked session must die *everywhere*. And Redis pub/sub — the obvious invalidation transport — is fire-and-forget; a design that needs delivery for correctness is broken the day it ships. sessiond's answer ([ADR 0003](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sessiond/docs/adr/0003-pubsub-invalidation-bounded-cache.md)) is a consistency argument that never mentions pub/sub:
 
 1. Redis is the single point of truth; the Lua scripts are its only writers. The cache never writes back.
 2. Every cache entry self-expires after `CacheTTL` (default 2s).
@@ -23,8 +23,8 @@ Pub/sub only tightens "≤ 2s" to "milliseconds". Because it's an optimization, 
 
 ## Key design decisions
 
-- **[ADR 0001 — opaque tokens, not JWTs.](https://github.com/aikazzh/portfolio/blob/main/sessiond/docs/adr/0001-opaque-tokens-not-jwt.md)** Every hard requirement of sessions — logout-now, concurrent-session limits, sliding expiry — is a statement about server-side state. Once that state exists, a JWT's one advantage evaporates and its costs remain. Redis stores only SHA-256 hashes, so a snapshot or read-only compromise yields nothing presentable.
-- **[ADR 0002 — one Lua script per check-and-act sequence.](https://github.com/aikazzh/portfolio/blob/main/sessiond/docs/adr/0002-lua-scripts-for-atomicity.md)** Create-under-cap, touch-with-deadline-check, rotate, revoke: each is a single atomic script, so races between nodes don't narrow — they cease to exist. The clock is always passed in as an argument, so tests drive a fake clock in lockstep with miniredis.
+- **[ADR 0001 — opaque tokens, not JWTs.](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sessiond/docs/adr/0001-opaque-tokens-not-jwt.md)** Every hard requirement of sessions — logout-now, concurrent-session limits, sliding expiry — is a statement about server-side state. Once that state exists, a JWT's one advantage evaporates and its costs remain. Redis stores only SHA-256 hashes, so a snapshot or read-only compromise yields nothing presentable.
+- **[ADR 0002 — one Lua script per check-and-act sequence.](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sessiond/docs/adr/0002-lua-scripts-for-atomicity.md)** Create-under-cap, touch-with-deadline-check, rotate, revoke: each is a single atomic script, so races between nodes don't narrow — they cease to exist. The clock is always passed in as an argument, so tests drive a fake clock in lockstep with miniredis.
 
 ```lua
 -- touchScript: validate + renew atomically; the deadline re-check protects
@@ -42,7 +42,7 @@ end
 
 ## Security highlights
 
-From the [threat model](https://github.com/aikazzh/portfolio/blob/main/sessiond/THREAT_MODEL.md): missing, expired, and revoked sessions are one indistinguishable `404` — the API is deliberately not a validity oracle; rotation kills the old ID and writes the new one in the same script, so there's no fixation window; API tokens are hashed then compared in constant time, and zero configured tokens fails closed (503), never open; realm and user IDs pass an allowlist before being spliced into Redis keys; only truncated UA fingerprints are stored, not raw strings.
+From the [threat model](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sessiond/THREAT_MODEL.md): missing, expired, and revoked sessions are one indistinguishable `404` — the API is deliberately not a validity oracle; rotation kills the old ID and writes the new one in the same script, so there's no fixation window; API tokens are hashed then compared in constant time, and zero configured tokens fails closed (503), never open; realm and user IDs pass an allowlist before being spliced into Redis keys; only truncated UA fingerprints are stored, not raw strings.
 
 ## Verified by
 
@@ -51,5 +51,5 @@ From the [threat model](https://github.com/aikazzh/portfolio/blob/main/sessiond/
 
 ## Code worth reading
 
-- [`internal/store/scripts.go`](https://github.com/aikazzh/portfolio/blob/main/sessiond/internal/store/scripts.go) — all five Lua scripts, each 10–30 lines with its invariant stated in the comment.
-- [`internal/store/`](https://github.com/aikazzh/portfolio/tree/main/sessiond/internal/store) — the bounded cache and pub/sub listener.
+- [`internal/store/scripts.go`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/sessiond/internal/store/scripts.go) — all five Lua scripts, each 10–30 lines with its invariant stated in the comment.
+- [`internal/store/`](https://github.com/aigerimzhalgasbekova/meridian/tree/main/sessiond/internal/store) — the bounded cache and pub/sub listener.

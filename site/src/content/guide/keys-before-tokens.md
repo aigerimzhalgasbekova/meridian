@@ -21,7 +21,7 @@ pending → active → retiring → retired
 - **retiring** — demoted, still published for `RetireAfter`.
 - **retired** — unpublished; ciphertext retained for audit.
 
-A new key is *published before it ever signs*, and a demoted key *stays published until every token it signed has expired*. What makes this airtight rather than aspirational is that the two timing invariants are enforced at construction ([ADR 0003](https://github.com/aikazzh/portfolio/blob/main/keysmith/docs/adr/0003-rotation-state-machine.md)):
+A new key is *published before it ever signs*, and a demoted key *stays published until every token it signed has expired*. What makes this airtight rather than aspirational is that the two timing invariants are enforced at construction ([ADR 0003](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/docs/adr/0003-rotation-state-machine.md)):
 
 1. `JWKSMaxAge ≤ PendingDwell / 2` — every verifier cache must expire and refresh, picking up the pending key, before that key can start signing.
 2. `MaxTokenTTL ≤ RetireAfter` — no token can outlive its key's publication window.
@@ -32,11 +32,11 @@ Everything is driven by an idempotent `Tick()`: cold-start bootstrap, pre-rotati
 
 ## The JOSE layer: owning the protocol, not the crypto
 
-The most questioned decision in the repo ([ADR 0001](https://github.com/aikazzh/portfolio/blob/main/keysmith/docs/adr/0001-minimal-jose-implementation.md)): keysmith implements JWS compact serialization, JWT claims validation, and JWK/JWKS handling itself — about 600 lines — instead of importing `go-jose` or `golang-jwt`.
+The most questioned decision in the repo ([ADR 0001](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/docs/adr/0001-minimal-jose-implementation.md)): keysmith implements JWS compact serialization, JWT claims validation, and JWK/JWKS handling itself — about 600 lines — instead of importing `go-jose` or `golang-jwt`.
 
 "Don't roll your own crypto" applies to primitives, and no primitive is implemented here: signing and verification are one-call stdlib operations over `crypto/ed25519`, `crypto/ecdsa`, `crypto/rsa`. What the package owns is the *protocol* layer — parsing, serialization, policy — which is precisely where most real-world JWT vulnerabilities have lived: `alg: none` acceptance (CVE-2015-9235), RS256→HS256 key confusion (CVE-2016-5431, possible only because the library lets token input choose the algorithm family), embedded `jwk` header trust (CVE-2018-0114), `jku`/`x5u` dereference bugs.
 
-Owning the layer deletes those degrees of freedom structurally. From [`jose/jws.go`](https://github.com/aikazzh/portfolio/blob/main/keysmith/jose/jws.go):
+Owning the layer deletes those degrees of freedom structurally. From [`jose/jws.go`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/jose/jws.go):
 
 ```go
 dec := json.NewDecoder(strings.NewReader(string(rawHeader)))
@@ -64,7 +64,7 @@ Each historical CVE class is a permanent regression test (`TestKnownAttackPatter
 
 ## Envelope encryption with a KMS-shaped seam
 
-Signing keys must survive restarts, so they're persisted — and a leaked keystore file must be useless. [ADR 0002](https://github.com/aikazzh/portfolio/blob/main/keysmith/docs/adr/0002-envelope-encryption.md) uses a two-level envelope: each private key is encrypted with its own random 256-bit DEK under AES-256-GCM, and only the DEK is wrapped by a KEK behind a two-method interface — `Wrap`/`Unwrap` — which is exactly the shape of a cloud KMS API. The local 32-byte master-key implementation is the dev posture; AWS KMS is a drop-in at deployment, and rotating the KEK re-wraps a few dozen bytes per key, never the key material.
+Signing keys must survive restarts, so they're persisted — and a leaked keystore file must be useless. [ADR 0002](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/docs/adr/0002-envelope-encryption.md) uses a two-level envelope: each private key is encrypted with its own random 256-bit DEK under AES-256-GCM, and only the DEK is wrapped by a KEK behind a two-method interface — `Wrap`/`Unwrap` — which is exactly the shape of a cloud KMS API. The local 32-byte master-key implementation is the dev posture; AWS KMS is a drop-in at deployment, and rotating the KEK re-wraps a few dozen bytes per key, never the key material.
 
 The detail worth stealing: the GCM AAD binds each ciphertext to its key ID and algorithm. An attacker with file-write access who reorders records doesn't get key substitution — they get a detected integrity failure (`TestFileStoreTamperDetection`).
 
