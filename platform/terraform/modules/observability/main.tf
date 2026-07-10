@@ -2,7 +2,7 @@
 # hosts) for exposed services; ECS CPU for everything.
 
 locals {
-  alb_services = { for k, v in var.services : k => v if v.target_group_arn_suffix != null }
+  alb_services = { for k, v in var.services : k => v if v.alb }
 
   dashboard_widgets = concat(
     [

@@ -22,7 +22,7 @@ Meridian is a standards-aligned IAM platform of the kind a mid-size company woul
 | [portal](/projects/portal/) | Async workflow security: the account-recovery flows attackers actually target, driven by a Postgres job queue |
 | [console](/projects/console/) | Authorization modeling: RBAC where every decision can explain itself |
 
-The eighth project — `platform`: Terraform, CI/CD, the one-command local stack — is deployment-blocked (no AWS account yet); [chapter 9](/guide/running-it/) covers its design and exactly what's pending.
+The eighth project — `platform`: Terraform, CI/CD, the one-command local stack — is not yet deployed — validated and `terraform plan`-clean against a real AWS account, but unapplied; [chapter 9](/guide/running-it/) covers its design and exactly what's pending.
 
 ## Decisions made before writing code
 

@@ -181,8 +181,9 @@ fixed and recorded in `docs/iteration-log.md`:
 
 ## 9. Deployment reality
 
-No AWS credentials exist yet. Everything is built **deploy-ready**: Terraform validated
-and planned (`terraform validate` + `plan` against mocked providers where possible),
-images built locally, CI pipelines defined. The final handoff report states the exact
-sequence (account → OIDC role for CI → `terraform apply`) and expected monthly cost.
-Live demos activate when credentials arrive; until then, docker-compose is the demo.
+An AWS account now exists, and the dev environment plans cleanly against it
+(`terraform init`/`validate`/`plan`: 166 resources, no diagnostics) — but nothing
+is applied yet. Everything is built **deploy-ready**: images built locally, CI
+pipelines defined. The remaining handoff sequence is remote-state bootstrap →
+domain + ACM cert → OIDC role for CI → `terraform apply`, at the monthly cost
+below. Live demos activate once it's applied; until then, docker-compose is the demo.

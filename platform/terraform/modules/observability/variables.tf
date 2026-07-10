@@ -18,11 +18,15 @@ variable "alb_arn_suffix" {
 
 variable "services" {
   description = <<-EOT
-    Per-service monitoring config. target_group_arn_suffix is null for
-    internal services (no ALB metrics; they still get CPU alarms).
+    Per-service monitoring config. Internal services get only CPU alarms; set
+    alb = true for services fronted by the ALB to add 5xx/latency/unhealthy-host
+    alarms. alb (not target_group_arn_suffix) drives that selection because the
+    for_each over these alarms needs keys known at plan time, and the arn suffix
+    is a module output unknown until apply.
   EOT
   type = map(object({
     service_name            = string
+    alb                     = optional(bool, false)
     target_group_arn_suffix = optional(string)
   }))
 }

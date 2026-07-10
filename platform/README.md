@@ -53,7 +53,7 @@ CI lives in `.github/workflows/` at the repo root (`ci.yml`, `release.yml`).
 - **Single-writer services pinned to one task**: keysmith (file keystore) and
   sentinel (hash-chained audit file) run on EFS with `max_count = 1`.
 
-## Cost estimate (eu-central-1, dev, monthly)
+## Cost estimate (eu-west-1, dev, monthly)
 
 | Item | Sizing | ~USD |
 |------|--------|-----:|
@@ -70,13 +70,34 @@ CI lives in `.github/workflows/` at the repo root (`ci.yml`, `release.yml`).
 Biggest levers if that's too much: stop the cluster overnight (Fargate is
 per-second), or drop the four internal/demo services from `desired_count`.
 
-## Runbook: when AWS credentials exist
+## Runbook: first apply
 
-1. **Bootstrap remote state** — run the S3/DynamoDB commands commented in
-   `terraform/envs/dev/versions.tf`, then uncomment the `backend "s3"` block.
-2. **DNS + TLS** — request an ACM certificate for `*.dev.<your-domain>` in the
-   target region; put its ARN and the domain in `terraform.tfvars` (copy from
-   `terraform.tfvars.example`).
+The account exists and `terraform init`/`validate`/`plan` already pass against
+it (a clean 166-resource plan with a placeholder cert), so the config itself is
+verified — what remains is the out-of-band setup Terraform can't do for you.
+
+1. **Bootstrap remote state** — create the state bucket and lock table (one-time,
+   with admin credentials), then enable the `backend "s3"` block commented in
+   `terraform/envs/dev/versions.tf` and re-init:
+
+   ```sh
+   aws s3api create-bucket --bucket meridian-terraform-state \
+     --create-bucket-configuration LocationConstraint=eu-west-1
+   aws s3api put-bucket-versioning --bucket meridian-terraform-state \
+     --versioning-configuration Status=Enabled
+   aws s3api put-public-access-block --bucket meridian-terraform-state \
+     --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+   aws dynamodb create-table --table-name meridian-terraform-lock \
+     --attribute-definitions AttributeName=LockID,AttributeType=S \
+     --key-schema AttributeName=LockID,KeyType=HASH \
+     --billing-mode PAY_PER_REQUEST
+
+   # uncomment the backend "s3" block in versions.tf, then:
+   (cd terraform/envs/dev && terraform init -migrate-state)
+   ```
+2. **DNS + TLS** — request an ACM certificate for `*.meridian.example.com` **in
+   `eu-west-1`** (must match the ALB's region); put its ARN and the domain in
+   `terraform.tfvars` (copy from `terraform.tfvars.example`).
 3. **Pre-apply secrets** — create the SSM SecureStrings that don't depend on
    infrastructure (values via `openssl rand -hex 32`; master key
    `openssl rand -base64 32`):
@@ -127,10 +148,10 @@ per-second), or drop the four internal/demo services from `desired_count`.
    `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REGISTRY`.
 7. **First release** — `git tag v0.1.0 && git push --tags`. release.yml builds
    and pushes all seven images (`:v0.1.0` + `:dev`) and rolls the services.
-8. **DNS records** — CNAME `idp/sso/portal/console.dev.<domain>` to
+8. **DNS records** — CNAME `idp/sso/portal/console.meridian.example.com` to
    `terraform output alb_dns_name`.
-9. **Verify** — `curl https://idp.dev.<domain>/healthz`, then the smoke flow
-   from `compose/smoke.sh` with `IDP_URL=https://idp.dev.<domain>` (the dev
+9. **Verify** — `curl https://idp.meridian.example.com/healthz`, then the smoke flow
+   from `compose/smoke.sh` with `IDP_URL=https://idp.meridian.example.com` (the dev
    realm only exists with `IDP_DEV_MODE=1`; in AWS, create a realm via the
    registration API first).
 
