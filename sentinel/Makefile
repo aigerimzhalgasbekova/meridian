@@ -1,7 +1,11 @@
 GO ?= go
 PY ?= python3
 
-.PHONY: test test-py vet fmt build run-dev report
+.PHONY: test test-py vet fmt check build run run-dev report
+
+check: vet test test-py
+
+run: run-dev
 
 test:
 	$(GO) test -race ./...

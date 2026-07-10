@@ -1,6 +1,10 @@
 NPM ?= npm
 
-.PHONY: install test test-int typecheck build dev docker
+.PHONY: install test test-int typecheck check build dev run docker
+
+check: typecheck test
+
+run: dev
 
 install:
 	$(NPM) install

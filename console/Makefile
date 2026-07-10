@@ -1,7 +1,14 @@
 GO ?= go
 NPM ?= npm
 
-.PHONY: test vet build web run-dev
+.PHONY: test vet fmt check build web run run-dev
+
+fmt:
+	gofmt -l .
+
+check: vet test
+
+run: run-dev
 
 test:
 	$(GO) test -race ./...
