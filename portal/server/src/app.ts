@@ -59,6 +59,9 @@ function meBody(user: User, session: Session) {
 export function createApp(ctx: AppContext): Express {
   const { store, queue, config } = ctx;
   const app = express();
+  app.get('/healthz', (_req, res) => {
+    res.json({ ok: true });
+  });
   app.use(express.json());
   app.use(sessionLoader(ctx));
   const limited = rateLimit(ctx);
