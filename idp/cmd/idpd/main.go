@@ -9,6 +9,10 @@
 //	IDP_REGISTRATION_TOKEN  initial access token for RFC 7591 registration (empty = disabled)
 //	IDP_DEV_MODE            "1": in-memory storage, seeded demo realm, insecure cookies
 //	IDP_DATABASE_URL        Postgres DSN (required unless IDP_DEV_MODE=1)
+//	IDP_TRUST_PROXY         "1": key the login guard on the last X-Forwarded-For
+//	                        hop. Set this ONLY when the process is unreachable
+//	                        except through a load balancer that appends the peer
+//	                        address it observed; otherwise clients forge it.
 package main
 
 import (
@@ -81,6 +85,7 @@ func run(logger *slog.Logger) error {
 		Logger:            logger,
 		RegistrationToken: os.Getenv("IDP_REGISTRATION_TOKEN"),
 		InsecureDev:       devMode,
+		TrustProxyHeaders: os.Getenv("IDP_TRUST_PROXY") == "1",
 	})
 	if err != nil {
 		return err

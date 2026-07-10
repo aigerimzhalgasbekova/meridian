@@ -242,7 +242,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	username := strings.TrimSpace(r.PostFormValue("username"))
 	pass := r.PostFormValue("password")
-	ip := remoteIP(r)
+	ip := remoteIP(r, s.cfg.TrustProxyHeaders)
 
 	if !s.cfg.Guard.Allow(ctx, realm.Name, username, ip) {
 		// Deliberately the same body as a failed login plus a hint — no
