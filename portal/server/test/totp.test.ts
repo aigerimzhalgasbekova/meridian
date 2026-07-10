@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { randomBytes } from 'node:crypto';
 import { hotp, totp, verifyTotp, generateTotpSecret, otpauthUri } from '../src/crypto/totp.js';
 import { base32Decode, base32Encode } from '../src/crypto/base32.js';
+import { open, seal } from '../src/crypto/secretbox.js';
 
 const SECRET = Buffer.from('12345678901234567890', 'ascii');
 
@@ -59,6 +61,28 @@ describe('base32', () => {
     const { secret, base32 } = generateTotpSecret();
     expect(base32Decode(base32)).toEqual(secret);
     expect(base32Encode(base32Decode('JBSWY3DPEHPK3PXP'))).toBe('JBSWY3DPEHPK3PXP');
+  });
+});
+
+describe('secretbox (TOTP secret encryption at rest)', () => {
+  const key = randomBytes(32);
+
+  it('round-trips a base32 secret through seal/open', () => {
+    const { base32 } = generateTotpSecret();
+    const sealed = seal(base32, key);
+    expect(sealed).not.toContain(base32); // not stored in the clear
+    expect(open(sealed, key)).toBe(base32);
+  });
+
+  it('produces a fresh nonce each time (distinct ciphertext for the same input)', () => {
+    expect(seal('JBSWY3DPEHPK3PXP', key)).not.toBe(seal('JBSWY3DPEHPK3PXP', key));
+  });
+
+  it('rejects tampered ciphertext (GCM auth tag)', () => {
+    const sealed = seal('JBSWY3DPEHPK3PXP', key);
+    const bytes = Buffer.from(sealed, 'base64');
+    bytes[bytes.length - 1]! ^= 0xff;
+    expect(() => open(bytes.toString('base64'), key)).toThrow();
   });
 });
 

@@ -106,6 +106,40 @@ describe('worker retry / dead-letter', () => {
     expect((await q.get(job.id))?.status).toBe('dead');
   });
 
+  it('recover() requeues jobs stranded in running back to pending', async () => {
+    const q = memoryQueue();
+    const job = await q.enqueue('a', {});
+    const now = new Date();
+    expect((await q.claim(now))?.id).toBe(job.id); // now 'running'
+    expect(await q.claim(now)).toBeNull(); // invisible while running
+    expect(await q.recover()).toBe(1);
+    expect((await q.claim(now))?.id).toBe(job.id); // reclaimable again
+  });
+
+  it('stop() awaits the in-flight tick so a mid-job shutdown does not strand work', async () => {
+    const q = memoryQueue();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let done = false;
+    const worker = new Worker(q, {
+      slow: async () => {
+        await gate;
+        done = true;
+      },
+    });
+    await q.enqueue('slow', {});
+    worker.start();
+    // wait until the handler has actually claimed and entered the slow job
+    for (let i = 0; i < 100 && (await q.listByStatus('running')).length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const stopped = worker.stop();
+    release();
+    await stopped;
+    expect(done).toBe(true);
+    expect(await q.listByStatus('done')).toHaveLength(1);
+  });
+
   it('two workers drain a batch without processing any job twice', async () => {
     const q = memoryQueue();
     const now = () => new Date();

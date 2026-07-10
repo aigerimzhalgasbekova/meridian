@@ -83,5 +83,14 @@ export function postgresQueue(pool: Pool): JobQueue {
       const { rows } = await pool.query<JobRow>(`SELECT * FROM jobs WHERE status = $1 ORDER BY created_at`, [status]);
       return rows.map(toJob);
     },
+
+    async recover() {
+      // ponytail: startup requeue of orphaned 'running' jobs. Fine for the
+      // single-worker deploy here; a multi-worker fleet would also reset peers'
+      // in-flight jobs (handlers are idempotent, so it's safe but wasteful) —
+      // upgrade path is a claimed_at column + stale-timeout reaper in claim().
+      const res = await pool.query(`UPDATE jobs SET status = 'pending' WHERE status = 'running'`);
+      return res.rowCount ?? 0;
+    },
   };
 }

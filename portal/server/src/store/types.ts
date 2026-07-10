@@ -53,6 +53,12 @@ export interface UserRepo {
   findByEmail(email: string): Promise<User | null>;
   findById(id: string): Promise<User | null>;
   update(id: string, patch: Partial<Omit<User, 'id' | 'createdAt'>>): Promise<void>;
+  /**
+   * Atomically advance the TOTP replay counter. Returns false (a rejected replay)
+   * unless `counter` is strictly greater than the stored value — closing the
+   * read-then-write TOCTOU where two concurrent codes both pass the old check.
+   */
+  advanceTotpCounter(id: string, counter: string): Promise<boolean>;
 }
 
 export interface SessionRepo {
@@ -84,4 +90,11 @@ export interface Store {
   sessions: SessionRepo;
   tokens: TokenRepo;
   recoveryCodes: RecoveryCodeRepo;
+  /**
+   * Deletes rows that have outlived their expiry: sessions, and one-time
+   * tokens (password reset / verify email) that are expired or already used.
+   * Nothing reads these rows again, so unswept they only bloat the tables.
+   * Returns the total number of rows removed.
+   */
+  sweep(now: Date): Promise<number>;
 }

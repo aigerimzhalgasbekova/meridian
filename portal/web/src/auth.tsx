@@ -47,17 +47,23 @@ export function Login() {
 }
 
 export function Signup() {
-  const { setMe } = useSession();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [sent, setSent] = useState(false);
   const { error, busy, submit } = useForm();
 
+  // Enumeration-safe: the server returns the same "check your email" response
+  // whether or not the address was already registered, so we never auto-login.
+  // The copy must be true of both branches — a new address receives a
+  // verification link, a taken one receives a reset link — and hint at neither.
+  if (sent) {
+    return <div className="card"><h1>Check your email</h1>
+      <p>We sent a message to {email}. Follow the link in it to continue, then <Link to="/">sign in</Link>.</p></div>;
+  }
   return (
     <form className="card" onSubmit={submit(async () => {
-      const me = await api<Me>('POST', '/api/auth/signup', { email, password });
-      setCsrf(me.csrfToken);
-      setMe(me);
-      navigate('/');
+      await api('POST', '/api/auth/signup', { email, password });
+      setSent(true);
     })}>
       <h1>Create account</h1>
       {error && <p className="error">{error}</p>}

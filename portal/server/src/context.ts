@@ -12,6 +12,8 @@ export interface Config {
   uniformDelayMs: number;
   rateLimit: { limit: number; windowMs: number };
   secureCookies: boolean;
+  /** 32-byte key-encryption key for at-rest secrets (TOTP). From env in prod. */
+  totpKek: Buffer;
 }
 
 export const defaultConfig: Config = {
@@ -22,7 +24,12 @@ export const defaultConfig: Config = {
   verifyTokenTtlMs: 24 * 60 * 60 * 1000,
   uniformDelayMs: 100,
   rateLimit: { limit: 10, windowMs: 60_000 },
-  secureCookies: false,
+  // Secure-by-default: an unset/misspelled NODE_ENV must not silently ship
+  // insecure cookies. Local dev opts out explicitly (see index.ts).
+  secureCookies: true,
+  // ponytail: obvious non-secret placeholder for dev/test; prod must set
+  // PORTAL_TOTP_KEK (index.ts refuses the DB path without it).
+  totpKek: Buffer.alloc(32, 7),
 };
 
 export interface AppContext {

@@ -33,6 +33,15 @@ export function memoryStore(): Store {
         const u = users.get(id);
         if (u) Object.assign(u, patch);
       },
+      async advanceTotpCounter(id, counter) {
+        // Single synchronous check-and-set: no await between compare and write,
+        // so concurrent requests cannot interleave (mirrors the SQL guard).
+        const u = users.get(id);
+        if (!u) return false;
+        if (u.totpLastCounter !== null && BigInt(counter) <= BigInt(u.totpLastCounter)) return false;
+        u.totpLastCounter = counter;
+        return true;
+      },
     },
     sessions: {
       async create(s) {
@@ -96,6 +105,22 @@ export function memoryStore(): Store {
       async countUnused(userId) {
         return codes.filter((c) => c.userId === userId && !c.usedAt).length;
       },
+    },
+    async sweep(now) {
+      let removed = 0;
+      for (const [k, s] of sessions) {
+        if (s.expiresAt < now) {
+          sessions.delete(k);
+          removed++;
+        }
+      }
+      for (const [k, t] of tokens) {
+        if (t.expiresAt < now || t.usedAt) {
+          tokens.delete(k);
+          removed++;
+        }
+      }
+      return removed;
     },
   };
 }

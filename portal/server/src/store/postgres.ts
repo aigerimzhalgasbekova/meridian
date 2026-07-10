@@ -67,6 +67,15 @@ export function postgresStore(pool: Pool): Store {
         }
         if (sets.length) await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $1`, vals);
       },
+      async advanceTotpCounter(id, counter) {
+        // Atomic replay defense: the WHERE loses the race for a concurrent replay.
+        const res = await pool.query(
+          `UPDATE users SET totp_last_counter = $2
+           WHERE id = $1 AND (totp_last_counter IS NULL OR totp_last_counter::bigint < $2::bigint)`,
+          [id, counter],
+        );
+        return (res.rowCount ?? 0) > 0;
+      },
     },
     sessions: {
       async create(s) {
@@ -200,6 +209,17 @@ export function postgresStore(pool: Pool): Store {
         );
         return Number(rows[0]!.n);
       },
+    },
+    async sweep(now) {
+      let total = 0;
+      for (const stmt of [
+        `DELETE FROM sessions WHERE expires_at < $1`,
+        `DELETE FROM one_time_tokens WHERE expires_at < $1 OR used_at IS NOT NULL`,
+      ]) {
+        const res = await pool.query(stmt, [now]);
+        total += res.rowCount ?? 0;
+      }
+      return total;
     },
   };
 }

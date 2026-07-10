@@ -33,6 +33,11 @@ export interface JobQueue {
   fail(id: string, error: string, now: Date): Promise<void>;
   get(id: string): Promise<Job | null>;
   listByStatus(status: JobStatus): Promise<Job[]>;
+  /**
+   * Requeue jobs left 'running' by a crashed/killed worker back to 'pending'.
+   * Called once on worker startup; returns how many were reclaimed.
+   */
+  recover(): Promise<number>;
 }
 
 /** Exponential backoff: 1s, 4s, 16s, ... capped at 5 minutes. */
