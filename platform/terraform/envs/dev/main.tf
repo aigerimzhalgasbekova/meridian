@@ -61,11 +61,64 @@ resource "aws_service_discovery_private_dns_namespace" "this" {
   vpc  = module.network.vpc_id
 }
 
+# --- ALB access logs (SEC04-BP01 sibling: capture request-level activity) ---
+
+data "aws_elb_service_account" "this" {}
+
+resource "aws_s3_bucket" "alb_logs" {
+  bucket = "${local.name}-alb-logs-${data.aws_caller_identity.current.account_id}"
+}
+
+resource "aws_s3_bucket_public_access_block" "alb_logs" {
+  bucket                  = aws_s3_bucket.alb_logs.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
+  bucket = aws_s3_bucket.alb_logs.id
+
+  rule {
+    id     = "expire"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = 90
+    }
+  }
+}
+
+data "aws_iam_policy_document" "alb_logs" {
+  # Regional ELB log-delivery account writes objects under the ALB's prefix.
+  statement {
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.alb_logs.arn}/${local.name}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"]
+    principals {
+      type        = "AWS"
+      identifiers = [data.aws_elb_service_account.this.arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "alb_logs" {
+  bucket = aws_s3_bucket.alb_logs.id
+  policy = data.aws_iam_policy_document.alb_logs.json
+}
+
 resource "aws_lb" "this" {
   name               = local.name
   load_balancer_type = "application"
   security_groups    = [module.network.alb_security_group_id]
   subnets            = module.network.public_subnet_ids
+
+  access_logs {
+    bucket  = aws_s3_bucket.alb_logs.id
+    prefix  = local.name
+    enabled = true
+  }
+  depends_on = [aws_s3_bucket_policy.alb_logs]
 
   # Services key their brute-force guards on the LAST X-Forwarded-For hop.
   # That is only sound because the ALB appends the IP it actually observed;
@@ -77,6 +130,85 @@ resource "aws_lb" "this" {
 
   # Reject requests carrying malformed headers instead of normalizing them.
   drop_invalid_header_fields = true
+}
+
+# --- WAFv2 (SEC04-BP01: filter common web attacks + rate-limit) -------------
+
+resource "aws_wafv2_web_acl" "this" {
+  name  = "${local.name}-waf"
+  scope = "REGIONAL"
+
+  default_action {
+    allow {}
+  }
+
+  rule {
+    name     = "aws-common"
+    priority = 0
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-aws-common"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "aws-known-bad-inputs"
+    priority = 1
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-aws-known-bad-inputs"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "rate-limit"
+    priority = 2
+    action {
+      block {}
+    }
+    statement {
+      rate_based_statement {
+        limit              = 2000 # requests per 5-minute window, per source IP
+        aggregate_key_type = "IP"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-rate-limit"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${local.name}-waf"
+    sampled_requests_enabled   = true
+  }
+}
+
+resource "aws_wafv2_web_acl_association" "alb" {
+  resource_arn = aws_lb.this.arn
+  web_acl_arn  = aws_wafv2_web_acl.this.arn
 }
 
 resource "aws_lb_listener" "https" {

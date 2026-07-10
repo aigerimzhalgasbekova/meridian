@@ -106,10 +106,14 @@ per-second), or drop the four internal/demo services from `desired_count`.
    (idp migrates its own database on boot). Write the DSNs:
 
    ```sh
+   # sslmode=require: the parameter group sets rds.force_ssl=1 server-side
+   # anyway; require just makes the client-side expectation explicit. Upgrade
+   # to verify-full + sslrootcert=<RDS CA bundle> if you want to authenticate
+   # the server cert too.
    aws ssm put-parameter --type SecureString --name $P/idp/IDP_DATABASE_URL \
-     --value "postgres://meridian:<pw>@<postgres_endpoint>:5432/idp"
+     --value "postgres://meridian:<pw>@<postgres_endpoint>:5432/idp?sslmode=require"
    aws ssm put-parameter --type SecureString --name $P/portal/DATABASE_URL \
-     --value "postgres://meridian:<pw>@<postgres_endpoint>:5432/portal"
+     --value "postgres://meridian:<pw>@<postgres_endpoint>:5432/portal?sslmode=require"
    ```
 
 6. **CI federation** — create the GitHub OIDC provider + `meridian-ci` role
