@@ -11,8 +11,9 @@ where canonical JSON is compact, keys sorted, fields
 (action, actor, details, prev, seq, ts, type), string escaping identical to
 Go's encoding/json with HTML escaping disabled.
 
-Usage: verify_chain.py <audit.jsonl>
-Exit status: 0 chain intact, 1 broken or unreadable.
+Usage: verify_chain.py <audit.jsonl> [--allow-missing-anchors]
+Expects the out-of-band anchor sidecar <audit.jsonl>.anchors beside the log;
+its absence fails closed. Exit status: 0 chain intact, 1 broken or unreadable.
 """
 import hashlib
 import json
@@ -119,6 +120,32 @@ def check_anchors(records, anchors):
     return True, None
 
 
+def verify_export(path, records, allow_missing_anchors=False):
+    """Verify a whole export: the chain walk *and* the anchor cross-check.
+
+    Both halves are required. A prefix of a valid chain is itself a valid
+    chain, so the walk alone cannot see tail-truncation — only the sidecar
+    can. Every entry point that pronounces on a log's integrity must call
+    this, never verify() on its own.
+
+    Raises OSError/ValueError if the sidecar is unreadable. Returns
+    (ok, reason).
+    """
+    ok, seq, reason = verify(records)
+    if not ok:
+        return False, "chain broken at seq %s: %s" % (seq, reason)
+    # The sidecar's absence fails closed: deleting it would otherwise restore
+    # the very blind spot it exists to remove.
+    anchor_path = path + ".anchors"
+    if not os.path.exists(anchor_path):
+        if allow_missing_anchors:
+            return True, None
+        return False, ("anchor sidecar %s missing (deleted?); pass "
+                       "--allow-missing-anchors only for pre-sidecar logs"
+                       % anchor_path)
+    return check_anchors(records, load(anchor_path))
+
+
 def main(argv):
     # --allow-missing-anchors exists only for logs written before the sidecar
     # was introduced. Never pass it when verifying a live audit log: a missing
@@ -130,33 +157,13 @@ def main(argv):
         return 2
     try:
         records = load(argv[1])
+        ok, reason = verify_export(argv[1], records, allow_missing)
     except (OSError, ValueError) as e:
         print("ERROR: %s" % e, file=sys.stderr)
         return 1
-    ok, seq, reason = verify(records)
     if not ok:
-        print("BROKEN at seq %s: %s" % (seq, reason))
+        print("BROKEN: %s" % reason)
         return 1
-    # Cross-check the out-of-band anchor sidecar: this is what catches
-    # tail-truncation the chain walk alone cannot see. Its absence fails
-    # closed, otherwise deleting it would restore the very blind spot the
-    # sidecar exists to remove.
-    anchor_path = argv[1] + ".anchors"
-    if not os.path.exists(anchor_path):
-        if not allow_missing:
-            print("BROKEN: anchor sidecar %s missing (deleted?); pass "
-                  "--allow-missing-anchors only for pre-sidecar logs" % anchor_path)
-            return 1
-    else:
-        try:
-            anchors = load(anchor_path)
-        except (OSError, ValueError) as e:
-            print("ERROR: %s" % e, file=sys.stderr)
-            return 1
-        aok, areason = check_anchors(records, anchors)
-        if not aok:
-            print("BROKEN: %s" % areason)
-            return 1
     print("OK: chain of %d records intact (head %s)"
           % (len(records), records[-1]["hash"][:16] + "..." if records else "empty"))
     return 0

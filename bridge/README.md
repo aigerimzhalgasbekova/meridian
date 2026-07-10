@@ -59,9 +59,10 @@ Details of the state/nonce/PKCE design:
   discovery declares its issuer as the literal template
   `https://login.microsoftonline.com/{tenantid}/v2.0`. Compare naively and you
   reject every valid token; skip the check and you accept tokens from **any**
-  tenant on Earth. bridge substitutes the token's `tid` into the template,
-  requires `tid` to exist, and optionally pins an allowed-tenant list. Covered
-  by `TestEntraTenantedIssuer`.
+  tenant on Earth. bridge substitutes the token's `tid` into the template and
+  requires `tid` to exist; for the multi-tenant endpoints (`common`,
+  `organizations`, `consumers`) it also *requires* a non-empty allowed-tenant
+  list, refusing to start without one. Covered by `TestEntraTenantedIssuer`.
 - **No account takeover via email reuse.** Login matching is
   `(provider, subject)` only. Same email from a second provider yields a
   *separate* identity plus a visible linking offer — never an auto-merge.
@@ -109,7 +110,7 @@ local Ed25519 key, production plugs in a keysmith-backed signer (the shape of
 make run-dev    # BRIDGE_DEV_MODE=1: built-in fake upstreams, no accounts needed
 ```
 
-Open http://127.0.0.1:8080 — sign in via the built-in upstream, try the second
+Open http://127.0.0.1:8083 — sign in via the built-in upstream, try the second
 upstream to see the email-collision handling, link the two, and hit
 `/?app=demo` to watch an assertion get delivered.
 

@@ -19,9 +19,11 @@ on:
   push:
     tags: ['v*']
 
+# id-token: write is granted per-job, only to the two jobs that assume the AWS
+# role. preflight reads repository variables and must not be able to mint an
+# OIDC token.
 permissions:
   contents: read
-  id-token: write # OIDC federation with AWS
 
 env:
   # github.ref_name via env, never inline in run: (ref names are user input).
@@ -51,6 +53,9 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.configured == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC federation with AWS
     strategy:
       fail-fast: false
       matrix:
@@ -99,6 +104,9 @@ jobs:
     needs: [preflight, build-push]
     if: needs.preflight.outputs.configured == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC federation with AWS
     strategy:
       fail-fast: false
       max-parallel: 3

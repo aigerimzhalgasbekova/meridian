@@ -6,7 +6,8 @@
 
 ## 1. Vision
 
-Meridian is a portfolio of eight interlocking projects that together form a realistic,
+Meridian is a portfolio of eight interlocking projects — seven services plus the
+platform that runs them, with the site alongside — that together form a realistic,
 standards-aligned IAM platform — the kind of system a mid-size company would run to
 centralize authentication, sessions, federation, and access control. Each project is a
 standalone, reviewable codebase with its own signature architectural challenge; together
@@ -155,7 +156,7 @@ portfolio/
 ├── keysmith/  idp/  sessiond/  sentinel/  bridge/   # Go services
 ├── portal/                # TypeScript (Fastify API + React UI + pg job worker)
 ├── console/               # Go API + React SPA
-├── platform/              # terraform/, ci/, compose/, observability/
+├── platform/              # terraform/, compose/, docs/{adr,observability.md}
 └── site/                  # Astro portfolio site with /guide
 ```
 

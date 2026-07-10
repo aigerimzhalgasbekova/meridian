@@ -43,8 +43,8 @@ create ──► live ──touch──► live (idle TTL renewed, clamped to de
              ├─ now ≥ absolute deadline ───► expired (script re-check)
              ├─ revoke / revoke-all ───────► revoked (broadcast)
              ├─ evicted by cap ────────────► revoked (broadcast)
-             └─ rotate ────────────────────► old ID dead, new ID carries
-                                             created-at + deadline over
+             └─ rotate ────────────────────► old ID dead (broadcast), new ID
+                                             carries created-at + deadline over
 ```
 
 Two clocks enforce expiry: the Redis key TTL implements the sliding idle
@@ -133,10 +133,13 @@ that is what `make test-int` covers:
 
 | miniredis | Redis | What only the real thing shows |
 |-----------|-------|-------------------------------|
-| gopher-lua | Lua 5.1 in Redis | `tostring()`/`tonumber()` and reply conversion. `rotateScript` writes `deadline_ms` back through `tostring()`; a number that renders as `1.7e+12` round-trips as a corrupt session. |
+| gopher-lua | Lua 5.1 in Redis | That the scripts mean the same thing to a different interpreter: `tostring()`/`tonumber()` number formatting and the Lua→RESP reply conversion. `rotateScript` round-trips `deadline_ms` through `tostring()`, so its correctness rests on Redis's `%.14g`, not gopher-lua's. |
 | `FastForward` | a clock | That the `PEXPIRE` we issue carries the TTL we think it does, and that a touch renews it. |
 | in-process channels | pub/sub over a socket | That a revocation is serialized, published, and delivered to another node. |
-| direct eval | `EVALSHA` + script cache | That the scripts load and run at all. |
+
+miniredis is not a strawman here: it implements `EVAL`, `EVALSHA` and `SCRIPT`,
+so the scripts genuinely load and run under it. What it cannot tell you is
+whether they mean the same thing to the interpreter Redis actually embeds.
 
 ```sh
 docker run -d --name meridian-redis-test -p 6380:6379 redis:7
@@ -145,6 +148,14 @@ docker rm -f meridian-redis-test
 ```
 
 The suite `FLUSHDB`s between tests, so point `TEST_REDIS_URL` at a throwaway
-database. CI runs it against an ephemeral `redis:7` service with
-`REQUIRE_TEST_REDIS_URL=1`, which turns a missing Redis into a red build rather
-than a suite that silently skips.
+database. `make test-int` sets `REQUIRE_TEST_REDIS_URL=1`, so a missing Redis
+fails rather than skipping every test it exists to run; CI does the same
+against an ephemeral `redis:7` service.
+
+## Docs
+
+- [THREAT_MODEL.md](THREAT_MODEL.md) — assets, trust boundaries, abuse cases,
+  residual risk
+- [ADR 0001](docs/adr/0001-opaque-tokens-not-jwt.md) — opaque tokens, not JWTs
+- [ADR 0002](docs/adr/0002-lua-scripts-for-atomicity.md) — Lua scripts for atomicity
+- [ADR 0003](docs/adr/0003-pubsub-invalidation-bounded-cache.md) — pub/sub invalidation, bounded cache

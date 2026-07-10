@@ -25,7 +25,7 @@ the email job pipeline.
    and stored server-side only as hashes.
 3. **API ↔ database.** Parameterized queries throughout; no secret material
    stored raw (session ids, tokens, recovery codes all hashed; TOTP secrets
-   necessarily stored recoverable — see residual risks).
+   necessarily reversible, so sealed under a KEK — see residual risks).
 
 ## Key defenses by flow
 
@@ -60,8 +60,12 @@ as secret-bearing: dead-lettered rows should be purged, not archived.
 
 ## Residual risks / accepted
 
-- **TOTP secrets stored unencrypted at rest.** Verification requires the raw
-  secret. Envelope encryption via keysmith is the platform upgrade path.
+- **TOTP secrets are recoverable by whoever holds the KEK.** Verification
+  requires the raw secret, so the database stores it sealed (AES-256-GCM under
+  `PORTAL_TOTP_KEK`) rather than hashed. A database dump alone yields nothing;
+  a dump plus the process environment yields every second factor. Moving the
+  KEK into keysmith-managed KMS, so the key never sits beside the ciphertext,
+  is the platform upgrade path.
 - **In-memory rate limiting is per-process.** Multi-node deployments need the
   `sentinel` decision API (documented seam); until then a distributed attacker
   faces only per-node limits.

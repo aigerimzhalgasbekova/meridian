@@ -22,7 +22,10 @@
 //     value we think it does.
 //   - Its pub/sub is in-process channels, so the revocation broadcast is never
 //     serialized, published, or delivered over a connection.
-//   - Scripts are never EVALSHA'd against a real script cache.
+//
+// Note what is NOT on that list: miniredis implements EVAL, EVALSHA and
+// SCRIPT, so the scripts do load and run under it. Only their meaning is in
+// question, never their execution.
 //
 // So this file runs the scripts on Redis and re-checks only what changes when
 // the interpreter, the clock, and the wire are real. It deliberately does not
@@ -100,9 +103,9 @@ func realStore(t *testing.T, rdb redis.UniversalClient, cfg Config) *Store {
 // TestLifecycleOnRealRedis runs one session through every script — create,
 // touch, rotate, revoke — and asserts the replies decode. The rotate leg is
 // the sharp one: rotateScript writes deadline_ms back with Lua's tostring(),
-// and Redis Lua formats numbers with %.14g. A deadline that ever renders as
-// "1.7e+12" would round-trip as a corrupt session, and no gopher-lua test
-// would notice.
+// so the field survives only because Redis formats numbers with %.14g and a
+// 13-digit millisecond deadline fits. Nothing in the code enforces that; this
+// test is what would catch a formatting change, and gopher-lua would not.
 func TestLifecycleOnRealRedis(t *testing.T) {
 	_, rdb := testRedis(t)
 	clk := newFakeClock()

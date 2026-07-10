@@ -7,6 +7,8 @@ that the Python chain rules match the Go ones.
 import copy
 import json
 import os
+import shutil
+import tempfile
 import unittest
 
 import report
@@ -79,7 +81,7 @@ class ReportTest(unittest.TestCase):
         self.records = verify_chain.load(FIXTURE)
 
     def test_report_sections_and_counts(self):
-        md, ok = report.build_report(self.records)
+        md, ok = report.build_report(self.records, (True, None))
         self.assertTrue(ok)
         self.assertIn("Chain integrity: **INTACT**", md)
         for section in ("# Sentinel compliance report", "## Decisions",
@@ -96,14 +98,34 @@ class ReportTest(unittest.TestCase):
     def test_report_flags_broken_chain(self):
         recs = copy.deepcopy(self.records)
         recs[2]["action"] = "tampered"
-        md, ok = report.build_report(recs)
+        md, ok = report.build_report(recs, verify_chain.verify_export(FIXTURE, recs))
         self.assertFalse(ok)
-        self.assertIn("BROKEN at seq", md)
+        self.assertIn("chain broken at seq", md)
 
     def test_report_on_empty_log(self):
-        md, ok = report.build_report([])
+        md, ok = report.build_report([], (True, None))
         self.assertTrue(ok)
         self.assertIn("Records: **0**", md)
+
+    def test_report_rejects_tail_truncated_log(self):
+        # The report used to call verify() alone, so a truncated log — a valid
+        # prefix of a valid chain — was pronounced INTACT with exit 0. Only the
+        # sidecar sees the missing tail, so report.main must cross-check it.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "audit.jsonl")
+            out = os.path.join(tmp, "report.md")
+            shutil.copy(FIXTURE + ".anchors", log + ".anchors")
+            with open(FIXTURE, encoding="utf-8") as src, \
+                    open(log, "w", encoding="utf-8") as dst:
+                dst.writelines(src.readlines()[:20])
+            self.assertEqual(report.main(["report.py", log, out]), 1)
+            with open(out, encoding="utf-8") as f:
+                self.assertIn("Chain integrity: **BROKEN**", f.read())
+
+    def test_report_accepts_the_intact_fixture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.md")
+            self.assertEqual(report.main(["report.py", FIXTURE, out]), 0)
 
 
 class AnchorTest(unittest.TestCase):

@@ -3,12 +3,14 @@
 // Dev mode (BRIDGE_DEV_MODE=1) needs zero external accounts: it spins up a
 // built-in fake OIDC upstream in-process, registers it as a provider, signs
 // assertions with an ephemeral local key, and registers a demo app whose
-// callback just echoes the assertion. Open http://127.0.0.1:8080 and click
-// through.
+// callback just echoes the assertion. `make run-dev` publishes it on :8083
+// (the code default would collide with idp); open http://127.0.0.1:8083 and
+// click through.
 //
 // Production configuration is env-driven:
 //
-//	BRIDGE_ADDR            listen address (default :8080)
+//	BRIDGE_ADDR            listen address (default :8080, the in-container
+//	                       port; compose and ECS publish it behind :8083)
 //	BRIDGE_BASE_URL        externally visible base URL (required outside dev)
 //	BRIDGE_HMAC_KEY        >= 32 bytes; state-parameter signing key
 //	BRIDGE_GOOGLE_CLIENT_ID / BRIDGE_GOOGLE_CLIENT_SECRET

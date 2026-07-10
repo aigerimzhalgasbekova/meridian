@@ -33,8 +33,13 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 			"authorization_code", "refresh_token", "client_credentials",
 			"urn:ietf:params:oauth:grant-type:device_code",
 		},
-		"subject_types_supported":               []string{"public"},
-		"id_token_signing_alg_values_supported": []string{"EdDSA", "ES256", "RS256"},
+		"subject_types_supported": []string{"public"},
+		// Must not exceed what keysmith is configured to sign with
+		// (KEYSMITH_ALGS, default "EdDSA,RS256"): an RP that trusts this list
+		// and gets an alg keysmith cannot produce is a broken integration.
+		// Under-advertising is safe, so this tracks keysmith's default rather
+		// than its full capability.
+		"id_token_signing_alg_values_supported": []string{"EdDSA", "RS256"},
 		"scopes_supported": []string{
 			oauth.ScopeOpenID, oauth.ScopeProfile, oauth.ScopeEmail, oauth.ScopeOfflineAccess,
 		},

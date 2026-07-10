@@ -6,9 +6,12 @@ delivery, and the demo UI session. Cryptographic verification primitives are
 in keysmith's threat model; this document covers how bridge uses them and what
 bridge adds.
 
-Assets: local identities and their provider links; app-facing assertions (a
-forged or misdirected one is authentication bypass at every relying app);
-in-flight login state (nonce, PKCE verifier); upstream client secrets.
+## Assets
+
+Local identities and their provider links; app-facing assertions (a forged or
+misdirected one is authentication bypass at every relying app); in-flight login
+state (nonce, PKCE verifier); the state-signing HMAC key; the assertion signing
+key; upstream client secrets.
 
 ## Trust boundaries
 

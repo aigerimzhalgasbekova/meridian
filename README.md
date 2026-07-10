@@ -54,8 +54,9 @@ left unwired — each service's tests and dev mode run with zero external servic
 ```
 
 The one wired runtime dependency is **idp → keysmith** (idp delegates all token
-signing over HTTP). **bridge → keysmith** is a compile-time module dependency
-(`replace` directive) for the hardened `jose` package. sessiond and sentinel have
+signing over HTTP). Both **idp** and **bridge** additionally link keysmith's
+hardened `jose` package at compile time (a `replace` directive); bridge does so
+*only* that way, to verify upstream ID tokens without an RPC. sessiond and sentinel have
 no in-code consumers yet — the platform Terraform deliberately grants them no
 ingress until the wiring exists (see [platform/README.md](platform/README.md)).
 
@@ -83,7 +84,8 @@ Ctrl-C stops everything. What you get:
 | console | http://localhost:8085 | personas at `/v1/dev/tokens` |
 | portal | http://localhost:3000 | web UI at http://localhost:5173; "emails" land in `portal/server/outbox/` |
 
-**One service at a time** — every project has `make run` (alias of `run-dev`):
+**One service at a time** — every project has `make run` (alias of `run-dev`;
+`dev` in portal):
 
 ```sh
 cd keysmith && make run    # KEYSMITH_DEV_MODE=1: in-memory keystore
@@ -99,7 +101,7 @@ cd idp      && make run    # IDP_DEV_MODE=1 — needs keysmith on :8081 first
 
 ```sh
 cd platform/compose
-cp .env.example .env       # replace every change-me — each line names its generator
+cp .env.example .env       # replace every change-me; the file header names the generator
 docker compose up -d --build
 ./smoke.sh                 # JWKS → discovery → full authorization-code flow
 ```
@@ -122,7 +124,7 @@ run; Go numbers include subtests):
 | idp | 117 | full browser flows via cookie jar against an in-process keysmith; refresh-reuse detection under real concurrency |
 | sessiond | 26 (+7 need Redis) | staleness-bound proof on a node missing every broadcast; parallel cap-invariant hammer on miniredis |
 | sentinel (Go) | 68 | sliding-window/lockout/risk contracts; Go tests invoke the Python verifier cross-language |
-| sentinel (Python) | 14 | stdlib-only chain verification of a Go-written fixture |
+| sentinel (Python) | 16 | stdlib-only chain verification of a Go-written fixture; truncation caught via the anchor sidecar |
 | bridge | 57 | fake upstream misbehavior: Entra tenanted issuer, breaker transitions, stale JWKS |
 | console | 68 | trace-shape assertions; dog-fooded authz negative cases |
 | portal | 100 (23 need Postgres) | RFC 6238 Appendix B vectors; queue claim/backoff/dead-letter; enumeration-safe reset flows |
@@ -130,21 +132,24 @@ run; Go numbers include subtests):
 ### Integration tests
 
 Three services keep a `make test-int` suite that runs against the real backend
-instead of the in-process stand-in. Each is gated on an environment variable and
-skips without it, so the default `make test` stays dependency-free.
+instead of the in-process stand-in. Each is gated on an environment variable, so
+the default `make test` stays dependency-free — while `make test-int` itself
+sets `REQUIRE_TEST_*` and *fails* rather than skipping when the backend is
+absent, which is the only way a gated suite keeps protecting anything.
 
 idp and portal each ship **two** implementations of one storage interface —
 in-memory (dev, and what the flow tests run against) and Postgres (production).
 A single shared conformance suite runs against both, so the backends cannot
-drift apart unnoticed. sessiond has one implementation and a fake backend
-(miniredis); its integration suite re-runs the parts that only mean something
-on real Redis.
+drift apart unnoticed. sessiond is shaped differently: one implementation, and a
+fake backend (miniredis) that its default suite runs against. Its integration
+suite is therefore not the same tests against a second backend but a distinct
+set, covering only what a fake Redis cannot show.
 
-| Project | Suite | Fast path | Real backend |
+| Project | Shape | Fast path | Real backend |
 |---------|-------|-----------|--------------|
-| idp | `internal/storage/storagetest` | memory, every `go test` | Postgres, `TEST_DATABASE_URL` |
-| portal | `server/test/contract/` | memory, every `npm test` | Postgres, `TEST_DATABASE_URL` |
-| sessiond | `internal/store/integration_test.go` | miniredis, every `go test` | Redis, `TEST_REDIS_URL` |
+| idp | one suite, two backends (`internal/storage/storagetest`) | memory, every `go test` | Postgres, `TEST_DATABASE_URL` |
+| portal | one suite, two backends (`server/test/contract/`) | memory, every `npm test` | Postgres, `TEST_DATABASE_URL` |
+| sessiond | separate suites (`internal/store/integration_test.go`, tagged `integration`) | miniredis, every `go test` | Redis, `TEST_REDIS_URL` |
 
 What real Redis buys that miniredis cannot: miniredis's Lua is gopher-lua, its
 TTLs advance by `FastForward` rather than a clock, and its pub/sub is in-process
@@ -152,7 +157,7 @@ channels. sessiond's whole design is Lua scripts, sliding TTLs, and a revocation
 broadcast, so all three matter. Atomicity is *not* on that list — miniredis
 applies commands under a lock exactly as single-threaded Redis does, and the
 concurrent-create cap tests in `concurrency_test.go` catch a non-atomic cap
-without Docker.
+without Docker. Nor is script execution: miniredis implements `EVAL`/`EVALSHA`.
 
 idp and portal both define a `users` table, so give each its own database:
 
