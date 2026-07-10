@@ -14,6 +14,13 @@ docker compose up -d --build
 ./smoke.sh                    # end-to-end: JWKS -> discovery -> auth-code flow
 ```
 
+## Stop
+
+```sh
+cd platform/compose
+docker compose down           # stop and remove containers; add -v to wipe pg/redis volumes too
+```
+
 Build note: `idp` and `bridge` build from the **repo root** context (their
 Dockerfiles `COPY keysmith/` next to their own module because of the
 `go.mod replace` directive); everything else builds from its own directory.
