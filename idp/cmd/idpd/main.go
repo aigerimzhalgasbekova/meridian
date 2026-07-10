@@ -9,6 +9,7 @@
 //	IDP_REGISTRATION_TOKEN  initial access token for RFC 7591 registration (empty = disabled)
 //	IDP_DEV_MODE            "1": in-memory storage, seeded demo realm, insecure cookies
 //	IDP_DATABASE_URL        Postgres DSN (required unless IDP_DEV_MODE=1)
+//	IDP_SEED_DEMO           "1": idempotently seed the demo realm (any store)
 //	IDP_TRUST_PROXY         "1": key the login guard on the last X-Forwarded-For
 //	                        hop. Set this ONLY when the process is unreachable
 //	                        except through a load balancer that appends the peer
@@ -111,11 +112,15 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if devMode {
-		if err := server.SeedDev(ctx, store); err != nil {
+	if devMode || os.Getenv("IDP_SEED_DEMO") == "1" {
+		switch err := server.SeedDev(ctx, store); {
+		case errors.Is(err, storage.ErrDuplicate):
+			logger.Info("demo realm already seeded")
+		case err != nil:
 			return fmt.Errorf("seed dev data: %w", err)
+		default:
+			logger.Info("seeded demo realm", "realm", "demo", "user", "alice", "password", "password123")
 		}
-		logger.Info("seeded demo realm", "realm", "demo", "user", "alice", "password", "password123")
 	}
 
 	httpSrv := &http.Server{
