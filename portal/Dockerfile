@@ -26,7 +26,9 @@ ENV OUTBOX_DIR=/tmp/outbox
 # with sslrootcert=<this path> in the DSN) instead of downgraded to no-verify.
 # Checksum-pinned: a build must fail, not silently trust, if the bundle a
 # mirror serves ever differs. Bump the pin when AWS rotates the bundle.
-ADD --checksum=sha256:e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3 \
+# --chmod matters: URL ADDs default to 600 root-only and the server runs as
+# the unprivileged node user.
+ADD --checksum=sha256:e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3 --chmod=644 \
   https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /etc/ssl/certs/rds-global-bundle.pem
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
