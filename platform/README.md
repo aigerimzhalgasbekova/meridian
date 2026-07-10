@@ -107,15 +107,17 @@ it (a clean 166-resource plan with a placeholder cert), so the config itself is
 verified — what remains is the out-of-band setup Terraform can't do for you.
 
 1. **Bootstrap remote state** — create the state bucket and lock table (one-time,
-   with admin credentials), then enable the `backend "s3"` block commented in
+   with admin credentials — the account id suffix matters: S3 names are global
+   and the bare `meridian-terraform-state` is already taken), then enable the
+   `backend "s3"` block in
    `terraform/envs/dev/versions.tf` and re-init:
 
    ```sh
-   aws s3api create-bucket --bucket meridian-terraform-state \
+   aws s3api create-bucket --bucket meridian-terraform-state-<account-id> \
      --create-bucket-configuration LocationConstraint=eu-west-1
-   aws s3api put-bucket-versioning --bucket meridian-terraform-state \
+   aws s3api put-bucket-versioning --bucket meridian-terraform-state-<account-id> \
      --versioning-configuration Status=Enabled
-   aws s3api put-public-access-block --bucket meridian-terraform-state \
+   aws s3api put-public-access-block --bucket meridian-terraform-state-<account-id> \
      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
    aws dynamodb create-table --table-name meridian-terraform-lock \
      --attribute-definitions AttributeName=LockID,AttributeType=S \
