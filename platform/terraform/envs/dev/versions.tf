@@ -29,7 +29,7 @@ provider "aws" {
   default_tags {
     tags = {
       Project     = "meridian"
-      Environment = "dev"
+      Environment = var.environment
       ManagedBy   = "terraform"
     }
   }

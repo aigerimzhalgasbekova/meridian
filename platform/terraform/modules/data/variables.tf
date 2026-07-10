@@ -11,6 +11,16 @@ variable "private_subnet_ids" {
   type = list(string)
 }
 
+variable "ephemeral" {
+  description = <<-EOT
+    When true (cheap/dev), the RDS instance drops deletion protection and skips
+    the final snapshot so `terraform destroy` is clean for apply-demo-destroy
+    cycles. Keep false (prod) to guard the database.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "db_instance_class" {
   type    = string
   default = "db.t4g.micro"

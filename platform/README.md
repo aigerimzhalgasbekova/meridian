@@ -53,22 +53,52 @@ CI lives in `.github/workflows/` at the repo root (`ci.yml`, `release.yml`).
 - **Single-writer services pinned to one task**: keysmith (file keystore) and
   sentinel (hash-chained audit file) run on EFS with `max_count = 1`.
 
-## Cost estimate (eu-west-1, dev, monthly)
+## Cost estimate (eu-west-1, prod profile, monthly)
+
+The hardened `prod` footprint. The default `dev` profile is cheaper — see the
+next section.
 
 | Item | Sizing | ~USD |
 |------|--------|-----:|
 | Fargate | 7 × (0.25 vCPU / 0.5 GB), 730 h | 72 |
 | ALB | 1 + light LCU | 23 |
-| NAT gateway | single AZ | 35 |
+| NAT gateway | single AZ (prod only) | 35 |
 | RDS Postgres | db.t4g.micro, 20 GB gp3, single-AZ | 16 |
 | ElastiCache Redis | cache.t4g.micro, 1 node | 13 |
+| WAF | managed rule groups + rate limit (prod only) | 6 |
 | EFS | < 1 GB | 1 |
-| CloudWatch | dashboard + ~25 alarms + logs | 8 |
+| CloudWatch | dashboard + ~25 alarms + logs + Container Insights | 8 |
 | ECR / Cloud Map / Secrets Manager | | 2 |
-| **Total** | | **~170** |
+| **Total** | | **~176** |
 
-Biggest levers if that's too much: stop the cluster overnight (Fargate is
-per-second), or drop the four internal/demo services from `desired_count`.
+Biggest levers if that's too much: run the `dev` profile (below), stop the
+cluster overnight (Fargate is per-second), or drop the four internal/demo
+services from `desired_count`.
+
+## Environment profile: dev (default) vs prod
+
+`environment` in `terraform.tfvars` (default `"dev"`) selects one profile. `dev`
+is cheap and disposable for apply-demo-destroy cycles; `prod` is the durable,
+hardened set costed above. Everything else in the stack is identical.
+
+| | `dev` (default) | `prod` |
+|---|---|---|
+| NAT gateway | none — tasks run in the public subnets with public IPs; their security groups still allow **no** inbound from the internet, only the ALB and peer services | one NAT gateway (~$35/mo) |
+| WAF on the ALB | off | AWS managed rule groups + IP rate limit |
+| Container Insights | off (the CPU alarms use the base `AWS/ECS` namespace, so nothing is lost) | on |
+| RDS on `terraform destroy` | deletion protection off, final snapshot skipped — destroys clean | deletion protection on, final snapshot taken |
+| AWS Budgets alert | **created in both** | **created in both** |
+
+Dropping the NAT/WAF/Insights puts the running `dev` footprint near ~$130/mo;
+the largest remaining line is Fargate, tunable via `desired_count`. A monthly
+AWS Budget (`monthly_budget_usd`, default 200) emails `alarm_email` at 80% and
+100% actual and 100% forecast spend, in both profiles.
+
+> **State is per-directory, not per-`environment`.** This directory (`envs/dev`)
+> holds the dev state (backend key `envs/dev/terraform.tfstate`). Do **not**
+> flip `environment = "prod"` here — that would reuse the dev state and try to
+> rename every resource. A real prod deployment gets its own directory and
+> backend key (see "Adding prod" below).
 
 ## Runbook: first apply
 
@@ -154,6 +184,21 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
    from `compose/smoke.sh` with `IDP_URL=https://idp.meridian.example.com` (the dev
    realm only exists with `IDP_DEV_MODE=1`; in AWS, create a realm via the
    registration API first).
+
+## Adding a prod environment
+
+`envs/dev` is one deployment with its own state. To stand up prod, give it a
+separate state boundary rather than flipping `environment` in place:
+
+1. Copy `envs/dev` to `envs/prod`.
+2. In `envs/prod/versions.tf`, set the backend `key` to
+   `envs/prod/terraform.tfstate` (a distinct state file).
+3. In `envs/prod/terraform.tfvars`, set `environment = "prod"` and the prod
+   domain / certificate ARN.
+
+The composition is identical; only the profile toggles and the state key differ.
+When the duplication starts to hurt, extract the shared `envs/dev/main.tf` body
+into a `modules/stack` module that both environments call.
 
 ## Local stack
 

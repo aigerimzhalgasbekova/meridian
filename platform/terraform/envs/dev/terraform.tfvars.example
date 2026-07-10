@@ -6,3 +6,10 @@ domain          = "example.com"
 certificate_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
 image_tag       = "dev"
 alarm_email     = "you@example.com"
+
+# "dev" (default): cheap + ephemeral — no NAT/WAF/Container Insights, and a
+# destroy-clean database, for apply-demo-destroy cycles. "prod": the hardened,
+# durable set. A monthly AWS Budget alert (monthly_budget_usd, default 200) is
+# created either way — it emails alarm_email at 80%/100% actual and 100% forecast.
+environment        = "dev"
+# monthly_budget_usd = 200

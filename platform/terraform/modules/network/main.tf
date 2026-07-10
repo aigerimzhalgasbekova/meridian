@@ -2,6 +2,10 @@
 # A single NAT gateway is a deliberate cost trade-off for dev: ~$32/mo instead
 # of ~$65/mo for one per AZ; an AZ outage takes egress with it, which dev
 # tolerates. Bump to one-per-AZ by mapping over local.azs when it matters.
+#
+# var.enable_nat = false drops the NAT entirely (cheap dev): tasks then run in
+# the public subnets with public IPs for egress. Data services (RDS/Redis/EFS)
+# stay in the private subnets and need no egress, so no NAT is required there.
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -44,12 +48,14 @@ resource "aws_subnet" "private" {
 }
 
 resource "aws_eip" "nat" {
+  count  = var.enable_nat ? 1 : 0
   domain = "vpc"
   tags   = { Name = "${var.name}-nat" }
 }
 
 resource "aws_nat_gateway" "this" {
-  allocation_id = aws_eip.nat.id
+  count         = var.enable_nat ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
   subnet_id     = aws_subnet.public[0].id
   depends_on    = [aws_internet_gateway.this]
 
@@ -70,12 +76,16 @@ resource "aws_route_table" "public" {
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.this.id
 
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.this.id
-  }
-
   tags = { Name = "${var.name}-private" }
+}
+
+# Default route only exists when there's a NAT to send it to; without NAT the
+# private subnets carry data services that need no internet egress.
+resource "aws_route" "private_egress" {
+  count                  = var.enable_nat ? 1 : 0
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.this[0].id
 }
 
 resource "aws_route_table_association" "public" {
