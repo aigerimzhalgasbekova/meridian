@@ -1,6 +1,10 @@
 go 1.26.5
 
 use (
+	./bridge
+	./console
 	./idp
 	./keysmith
+	./sentinel
+	./sessiond
 )
