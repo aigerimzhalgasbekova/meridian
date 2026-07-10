@@ -152,6 +152,14 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
 4. **Apply** — `cd terraform/envs/dev && terraform init && terraform plan &&
    terraform apply`. Tasks will crash-loop until steps 5–7 complete; ECS keeps
    retrying, that's fine.
+
+   > **Task-definition changes need an explicit roll.** The service module
+   > sets `ignore_changes = [task_definition]` so CI releases don't fight
+   > Terraform. The flip side: `terraform apply` registers a new revision but
+   > the service keeps running the old one. After changing env/secrets, roll
+   > it yourself:
+   > `aws ecs update-service --cluster meridian-dev --service <name> --task-definition meridian-dev-<name> --force-new-deployment`
+   > (naming the family without a revision picks the latest).
 5. **Database bootstrap** — read the master password from the Secrets Manager
    ARN in `terraform output postgres_master_secret_arn`, then (via a bastion
    task or `aws ecs execute-command` helper container):
