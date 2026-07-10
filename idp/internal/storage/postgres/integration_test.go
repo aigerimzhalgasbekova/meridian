@@ -169,6 +169,11 @@ func TestAuthCodeConsumeConcurrent(t *testing.T) {
 // (zero) previous timestamp, so all of them would appear to be the first
 // poll and the interval check could be bypassed. Under the fix exactly one
 // caller sees the initial (zero) value.
+//
+// A coordinator transaction holds the row lock while the pollers queue up, so
+// they genuinely contend — fired bare, they finish microseconds apart, never
+// overlap, and the old buggy SQL passes by timing luck (verified: it survived
+// 10 unforced runs, and fails this version deterministically).
 func TestTouchPollConcurrent(t *testing.T) {
 	s := testStore(t)
 	seedRealm(t, s)
@@ -181,15 +186,21 @@ func TestTouchPollConcurrent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	lock, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.Exec(ctx,
+		`SELECT 1 FROM device_codes WHERE realm_name='test' AND device_code_hash='dev0' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
 	const n = 16
 	var wg sync.WaitGroup
-	start := make(chan struct{})
 	sawZero := make([]bool, n)
 	for i := range n {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			<-start
 			prev, err := s.DeviceCodes().TouchPoll(ctx, "test", "dev0", now.Add(time.Duration(i)*time.Second))
 			if err != nil {
 				t.Errorf("TouchPoll: %v", err)
@@ -198,7 +209,12 @@ func TestTouchPollConcurrent(t *testing.T) {
 			sawZero[i] = prev.IsZero()
 		}(i)
 	}
-	close(start)
+	// Let the pollers pile up on the row lock (each takes its statement
+	// snapshot while blocked), then release them all at once.
+	time.Sleep(300 * time.Millisecond)
+	if err := lock.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 	wg.Wait()
 	zeros := 0
 	for _, z := range sawZero {

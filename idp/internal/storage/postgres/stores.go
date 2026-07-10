@@ -60,8 +60,8 @@ func (s *clientStore) Create(ctx context.Context, c storage.Client) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO clients (realm_name, client_id, secret_hash, name, redirect_uris, grant_types, public, first_party, scopes, created_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		c.RealmName, c.ClientID, c.SecretHash, c.Name, c.RedirectURIs, c.GrantTypes,
-		c.Public, c.FirstParty, []string(c.Scopes), c.CreatedAt)
+		c.RealmName, c.ClientID, c.SecretHash, c.Name, arr(c.RedirectURIs), arr(c.GrantTypes),
+		c.Public, c.FirstParty, arr(c.Scopes), c.CreatedAt)
 	return mapErr(err)
 }
 
@@ -176,7 +176,7 @@ func (s *authCodeStore) Create(ctx context.Context, c storage.AuthCode) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO auth_codes (code_hash, realm_name, client_id, user_id, redirect_uri, scopes, nonce, code_challenge, auth_time, session_id, expires_at, created_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		c.CodeHash, c.RealmName, c.ClientID, c.UserID, c.RedirectURI, []string(c.Scopes),
+		c.CodeHash, c.RealmName, c.ClientID, c.UserID, c.RedirectURI, arr(c.Scopes),
 		c.Nonce, c.CodeChallenge, c.AuthTime, c.SessionID, c.ExpiresAt, c.CreatedAt)
 	return mapErr(err)
 }
@@ -239,7 +239,7 @@ func (s *refreshStore) Create(ctx context.Context, t storage.RefreshToken) error
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO refresh_tokens (token_hash, realm_name, family_id, client_id, user_id, scopes, auth_time, nonce, expires_at, created_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		t.TokenHash, t.RealmName, t.FamilyID, t.ClientID, t.UserID, []string(t.Scopes),
+		t.TokenHash, t.RealmName, t.FamilyID, t.ClientID, t.UserID, arr(t.Scopes),
 		t.AuthTime, t.Nonce, t.ExpiresAt, t.CreatedAt)
 	return mapErr(err)
 }
@@ -295,7 +295,7 @@ func (s *refreshStore) Rotate(ctx context.Context, realm, oldHash string, succes
 		`INSERT INTO refresh_tokens (token_hash, realm_name, family_id, client_id, user_id, scopes, auth_time, nonce, expires_at, created_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		successor.TokenHash, successor.RealmName, successor.FamilyID, successor.ClientID,
-		successor.UserID, []string(successor.Scopes), successor.AuthTime, successor.Nonce,
+		successor.UserID, arr(successor.Scopes), successor.AuthTime, successor.Nonce,
 		successor.ExpiresAt, successor.CreatedAt); err != nil {
 		return mapErr(err)
 	}
@@ -326,7 +326,7 @@ func (s *consentStore) Upsert(ctx context.Context, c storage.Consent) error {
 		 SET scopes = (
 		   SELECT array_agg(DISTINCT s) FROM unnest(consents.scopes || EXCLUDED.scopes) AS s
 		 ), updated_at = EXCLUDED.updated_at`,
-		c.RealmName, c.UserID, c.ClientID, []string(c.Scopes), c.GrantedAt, c.UpdatedAt)
+		c.RealmName, c.UserID, c.ClientID, arr(c.Scopes), c.GrantedAt, c.UpdatedAt)
 	return mapErr(err)
 }
 
@@ -361,7 +361,7 @@ func (s *deviceStore) Create(ctx context.Context, d storage.DeviceCode) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO device_codes (device_code_hash, user_code, realm_name, client_id, scopes, status, user_id, interval_secs, expires_at, created_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		d.DeviceCodeHash, d.UserCode, d.RealmName, d.ClientID, []string(d.Scopes),
+		d.DeviceCodeHash, d.UserCode, d.RealmName, d.ClientID, arr(d.Scopes),
 		string(d.Status), d.UserID, d.Interval, d.ExpiresAt, d.CreatedAt)
 	return mapErr(err)
 }

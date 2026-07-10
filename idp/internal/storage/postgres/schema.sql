@@ -40,9 +40,11 @@ CREATE TABLE IF NOT EXISTS users (
     disabled       BOOLEAN NOT NULL DEFAULT FALSE,
     created_at     TIMESTAMPTZ NOT NULL,
     updated_at     TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (realm_name, id),
-    UNIQUE (realm_name, lower(username))
+    PRIMARY KEY (realm_name, id)
 );
+-- Case-insensitive username uniqueness. A table-level UNIQUE constraint cannot
+-- contain an expression like lower(), so this must be a unique index.
+CREATE UNIQUE INDEX IF NOT EXISTS users_realm_username ON users (realm_name, lower(username));
 
 CREATE TABLE IF NOT EXISTS auth_codes (
     code_hash        TEXT PRIMARY KEY,
