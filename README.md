@@ -202,10 +202,12 @@ scripts/dev-all.sh         everything in dev mode, no Docker
 
 ## Status
 
-Not yet deployed: the Terraform for AWS is complete and reviewed but unapplied
-(AWS credentials pending). Everything above runs locally today. The
-[platform runbook](platform/README.md) documents the exact bring-up sequence for
-when credentials exist.
+Not yet deployed, but no longer untested. An AWS account now exists, and the
+dev environment's Terraform `init`, `validate`, and `plan` all pass cleanly
+against it — a full 166-resource plan with no diagnostics. Applying it still
+needs a domain, a DNS-validated ACM certificate, and the one-time remote-state
+bootstrap; the [platform runbook](platform/README.md) is the exact bring-up
+sequence. Everything above runs locally today.
 
 ## License
 

@@ -55,14 +55,14 @@ The iteration protocol from the design doc also belongs to this chapter: before 
 
 ## What's honestly pending
 
-No AWS credentials exist yet, so the following are designed but not applied:
+An AWS account now exists, but nothing is applied to it yet, so the following are designed and plan-verified but not deployed:
 
-- The `platform/` Terraform stacks (the eighth project) — written to be `terraform validate`/`plan`-clean, but nothing has been applied to a real account.
+- The `platform/` Terraform stacks (the eighth project) — now `terraform plan`-clean against the real account (166 resources, no diagnostics), but nothing has been applied.
 - Live demo URLs on this site — each project card says "deploy pending" and links to the code instead. The URLs live in [one config file](https://github.com/aikazzh/portfolio/blob/main/site/src/config.ts); when the platform deploys, they're a one-line change each.
 - SES-backed mail in portal (the `MailTransport` interface is one method; dev writes JSON files to an outbox).
 - KMS-backed KEK in keysmith, sentinel's external anchor push, and CloudWatch/X-Ray wiring.
 
-The handoff sequence when credentials arrive, per the design doc: create the account, set up an OIDC role for CI (no long-lived keys), `terraform apply` per environment, then swap the demo URLs into this site's config. Until then, the local dev modes are the demo — which is arguably the more reviewable artifact anyway: `make run-dev` asks nothing of the reviewer but a Go toolchain.
+The remaining handoff sequence, per the design doc: bootstrap remote state, get a domain plus a DNS-validated ACM certificate, set up an OIDC role for CI (no long-lived keys), `terraform apply` per environment, then swap the demo URLs into this site's config. Until then, the local dev modes are the demo — which is arguably the more reviewable artifact anyway: `make run-dev` asks nothing of the reviewer but a Go toolchain.
 
 ## Why "deploy-ready" is a real claim
 

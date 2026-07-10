@@ -10,7 +10,7 @@ name: release
 #      ECS deploy (RegisterTaskDefinition/UpdateService/DescribeTaskDefinition
 #      + iam:PassRole on the meridian-dev-* task/execution roles).
 #   3. Set repository variables: AWS_ROLE_ARN, AWS_REGION, ECR_REGISTRY
-#      (e.g. 123456789012.dkr.ecr.eu-central-1.amazonaws.com).
+#      (e.g. 123456789012.dkr.ecr.eu-west-1.amazonaws.com).
 #
 # Until those variables exist the workflow skips with a notice instead of
 # failing — the repo stays green while there is no AWS account.

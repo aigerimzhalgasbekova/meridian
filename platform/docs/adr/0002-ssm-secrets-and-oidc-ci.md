@@ -53,4 +53,4 @@ One-time setup:
 The trust policy's `sub` condition pins deploys to **tag pushes on this
 repository** — a compromised PR branch or fork cannot assume the role.
 Until the variables exist, release.yml exits with a notice instead of failing
-(no AWS account yet is a supported state).
+(the CI variables stay unset even though the account now exists — a supported state).

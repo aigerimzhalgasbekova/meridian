@@ -578,11 +578,11 @@ module "observability" {
 
   services = {
     keysmith = { service_name = module.keysmith.service_name }
-    idp      = { service_name = module.idp.service_name, target_group_arn_suffix = module.idp.target_group_arn_suffix }
+    idp      = { service_name = module.idp.service_name, alb = true, target_group_arn_suffix = module.idp.target_group_arn_suffix }
     sessiond = { service_name = module.sessiond.service_name }
     sentinel = { service_name = module.sentinel.service_name }
-    bridge   = { service_name = module.bridge.service_name, target_group_arn_suffix = module.bridge.target_group_arn_suffix }
-    portal   = { service_name = module.portal.service_name, target_group_arn_suffix = module.portal.target_group_arn_suffix }
-    console  = { service_name = module.console.service_name, target_group_arn_suffix = module.console.target_group_arn_suffix }
+    bridge   = { service_name = module.bridge.service_name, alb = true, target_group_arn_suffix = module.bridge.target_group_arn_suffix }
+    portal   = { service_name = module.portal.service_name, alb = true, target_group_arn_suffix = module.portal.target_group_arn_suffix }
+    console  = { service_name = module.console.service_name, alb = true, target_group_arn_suffix = module.console.target_group_arn_suffix }
   }
 }
