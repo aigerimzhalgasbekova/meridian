@@ -10,6 +10,83 @@ import (
 	"github.com/alicebob/miniredis/v2"
 )
 
+// concurrentCreates fires n Create calls for one user from a standing start
+// and returns their errors in call order.
+func concurrentCreates(t *testing.T, s *Store, n int) []error {
+	t.Helper()
+	ctx := context.Background()
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, _, errs[i] = s.Create(ctx, "acme", "alice", "127.0.0.1", "hammer")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	return errs
+}
+
+// TestConcurrentCreateRejectsPastCap and its evict-oldest twin are the tests
+// that hold createScript to being *one* script. The suite's other cap tests
+// call Create sequentially, so a cap enforced by a prune/count/write sequence
+// of separate round trips passes them all: each caller reads a count that a
+// racing caller is about to invalidate. Firing the creates in parallel is what
+// exposes it — replacing the script with client-side round trips lets 16-29 of
+// 32 callers through here.
+func TestConcurrentCreateRejectsPastCap(t *testing.T) {
+	mr := miniredis.RunT(t)
+	const maxPerUser, callers = 5, 32
+	s := testStore(t, mr, newFakeClock(), Config{
+		MaxPerUser: maxPerUser, Policy: Reject, CacheTTL: time.Millisecond,
+	})
+
+	created := 0
+	for i, err := range concurrentCreates(t, s, callers) {
+		switch {
+		case err == nil:
+			created++
+		case errors.Is(err, ErrSessionLimit):
+		default:
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	if created != maxPerUser {
+		t.Errorf("%d of %d concurrent creates succeeded, want exactly %d", created, callers, maxPerUser)
+	}
+	sessions, err := s.List(context.Background(), "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != maxPerUser {
+		t.Errorf("%d live sessions, want %d", len(sessions), maxPerUser)
+	}
+}
+
+func TestConcurrentCreateEvictOldestHoldsCap(t *testing.T) {
+	mr := miniredis.RunT(t)
+	const maxPerUser, callers = 5, 32
+	s := testStore(t, mr, newFakeClock(), Config{MaxPerUser: maxPerUser, CacheTTL: time.Millisecond})
+
+	// Under evict-oldest every caller succeeds; the cap holds by eviction.
+	for i, err := range concurrentCreates(t, s, callers) {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	sessions, err := s.List(context.Background(), "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != maxPerUser {
+		t.Errorf("%d live sessions after %d concurrent creates, cap is %d", len(sessions), callers, maxPerUser)
+	}
+}
+
 // TestConcurrentHammer runs create/validate/rotate/revoke in parallel from
 // two nodes against one Redis and checks the invariants that must survive any
 // interleaving: no error other than the sentinel ones, and the per-user cap

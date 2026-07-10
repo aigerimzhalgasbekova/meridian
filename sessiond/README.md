@@ -112,13 +112,39 @@ policy, cache TTL).
 ## Tests
 
 ```sh
-make test   # go test -race ./... — miniredis-backed, no Docker required
+make test       # go test -race ./... — miniredis-backed, no Docker required
+make test-int   # + a real Redis; needs TEST_REDIS_URL
 ```
 
-The suite pins the contracts, not just the happy paths: sliding vs absolute
-expiry under a fake clock moved in lockstep with miniredis `FastForward`,
-deadline enforcement when the Redis TTL is stale, cap eviction and rejection,
-revocation/rotation propagation across two store instances sharing one
-miniredis, the bounded-staleness window on a node that misses every broadcast,
-and a parallel create/touch/rotate/revoke hammer whose invariant is that the
-per-user cap holds on every node's view.
+The default suite pins the contracts, not just the happy paths: sliding vs
+absolute expiry under a fake clock moved in lockstep with miniredis
+`FastForward`, deadline enforcement when the Redis TTL is stale, cap eviction
+and rejection, revocation/rotation propagation across two store instances
+sharing one miniredis, the bounded-staleness window on a node that misses every
+broadcast, a parallel create/touch/rotate/revoke hammer whose invariant is that
+the per-user cap holds on every node's view, and 32 callers racing to create a
+session for one user — which fails loudly if the cap is ever enforced by
+anything other than a single script.
+
+That last one holds because miniredis is a faithful fake *for atomicity*: it
+applies each command under a lock, exactly as single-threaded Redis does. Where
+it stops being faithful is everything it reimplements rather than runs, and
+that is what `make test-int` covers:
+
+| miniredis | Redis | What only the real thing shows |
+|-----------|-------|-------------------------------|
+| gopher-lua | Lua 5.1 in Redis | `tostring()`/`tonumber()` and reply conversion. `rotateScript` writes `deadline_ms` back through `tostring()`; a number that renders as `1.7e+12` round-trips as a corrupt session. |
+| `FastForward` | a clock | That the `PEXPIRE` we issue carries the TTL we think it does, and that a touch renews it. |
+| in-process channels | pub/sub over a socket | That a revocation is serialized, published, and delivered to another node. |
+| direct eval | `EVALSHA` + script cache | That the scripts load and run at all. |
+
+```sh
+docker run -d --name meridian-redis-test -p 6380:6379 redis:7
+TEST_REDIS_URL='redis://localhost:6380/1' make test-int
+docker rm -f meridian-redis-test
+```
+
+The suite `FLUSHDB`s between tests, so point `TEST_REDIS_URL` at a throwaway
+database. CI runs it against an ephemeral `redis:7` service with
+`REQUIRE_TEST_REDIS_URL=1`, which turns a missing Redis into a red build rather
+than a suite that silently skips.

@@ -120,7 +120,7 @@ run; Go numbers include subtests):
 |-------|------:|-----------|
 | keysmith | 95 | every historical JOSE attack class as a regression test; rotation under a fake clock; concurrent signing during rotation |
 | idp | 117 | full browser flows via cookie jar against an in-process keysmith; refresh-reuse detection under real concurrency |
-| sessiond | 24 | staleness-bound proof on a node missing every broadcast; parallel cap-invariant hammer on miniredis |
+| sessiond | 26 (+7 need Redis) | staleness-bound proof on a node missing every broadcast; parallel cap-invariant hammer on miniredis |
 | sentinel (Go) | 68 | sliding-window/lockout/risk contracts; Go tests invoke the Python verifier cross-language |
 | sentinel (Python) | 14 | stdlib-only chain verification of a Go-written fixture |
 | bridge | 57 | fake upstream misbehavior: Entra tenanted issuer, breaker transitions, stale JWKS |
@@ -129,35 +129,53 @@ run; Go numbers include subtests):
 
 ### Integration tests
 
+Three services keep a `make test-int` suite that runs against the real backend
+instead of the in-process stand-in. Each is gated on an environment variable and
+skips without it, so the default `make test` stays dependency-free.
+
 idp and portal each ship **two** implementations of one storage interface —
 in-memory (dev, and what the flow tests run against) and Postgres (production).
 A single shared conformance suite runs against both, so the backends cannot
-drift apart unnoticed:
+drift apart unnoticed. sessiond has one implementation and a fake backend
+(miniredis); its integration suite re-runs the parts that only mean something
+on real Redis.
 
-| Project | Suite | Memory | Postgres |
-|---------|-------|--------|----------|
-| idp | `internal/storage/storagetest` | every `go test` | `make test-int` |
-| portal | `server/test/contract/` | every `npm test` | `npm test` with `TEST_DATABASE_URL` |
+| Project | Suite | Fast path | Real backend |
+|---------|-------|-----------|--------------|
+| idp | `internal/storage/storagetest` | memory, every `go test` | Postgres, `TEST_DATABASE_URL` |
+| portal | `server/test/contract/` | memory, every `npm test` | Postgres, `TEST_DATABASE_URL` |
+| sessiond | `internal/store/integration_test.go` | miniredis, every `go test` | Redis, `TEST_REDIS_URL` |
 
-Both Postgres suites are gated on `TEST_DATABASE_URL` and skip without it, so
-the default run stays dependency-free. To run them, give each project its own
-database — idp and portal both define a `users` table:
+What real Redis buys that miniredis cannot: miniredis's Lua is gopher-lua, its
+TTLs advance by `FastForward` rather than a clock, and its pub/sub is in-process
+channels. sessiond's whole design is Lua scripts, sliding TTLs, and a revocation
+broadcast, so all three matter. Atomicity is *not* on that list — miniredis
+applies commands under a lock exactly as single-threaded Redis does, and the
+concurrent-create cap tests in `concurrency_test.go` catch a non-atomic cap
+without Docker.
+
+idp and portal both define a `users` table, so give each its own database:
 
 ```sh
 docker run -d --name meridian-pg-test -p 5433:5432 -e POSTGRES_PASSWORD=pw postgres:17
+docker run -d --name meridian-redis-test -p 6380:6379 redis:7
 docker exec meridian-pg-test sh -c 'until pg_isready -U postgres -q; do sleep 1; done'
 docker exec meridian-pg-test createdb -U postgres idp_test
 docker exec meridian-pg-test createdb -U postgres portal_test
 
-(cd idp    && TEST_DATABASE_URL='postgres://postgres:pw@localhost:5433/idp_test?sslmode=disable' make test-int)
-(cd portal && TEST_DATABASE_URL='postgres://postgres:pw@localhost:5433/portal_test'              make test-int)
+(cd idp      && TEST_DATABASE_URL='postgres://postgres:pw@localhost:5433/idp_test?sslmode=disable' make test-int)
+(cd portal   && TEST_DATABASE_URL='postgres://postgres:pw@localhost:5433/portal_test'              make test-int)
+(cd sessiond && TEST_REDIS_URL='redis://localhost:6380/1'                                          make test-int)
 
-docker rm -f meridian-pg-test   # schemas are applied by the suites; the container is disposable
+docker rm -f meridian-pg-test meridian-redis-test   # schemas are applied by the suites; both are disposable
 ```
 
-CI runs both against an ephemeral `postgres:17` service. Those jobs also set
-`REQUIRE_TEST_DATABASE_URL=1`, which turns a missing database into a red build
-rather than a suite that silently skips.
+The sessiond suite `FLUSHDB`s between tests — point `TEST_REDIS_URL` at a
+throwaway database, never a shared one.
+
+CI runs all three against ephemeral `postgres:17` / `redis:7` services. Those
+jobs also set `REQUIRE_TEST_DATABASE_URL=1` / `REQUIRE_TEST_REDIS_URL=1`, which
+turns a missing backend into a red build rather than a suite that silently skips.
 
 ## Repo layout & docs map
 
