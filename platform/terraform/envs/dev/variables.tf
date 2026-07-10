@@ -42,3 +42,15 @@ variable "alarm_email" {
   type        = string
   default     = ""
 }
+
+variable "site_certificate_arn" {
+  description = "us-east-1 ACM cert for the CloudFront portfolio site. Empty skips site infrastructure (CloudFront needs the cert ISSUED first)."
+  type        = string
+  default     = ""
+}
+
+variable "github_repository" {
+  description = "owner/repo allowed to assume the CI role via GitHub OIDC."
+  type        = string
+  default     = "aigerimzhalgasbekova/meridian"
+}
