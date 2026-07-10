@@ -384,6 +384,10 @@ module "sessiond" {
 
 # sentinel — internal decision service; hash-chained audit log on EFS.
 module "sentinel" {
+  # The audit store flocks its JSONL file: exactly one writer, so deployments
+  # must stop the old task before starting the new one.
+  stop_before_start = true
+
   source = "../../modules/service"
 
   name           = "sentinel"
