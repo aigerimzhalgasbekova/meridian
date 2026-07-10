@@ -184,7 +184,7 @@ func TestEntraTenantedIssuer(t *testing.T) {
 
 	t.Run("iss with tid substituted verifies", func(t *testing.T) {
 		setTenant("tenant-a")
-		p := newEntra(t)
+		p := newEntra(t, "tenant-a")
 		token, nonce := authenticate(t, s, p)
 		claims, err := p.VerifyIDToken(ctx, token, nonce)
 		if err != nil {
@@ -198,7 +198,7 @@ func TestEntraTenantedIssuer(t *testing.T) {
 	t.Run("iss/tid mismatch rejected", func(t *testing.T) {
 		s.SetTokenIssuer(s.URL + "/tenant-a/v2.0")
 		s.SetExtraClaims(map[string]any{"tid": "tenant-b"}) // lies about its tenant
-		p := newEntra(t)
+		p := newEntra(t, "tenant-a", "tenant-b")
 		token, nonce := authenticate(t, s, p)
 		if _, err := p.VerifyIDToken(ctx, token, nonce); !errors.Is(err, ErrIssuerMismatch) {
 			t.Fatalf("got %v, want ErrIssuerMismatch", err)
@@ -208,7 +208,7 @@ func TestEntraTenantedIssuer(t *testing.T) {
 	t.Run("missing tid rejected", func(t *testing.T) {
 		s.SetTokenIssuer(s.URL + "/tenant-a/v2.0")
 		s.SetExtraClaims(nil)
-		p := newEntra(t)
+		p := newEntra(t, "tenant-a")
 		token, nonce := authenticate(t, s, p)
 		if _, err := p.VerifyIDToken(ctx, token, nonce); !errors.Is(err, ErrIssuerMismatch) {
 			t.Fatalf("got %v, want ErrIssuerMismatch", err)
@@ -312,6 +312,16 @@ func TestDiscoveryValidation(t *testing.T) {
 		_, err := New(Config{Name: "x", Issuer: "https://x/" + TenantPlaceholder, ClientID: "c"})
 		if err == nil {
 			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("templated issuer with empty AllowedTenants rejected", func(t *testing.T) {
+		_, err := New(Config{
+			Name: "x", Issuer: "https://x/" + TenantPlaceholder, ClientID: "c",
+			DiscoveryURL: "https://x/.well-known/openid-configuration",
+		})
+		if err == nil {
+			t.Fatal("multi-tenant Entra config with empty AllowedTenants must be rejected")
 		}
 	})
 }

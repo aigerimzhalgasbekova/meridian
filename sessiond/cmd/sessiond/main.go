@@ -12,7 +12,9 @@
 //	SESSIOND_MAX_PER_USER  concurrent session cap (default 5)
 //	SESSIOND_LIMIT_POLICY  evict-oldest (default) or reject
 //	SESSIOND_CACHE_TTL     local cache TTL / staleness bound, e.g. 2s (default)
-//	SESSIOND_DEMO          1 mounts the browser demo at /demo (auto-on in dev mode)
+//	SESSIOND_DEMO          (removed) demo mode now follows SESSIOND_DEV_MODE only,
+//	                       since it mints unauthenticated sessions and must never
+//	                       be reachable against a real Redis.
 package main
 
 import (
@@ -82,7 +84,10 @@ func run(logger *slog.Logger) error {
 	if redisURL == "" && !devMode {
 		return errors.New("SESSIOND_REDIS_URL required (or set SESSIOND_DEV_MODE=1)")
 	}
-	if redisURL == "" {
+	// Demo routes mint real sessions without auth, so they may only run against
+	// the throwaway embedded store — never a Redis someone pointed at prod.
+	embedded := redisURL == ""
+	if embedded {
 		mr, err := miniredis.Run()
 		if err != nil {
 			return fmt.Errorf("embedded miniredis: %w", err)
@@ -144,7 +149,7 @@ func run(logger *slog.Logger) error {
 
 	srv := server.New(st, server.Config{
 		APITokens:  splitList(os.Getenv("SESSIOND_API_TOKENS")),
-		EnableDemo: devMode || os.Getenv("SESSIOND_DEMO") == "1",
+		EnableDemo: devMode && embedded,
 		Logger:     logger,
 	})
 

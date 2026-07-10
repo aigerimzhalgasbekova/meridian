@@ -71,8 +71,10 @@ type Config struct {
 	ClientSecret string
 	// Scopes defaults to openid, email, profile.
 	Scopes []string
-	// AllowedTenants, when non-empty for a templated issuer, restricts which
-	// tid values are accepted. Empty means any tenant (true multi-tenant).
+	// AllowedTenants restricts which tid values are accepted for a templated
+	// (multi-tenant) issuer. Required non-empty for such issuers — New
+	// rejects an empty list rather than admitting any Microsoft tenant on
+	// earth.
 	AllowedTenants []string
 }
 
@@ -90,8 +92,8 @@ func Google(clientID, clientSecret string) Config {
 // Entra returns the preset for Microsoft Entra ID. tenant is a tenant GUID,
 // a verified domain, or one of the pseudo-tenants "common" / "organizations"
 // / "consumers". For pseudo-tenants the issuer is the {tenantid} template and
-// per-token tenant validation applies (see package doc); pass allowedTenants
-// to pin which tenants may sign in.
+// per-token tenant validation applies (see package doc); allowedTenants is
+// required for these pseudo-tenants — New rejects the config otherwise.
 func Entra(tenant, clientID, clientSecret string, allowedTenants ...string) Config {
 	cfg := Config{
 		Name:         "entra",
@@ -177,6 +179,9 @@ func WithBreaker(b *health.Breaker) Option { return func(p *Provider) { p.breake
 func New(cfg Config, opts ...Option) (*Provider, error) {
 	if cfg.Name == "" || cfg.Issuer == "" || cfg.ClientID == "" {
 		return nil, errors.New("provider: Name, Issuer and ClientID are required")
+	}
+	if strings.Contains(cfg.Issuer, TenantPlaceholder) && len(cfg.AllowedTenants) == 0 {
+		return nil, errors.New("provider: multi-tenant Entra endpoint requires a non-empty AllowedTenants list")
 	}
 	if cfg.DiscoveryURL == "" {
 		if strings.Contains(cfg.Issuer, TenantPlaceholder) {
