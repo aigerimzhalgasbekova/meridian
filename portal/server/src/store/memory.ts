@@ -17,6 +17,13 @@ export function memoryStore(): Store {
   return {
     users: {
       async create(u) {
+        // Mirrors the users.email UNIQUE constraint. Signup checks findByEmail
+        // first, so this is what stops two concurrent signups from both
+        // creating the same account — without it, dev and test would accept a
+        // duplicate that production rejects.
+        for (const existing of users.values()) {
+          if (existing.email === u.email) throw new Error('duplicate email');
+        }
         const user: User = { ...u, id: randomUUID(), createdAt: new Date() };
         users.set(user.id, user);
         return { ...user };
