@@ -8,7 +8,7 @@ Password reset, email change, MFA enrollment: the flows that rarely get engineer
 
 ## Enumeration-safe by construction
 
-`POST /api/auth/forgot` takes an email address. If its behavior differs for existing vs. unknown accounts — status, body, or *response time* — it becomes an oracle for harvesting valid emails: a real finding in most pentests and a GDPR-relevant disclosure. [ADR 0003](https://github.com/aikazzh/portfolio/blob/main/portal/docs/adr/0003-enumeration-safe-reset.md) makes the two paths identical three ways:
+`POST /api/auth/forgot` takes an email address. If its behavior differs for existing vs. unknown accounts — status, body, or *response time* — it becomes an oracle for harvesting valid emails: a real finding in most pentests and a GDPR-relevant disclosure. [ADR 0003](https://github.com/aigerimzhalgasbekova/meridian/blob/main/portal/docs/adr/0003-enumeration-safe-reset.md) makes the two paths identical three ways:
 
 1. **Identical response:** `202 {"ok":true}` either way.
 2. **Uniform timing:** the handler runs under `withMinDuration(100ms)` — it never responds faster than the floor, masking the work difference between "look up, generate token, enqueue email" and "look up, stop".
@@ -22,9 +22,9 @@ One honest exception, documented in the ADR: signup's 409-on-duplicate *is* an e
 
 ## TOTP from the RFC up
 
-MFA enrollment uses TOTP — implemented directly on `node:crypto`, about 60 lines, rather than an npm package ([ADR 0002](https://github.com/aikazzh/portfolio/blob/main/portal/docs/adr/0002-hand-rolled-totp.md)). The algorithm is small and frozen (one HMAC, a dynamic-truncation offset, a modulus; unchanged since 2011), the npm options are a poor trade (`speakeasy` unmaintained since 2017, `otplib` a dependency tree for one screen of code), and the RFCs publish test vectors that make correctness objective — the suite pins every one of RFC 4226 Appendix D and RFC 6238 Appendix B.
+MFA enrollment uses TOTP — implemented directly on `node:crypto`, about 60 lines, rather than an npm package ([ADR 0002](https://github.com/aigerimzhalgasbekova/meridian/blob/main/portal/docs/adr/0002-hand-rolled-totp.md)). The algorithm is small and frozen (one HMAC, a dynamic-truncation offset, a modulus; unchanged since 2011), the npm options are a poor trade (`speakeasy` unmaintained since 2017, `otplib` a dependency tree for one screen of code), and the RFCs publish test vectors that make correctness objective — the suite pins every one of RFC 4226 Appendix D and RFC 6238 Appendix B.
 
-The core, from [`totp.ts`](https://github.com/aikazzh/portfolio/blob/main/portal/server/src/crypto/totp.ts):
+The core, from [`totp.ts`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/portal/server/src/crypto/totp.ts):
 
 ```ts
 export function hotp(secret: Buffer, counter: bigint, digits = TOTP_DIGITS, algorithm = 'sha1'): string {
@@ -42,12 +42,12 @@ The ADR's real argument: **the hard parts are policy, not math, and libraries do
 
 ## Postgres as a job queue
 
-Verification and reset emails are sent asynchronously, which needs a durable queue with retries and dead-lettering. The conventional reflex is Redis (BullMQ) or SQS. [ADR 0001](https://github.com/aikazzh/portfolio/blob/main/portal/docs/adr/0001-postgres-job-queue.md): portal already has Postgres — an external queue adds an infrastructure component, a client library, a failure mode, a local-dev story, and the dual-write problem, to move a handful of emails per minute.
+Verification and reset emails are sent asynchronously, which needs a durable queue with retries and dead-lettering. The conventional reflex is Redis (BullMQ) or SQS. [ADR 0001](https://github.com/aigerimzhalgasbekova/meridian/blob/main/portal/docs/adr/0001-postgres-job-queue.md): portal already has Postgres — an external queue adds an infrastructure component, a client library, a failure mode, a local-dev story, and the dual-write problem, to move a handful of emails per minute.
 
 Instead: a `jobs` table claimed with `SELECT … FOR UPDATE SKIP LOCKED` — the textbook mechanism for competing consumers on a relational queue; concurrent workers each lock a different row with no advisory locks and no contention loops. Exponential backoff (1s·4ⁿ, capped at 5 minutes), `max_attempts`, then a `dead` status as the parking lot. The ceiling is stated rather than discovered later: row-claim queues degrade around thousands of jobs/second from table bloat and vacuum pressure; portal is orders of magnitude below, handlers are idempotent, and the `JobQueue` interface is five methods if a broker swap ever earns its keep.
 
 The testing move worth copying: the in-memory queue mirrors the claim semantics *exactly* — selection and status-flip in one synchronous step, the clock passed in rather than read ambiently — so retry, backoff, dead-lettering, and two-worker exclusivity are tested without a database, and the identical suite runs against real Postgres when `TEST_DATABASE_URL` is set. (The clock-as-argument rule was learned the hard way; the story is in [chapter 10](/guide/lessons-learned/).)
 
-One threat-model item that's easy to miss: job payloads embed the emailed link, raw token included, so the `jobs` table and the dev outbox directory are secret-bearing — dead-lettered rows should be purged, not archived. It's in the [threat model](https://github.com/aikazzh/portfolio/blob/main/portal/THREAT_MODEL.md) because that's where operational footguns belong.
+One threat-model item that's easy to miss: job payloads embed the emailed link, raw token included, so the `jobs` table and the dev outbox directory are secret-bearing — dead-lettered rows should be purged, not archived. It's in the [threat model](https://github.com/aigerimzhalgasbekova/meridian/blob/main/portal/THREAT_MODEL.md) because that's where operational footguns belong.
 
 **Verified by:** `npm test` — 50 tests pass, 3 skipped (the Postgres integration suite, which runs when `TEST_DATABASE_URL` is set). The 22 TOTP tests include every published RFC vector; the 20 API tests drive the full HTTP flows, including asserting the enumeration-safe paths return byte-identical bodies above the timing floor.

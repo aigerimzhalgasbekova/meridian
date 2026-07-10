@@ -20,17 +20,17 @@ The two timing invariants that make this airtight are validated at service const
 - `JWKSMaxAge ≤ PendingDwell / 2` — every verifier cache must refresh (picking up the pending key) before that key can start signing.
 - `MaxTokenTTL ≤ RetireAfter` — no token can outlive its key's publication window.
 
-An unsafe configuration fails to boot. See [ADR 0003 — rotation state machine](https://github.com/aikazzh/portfolio/blob/main/keysmith/docs/adr/0003-rotation-state-machine.md).
+An unsafe configuration fails to boot. See [ADR 0003 — rotation state machine](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/docs/adr/0003-rotation-state-machine.md).
 
 ## Key design decisions
 
-- **[ADR 0001 — minimal JOSE instead of a library.](https://github.com/aikazzh/portfolio/blob/main/keysmith/docs/adr/0001-minimal-jose-implementation.md)** ~600 lines of protocol plumbing over stdlib crypto only. "Don't roll your own crypto" applies to primitives, not to the parsing-and-policy layer where most real JWT CVEs have actually lived. Owning the layer deletes the vulnerable degrees of freedom structurally: no `alg: none`, no HMAC (so no RS256→HS256 confusion), no `jwk`/`jku`/`x5u`/`crit`, unknown header parameters rejected, and the pinned key set — never the token — decides the algorithm.
-- **[ADR 0002 — envelope encryption.](https://github.com/aikazzh/portfolio/blob/main/keysmith/docs/adr/0002-envelope-encryption.md)** Per-key AES-256-GCM DEKs wrapped by a two-method KEK interface (`Wrap`/`Unwrap`) — exactly the shape of a cloud KMS API, so the production KMS-backed KEK is a drop-in. GCM AAD binds each ciphertext to its key ID and algorithm, so an attacker shuffling records in the keystore file produces integrity failures, not key confusion.
-- **[ADR 0003 — the rotation machine](https://github.com/aikazzh/portfolio/blob/main/keysmith/docs/adr/0003-rotation-state-machine.md)** is driven by an idempotent `Tick()`: cold-start bootstrap, availability recovery, pre-rotation generation, dwell-gated promotion, retirement. `Promote(force=true)` exists for key-compromise response and is audited.
+- **[ADR 0001 — minimal JOSE instead of a library.](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/docs/adr/0001-minimal-jose-implementation.md)** ~600 lines of protocol plumbing over stdlib crypto only. "Don't roll your own crypto" applies to primitives, not to the parsing-and-policy layer where most real JWT CVEs have actually lived. Owning the layer deletes the vulnerable degrees of freedom structurally: no `alg: none`, no HMAC (so no RS256→HS256 confusion), no `jwk`/`jku`/`x5u`/`crit`, unknown header parameters rejected, and the pinned key set — never the token — decides the algorithm.
+- **[ADR 0002 — envelope encryption.](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/docs/adr/0002-envelope-encryption.md)** Per-key AES-256-GCM DEKs wrapped by a two-method KEK interface (`Wrap`/`Unwrap`) — exactly the shape of a cloud KMS API, so the production KMS-backed KEK is a drop-in. GCM AAD binds each ciphertext to its key ID and algorithm, so an attacker shuffling records in the keystore file produces integrity failures, not key confusion.
+- **[ADR 0003 — the rotation machine](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/docs/adr/0003-rotation-state-machine.md)** is driven by an idempotent `Tick()`: cold-start bootstrap, availability recovery, pre-rotation generation, dwell-gated promotion, retirement. `Promote(force=true)` exists for key-compromise response and is audited.
 
 ## Security highlights
 
-From the [threat model](https://github.com/aikazzh/portfolio/blob/main/keysmith/THREAT_MODEL.md): the JWKS endpoint is public and carries no secrets; signer and admin tokens are separate classes compared in constant time; `exp`/`iat` are server-set with a TTL cap so a stolen signer token cannot mint long-lived tokens; `/v1/verify` returns coarse reasons only so verification errors can't become a forgery oracle; private-JWK serialization does not exist in the codebase (tested). Accepted residual risks — LocalKEK in process memory, single-writer file store, no HSM — are documented rather than hidden.
+From the [threat model](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/THREAT_MODEL.md): the JWKS endpoint is public and carries no secrets; signer and admin tokens are separate classes compared in constant time; `exp`/`iat` are server-set with a TTL cap so a stolen signer token cannot mint long-lived tokens; `/v1/verify` returns coarse reasons only so verification errors can't become a forgery oracle; private-JWK serialization does not exist in the codebase (tested). Accepted residual risks — LocalKEK in process memory, single-writer file store, no HSM — are documented rather than hidden.
 
 ## Verified by
 
@@ -40,6 +40,6 @@ From the [threat model](https://github.com/aikazzh/portfolio/blob/main/keysmith/
 
 ## Code worth reading
 
-- [`jose/jws.go`](https://github.com/aikazzh/portfolio/blob/main/keysmith/jose/jws.go) — `Verify` and its strict, non-negotiable header policy (`DisallowUnknownFields`, hard rejection of `crit`/`jwk`/`jku`/`x5u`/`x5c`, key set as the algorithm authority).
-- [`keystore/`](https://github.com/aikazzh/portfolio/tree/main/keysmith/keystore) — the lifecycle manager and envelope encryption.
-- [`client/`](https://github.com/aikazzh/portfolio/tree/main/keysmith/client) — the verifier-side JWKS cache with stale-if-error behavior and kid-miss refresh.
+- [`jose/jws.go`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/keysmith/jose/jws.go) — `Verify` and its strict, non-negotiable header policy (`DisallowUnknownFields`, hard rejection of `crit`/`jwk`/`jku`/`x5u`/`x5c`, key set as the algorithm authority).
+- [`keystore/`](https://github.com/aigerimzhalgasbekova/meridian/tree/main/keysmith/keystore) — the lifecycle manager and envelope encryption.
+- [`client/`](https://github.com/aigerimzhalgasbekova/meridian/tree/main/keysmith/client) — the verifier-side JWKS cache with stale-if-error behavior and kid-miss refresh.

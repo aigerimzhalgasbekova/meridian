@@ -8,7 +8,7 @@ When an admin is denied, the operational question is always "why?" — and in mo
 
 ## The model, sized to the domain
 
-[ADR 0001](https://github.com/aikazzh/portfolio/blob/main/console/docs/adr/0001-rbac-with-explanation.md) weighs RBAC against ABAC and ReBAC and picks RBAC deliberately. Console administration has a small, stable set of operations and job functions; ABAC's power buys nothing here and costs a policy language — parsing, evaluation semantics, and a whole class of misconfiguration. ReBAC (Zanzibar-style) earns its complexity when permissions follow deep object graphs; the console's only relationship is "user belongs to realm", which a one-field `Scope` expresses.
+[ADR 0001](https://github.com/aigerimzhalgasbekova/meridian/blob/main/console/docs/adr/0001-rbac-with-explanation.md) weighs RBAC against ABAC and ReBAC and picks RBAC deliberately. Console administration has a small, stable set of operations and job functions; ABAC's power buys nothing here and costs a policy language — parsing, evaluation semantics, and a whole class of misconfiguration. ReBAC (Zanzibar-style) earns its complexity when permissions follow deep object graphs; the console's only relationship is "user belongs to realm", which a one-field `Scope` expresses.
 
 The insight worth keeping: **choosing the simpler model is what makes explainability affordable.** RBAC evaluation is a flat walk over assignments and inheritance chains — the trace *is* the evaluation. An honest ABAC explanation is a policy-language interpreter trace; few systems ship one because it's hard.
 
@@ -16,7 +16,7 @@ So: permissions are `resource:action` with wildcard actions (`users:*`) and the 
 
 ## Deny overrides, and why not specificity
 
-Wildcards plus inheritance means two rules can match one query with opposite effects. [ADR 0002](https://github.com/aikazzh/portfolio/blob/main/console/docs/adr/0002-deny-overrides-allow.md) fixes the precedence:
+Wildcards plus inheritance means two rules can match one query with opposite effects. [ADR 0002](https://github.com/aigerimzhalgasbekova/meridian/blob/main/console/docs/adr/0002-deny-overrides-allow.md) fixes the precedence:
 
 ```
 explicit deny > allow > default deny
@@ -28,7 +28,7 @@ It also enables the useful patterns: "everything on users except delete" is one 
 
 ## The trace is a contract
 
-`Check(subject, permission, scope)` returns a `Decision` that records everything considered — including assignments skipped for scope mismatch and roles that matched nothing — because "why was this denied" is only answerable if the near-misses are visible. The engine ([`rbac/rbac.go`](https://github.com/aikazzh/portfolio/blob/main/console/rbac/rbac.go), a pure library with zero I/O) builds the trace as it evaluates:
+`Check(subject, permission, scope)` returns a `Decision` that records everything considered — including assignments skipped for scope mismatch and roles that matched nothing — because "why was this denied" is only answerable if the near-misses are visible. The engine ([`rbac/rbac.go`](https://github.com/aigerimzhalgasbekova/meridian/blob/main/console/rbac/rbac.go), a pure library with zero I/O) builds the trace as it evaluates:
 
 ```go
 at := AssignmentTrace{Assignment: a, ScopeMatch: a.Scope.covers(scope)}
@@ -45,7 +45,7 @@ Traces are contract, not log: tests assert on trace shape (chain order, matched 
 
 ## Scope on the assignment, and the two write rules
 
-[ADR 0003](https://github.com/aikazzh/portfolio/blob/main/console/docs/adr/0003-scope-model.md): scope lives on the assignment (`{subject, role, scope}`), so one `realm-admin` role serves every realm and the role catalog never explodes combinatorially. The tenancy boundary then reduces to two write rules:
+[ADR 0003](https://github.com/aigerimzhalgasbekova/meridian/blob/main/console/docs/adr/0003-scope-model.md): scope lives on the assignment (`{subject, role, scope}`), so one `realm-admin` role serves every realm and the role catalog never explodes combinatorially. The tenancy boundary then reduces to two write rules:
 
 - **Role definitions are global objects**, so `roles:write` is checked at *global* scope. A realm-admin cannot mint roles — a role they authored would be assignable in other realms, exceeding their authority.
 - **Assignment writes are checked at the scope being granted.** This single check is the whole boundary: alice, realm-admin of engineering, can assign `viewer` at `realm:engineering`; assigning at `realm:finance` or globally is denied. Delegation within your own realm is allowed by design; escalation to global is impossible because no realm-scoped check covers it.
@@ -54,7 +54,7 @@ Traces are contract, not log: tests assert on trace shape (chain order, matched 
 
 The console's own API is authorized by the same engine it administers. `POST /v1/roles` goes through `rbac.Check` like everything else; a denied admin gets the trace in the 403 body. There is no backdoor path — if the model can't express an operation, the console can't perform it, including against its operator. Self-lockout (an admin revoking their own access) is deliberately *not* prevented: deny-by-default beats magic exemptions, and recovery is a documented re-seed. Every mutation attempt, allowed or denied, lands in the audit trail.
 
-The [threat model](https://github.com/aikazzh/portfolio/blob/main/console/THREAT_MODEL.md) models the control plane honestly: the primary adversary is the authenticated-but-malicious admin, and the dev-grade HS256 verifier is called out *in the threat model* (a shared symmetric key means anyone who can verify can also mint), with the production keysmith-JWKS Ed25519 verifier behind the same one-method interface.
+The [threat model](https://github.com/aigerimzhalgasbekova/meridian/blob/main/console/THREAT_MODEL.md) models the control plane honestly: the primary adversary is the authenticated-but-malicious admin, and the dev-grade HS256 verifier is called out *in the threat model* (a shared symmetric key means anyone who can verify can also mint), with the production keysmith-JWKS Ed25519 verifier behind the same one-method interface.
 
 Try it locally: `make run-dev` seeds two realms and six personas; act as `alice` (engineering realm-admin), try to disable a finance user, and read the trace in the 403.
 

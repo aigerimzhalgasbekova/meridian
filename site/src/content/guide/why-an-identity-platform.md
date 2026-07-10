@@ -6,7 +6,7 @@ summary: The scope, the decomposition into interlocking projects, and what makes
 
 Most portfolio projects are apps with a login screen. This one is the login screen — and everything behind it: keys, tokens, sessions, federation, rate limits, account recovery, and the authorization layer that decides who may administer all of it.
 
-Meridian is a standards-aligned IAM platform of the kind a mid-size company would run to centralize authentication. It was designed as eight interlocking projects (seven services plus the deployment platform), each a standalone, reviewable codebase. The organizing principle, stated in the [design document](https://github.com/aikazzh/portfolio/blob/main/docs/design/2026-07-09-meridian-platform-design.md) before any code existed:
+Meridian is a standards-aligned IAM platform of the kind a mid-size company would run to centralize authentication. It was designed as eight interlocking projects (seven services plus the deployment platform), each a standalone, reviewable codebase. The organizing principle, stated in the [design document](https://github.com/aigerimzhalgasbekova/meridian/blob/main/docs/design/2026-07-09-meridian-platform-design.md) before any code existed:
 
 > Every project must answer a different engineering question. Not eight CRUD apps with login screens — eight distinct problem shapes.
 
@@ -28,7 +28,7 @@ The eighth project — `platform`: Terraform, CI/CD, the one-command local stack
 
 The original brief listed candidate projects and granted latitude to swap or merge. Three restructurings mattered:
 
-**"Centralized Login" and "OIDC Provider" merged into one `idp`.** OIDC is a profile *on top of* OAuth 2.0 — the ID token, userinfo, and discovery extend the same authorization-code and token endpoints. Splitting them yields two servers each implementing half of the same flow, kept byte-compatible by hope ([ADR](https://github.com/aikazzh/portfolio/blob/main/idp/docs/adr/0001-merge-oauth-oidc.md)). The genuinely different problem hiding inside "centralized login" — distributed session management — became `sessiond`, where it isn't overshadowed by protocol surface.
+**"Centralized Login" and "OIDC Provider" merged into one `idp`.** OIDC is a profile *on top of* OAuth 2.0 — the ID token, userinfo, and discovery extend the same authorization-code and token endpoints. Splitting them yields two servers each implementing half of the same flow, kept byte-compatible by hope ([ADR](https://github.com/aigerimzhalgasbekova/meridian/blob/main/idp/docs/adr/0001-merge-oauth-oidc.md)). The genuinely different problem hiding inside "centralized login" — distributed session management — became `sessiond`, where it isn't overshadowed by protocol surface.
 
 **Key management was promoted to project #1.** Every other service consumes keysmith's signing or verification surface. Building it first forces an honest interface instead of a retrofitted one. [Chapter 2](/guide/keys-before-tokens/) is the full argument.
 
@@ -48,4 +48,4 @@ A few decisions hold everywhere, and they're the ones that shape how the code re
 
 Chapters 2–8 walk the seven services in dependency order — the same order they were built, because dependencies flow backward only (idp consumes keysmith, never the reverse). Each chapter focuses on the one architectural idea that project exists to demonstrate, quotes the real code, and links the ADR where the trade-offs are argued properly. Chapter 9 covers deployment; chapter 10 is the honest retrospective — including the bugs.
 
-Everything here is checkable: the claims link to files in the [monorepo](https://github.com/aikazzh/portfolio), and the "verified by" sections on the project pages cite test runs from this machine, not aspirations.
+Everything here is checkable: the claims link to files in the [monorepo](https://github.com/aigerimzhalgasbekova/meridian), and the "verified by" sections on the project pages cite test runs from this machine, not aspirations.
