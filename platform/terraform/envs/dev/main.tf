@@ -13,11 +13,16 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  name     = "meridian-dev"
+  name     = "meridian-${var.environment}"
   services = ["keysmith", "idp", "sessiond", "sentinel", "bridge", "portal", "console"]
 
+  # prod = hardened + durable; anything else = cheap + ephemeral (see variables.tf).
+  is_prod   = var.environment == "prod"
+  ephemeral = !local.is_prod # RDS: no deletion protection, no final snapshot
+  cheap     = !local.is_prod # no NAT/WAF/Container Insights
+
   # SSM SecureString parameters created out-of-band (runbook step 3).
-  ssm = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/meridian/dev"
+  ssm = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/meridian/${var.environment}"
 
   sd_domain = "meridian.local"
 }
@@ -25,8 +30,9 @@ locals {
 # --- Shared plumbing ---------------------------------------------------------
 
 module "network" {
-  source = "../../modules/network"
-  name   = local.name
+  source     = "../../modules/network"
+  name       = local.name
+  enable_nat = !local.cheap
 }
 
 module "data" {
@@ -34,6 +40,7 @@ module "data" {
   name               = local.name
   vpc_id             = module.network.vpc_id
   private_subnet_ids = module.network.private_subnet_ids
+  ephemeral          = local.ephemeral
 }
 
 resource "aws_ecr_repository" "svc" {
@@ -51,8 +58,10 @@ resource "aws_ecs_cluster" "this" {
   name = local.name
 
   setting {
-    name  = "containerInsights"
-    value = "enabled"
+    name = "containerInsights"
+    # The CPU alarms/dashboard use the base AWS/ECS namespace, which exists
+    # without Container Insights, so cheap mode drops it with no alarm loss.
+    value = local.cheap ? "disabled" : "enabled"
   }
 }
 
@@ -135,6 +144,8 @@ resource "aws_lb" "this" {
 # --- WAFv2 (SEC04-BP01: filter common web attacks + rate-limit) -------------
 
 resource "aws_wafv2_web_acl" "this" {
+  count = local.cheap ? 0 : 1
+
   name  = "${local.name}-waf"
   scope = "REGIONAL"
 
@@ -207,8 +218,10 @@ resource "aws_wafv2_web_acl" "this" {
 }
 
 resource "aws_wafv2_web_acl_association" "alb" {
+  count = local.cheap ? 0 : 1
+
   resource_arn = aws_lb.this.arn
-  web_acl_arn  = aws_wafv2_web_acl.this.arn
+  web_acl_arn  = aws_wafv2_web_acl.this[0].arn
 }
 
 resource "aws_lb_listener" "https" {
@@ -247,10 +260,13 @@ resource "aws_lb_listener" "http_redirect" {
 
 locals {
   common = {
-    env_name                       = local.name
-    cluster_arn                    = aws_ecs_cluster.this.arn
-    vpc_id                         = module.network.vpc_id
-    private_subnet_ids             = module.network.private_subnet_ids
+    env_name    = local.name
+    cluster_arn = aws_ecs_cluster.this.arn
+    vpc_id      = module.network.vpc_id
+    # No NAT in cheap mode: tasks run in public subnets with public IPs for
+    # egress. Their SGs still allow ingress only from the ALB / peer services.
+    subnet_ids                     = local.cheap ? module.network.public_subnet_ids : module.network.private_subnet_ids
+    assign_public_ip               = local.cheap
     service_discovery_namespace_id = aws_service_discovery_private_dns_namespace.this.id
     region                         = var.region
   }
@@ -290,7 +306,8 @@ module "keysmith" {
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
   vpc_id                         = local.common.vpc_id
-  private_subnet_ids             = local.common.private_subnet_ids
+  subnet_ids                     = local.common.subnet_ids
+  assign_public_ip               = local.common.assign_public_ip
   service_discovery_namespace_id = local.common.service_discovery_namespace_id
   region                         = local.common.region
 }
@@ -330,7 +347,8 @@ module "idp" {
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
   vpc_id                         = local.common.vpc_id
-  private_subnet_ids             = local.common.private_subnet_ids
+  subnet_ids                     = local.common.subnet_ids
+  assign_public_ip               = local.common.assign_public_ip
   service_discovery_namespace_id = local.common.service_discovery_namespace_id
   region                         = local.common.region
 }
@@ -355,7 +373,8 @@ module "sessiond" {
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
   vpc_id                         = local.common.vpc_id
-  private_subnet_ids             = local.common.private_subnet_ids
+  subnet_ids                     = local.common.subnet_ids
+  assign_public_ip               = local.common.assign_public_ip
   service_discovery_namespace_id = local.common.service_discovery_namespace_id
   region                         = local.common.region
 }
@@ -390,7 +409,8 @@ module "sentinel" {
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
   vpc_id                         = local.common.vpc_id
-  private_subnet_ids             = local.common.private_subnet_ids
+  subnet_ids                     = local.common.subnet_ids
+  assign_public_ip               = local.common.assign_public_ip
   service_discovery_namespace_id = local.common.service_discovery_namespace_id
   region                         = local.common.region
 }
@@ -429,7 +449,8 @@ module "bridge" {
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
   vpc_id                         = local.common.vpc_id
-  private_subnet_ids             = local.common.private_subnet_ids
+  subnet_ids                     = local.common.subnet_ids
+  assign_public_ip               = local.common.assign_public_ip
   service_discovery_namespace_id = local.common.service_discovery_namespace_id
   region                         = local.common.region
 }
@@ -467,7 +488,8 @@ module "portal" {
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
   vpc_id                         = local.common.vpc_id
-  private_subnet_ids             = local.common.private_subnet_ids
+  subnet_ids                     = local.common.subnet_ids
+  assign_public_ip               = local.common.assign_public_ip
   service_discovery_namespace_id = local.common.service_discovery_namespace_id
   region                         = local.common.region
 }
@@ -499,7 +521,8 @@ module "console" {
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
   vpc_id                         = local.common.vpc_id
-  private_subnet_ids             = local.common.private_subnet_ids
+  subnet_ids                     = local.common.subnet_ids
+  assign_public_ip               = local.common.assign_public_ip
   service_discovery_namespace_id = local.common.service_discovery_namespace_id
   region                         = local.common.region
 }
@@ -584,5 +607,33 @@ module "observability" {
     bridge   = { service_name = module.bridge.service_name, alb = true, target_group_arn_suffix = module.bridge.target_group_arn_suffix }
     portal   = { service_name = module.portal.service_name, alb = true, target_group_arn_suffix = module.portal.target_group_arn_suffix }
     console  = { service_name = module.console.service_name, alb = true, target_group_arn_suffix = module.console.target_group_arn_suffix }
+  }
+}
+
+# --- Cost guardrail (both environments) --------------------------------------
+# A monthly cost budget so a runaway resource or a forgotten cheap-dev stack
+# emails before the bill surprises you. Notifications need a subscriber, so they
+# only attach when alarm_email is set; the budget itself is always visible.
+
+resource "aws_budgets_budget" "monthly" {
+  name         = "${local.name}-monthly"
+  budget_type  = "COST"
+  limit_amount = tostring(var.monthly_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  dynamic "notification" {
+    for_each = var.alarm_email == "" ? [] : [
+      { type = "ACTUAL", threshold = 80 },
+      { type = "ACTUAL", threshold = 100 },
+      { type = "FORECASTED", threshold = 100 },
+    ]
+    content {
+      comparison_operator        = "GREATER_THAN"
+      threshold                  = notification.value.threshold
+      threshold_type             = "PERCENTAGE"
+      notification_type          = notification.value.type
+      subscriber_email_addresses = [var.alarm_email]
+    }
   }
 }

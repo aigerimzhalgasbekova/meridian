@@ -3,6 +3,24 @@ variable "region" {
   default = "eu-west-1"
 }
 
+variable "environment" {
+  description = <<-EOT
+    Environment name. "prod" keeps the hardened set: RDS deletion protection +
+    final snapshot, WAF on the ALB, Container Insights, and a NAT gateway. Any
+    other value (e.g. "dev") runs cheap and ephemeral — no NAT (tasks in public
+    subnets), no WAF, no Container Insights, and a destroy-clean database — so
+    you can apply-demo-destroy on credits. A budget guardrail is created either way.
+  EOT
+  type        = string
+  default     = "dev"
+}
+
+variable "monthly_budget_usd" {
+  description = "AWS Budgets monthly cost limit. Alerts fire at 80%/100% actual and 100% forecast when alarm_email is set."
+  type        = number
+  default     = 200
+}
+
 variable "domain" {
   description = "Base domain for public services (idp.<domain>, sso.<domain>, portal.<domain>, console.<domain>)."
   type        = string

@@ -16,8 +16,15 @@ variable "vpc_id" {
   type = string
 }
 
-variable "private_subnet_ids" {
-  type = list(string)
+variable "subnet_ids" {
+  description = "Subnets the tasks run in. Private (with NAT) normally; the public subnets in cheap/no-NAT dev, paired with assign_public_ip = true."
+  type        = list(string)
+}
+
+variable "assign_public_ip" {
+  description = "Give tasks a public IP for egress when there is no NAT gateway. Ingress is still gated entirely by the task security group."
+  type        = bool
+  default     = false
 }
 
 variable "image" {
