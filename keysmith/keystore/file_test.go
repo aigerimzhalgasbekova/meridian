@@ -3,6 +3,7 @@ package keystore
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -183,6 +184,80 @@ func TestFileStoreTamperDetection(t *testing.T) {
 	}
 	if _, err := OpenFileStore(ctx, path, kek); err == nil {
 		t.Fatal("record swap between key IDs went undetected")
+	}
+}
+
+func TestFileStorePublicKeyTamperRejected(t *testing.T) {
+	// KS-P0: the published public key must be derived from the encrypted
+	// private key, not trusted from the plaintext public_jwk field. Swapping in
+	// an attacker's public key under a legitimate kid must fail closed.
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "keys.json")
+	kek := testKEK(t)
+	s, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := newKey(jose.AlgEdDSA, 2048, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, k); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attacker overwrites public_jwk with a key they hold the private half of,
+	// leaving the kid and encrypted private material untouched.
+	attacker, err := newKey(jose.AlgEdDSA, 2048, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	evilJWK, err := jose.PublicJWK(attacker.VerificationKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc fileDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc.Keys[0].PublicJWK = evilJWK
+	tampered, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// public_jwk is not the source of truth: it is ignored and the public key
+	// is re-derived from the encrypted private material, so the attacker's key
+	// never gets published under the legitimate kid.
+	s2, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatalf("reopen after public_jwk swap: %v", err)
+	}
+	got, err := s2.Get(ctx, k.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Public.(ed25519.PublicKey).Equal(k.Public.(ed25519.PublicKey)) {
+		t.Fatal("attacker public_jwk was published under legitimate kid: forgery possible")
+	}
+
+	// A kid that does not match the thumbprint of the private key is rejected.
+	doc.Keys[0].ID = "sha256:not-the-real-thumbprint"
+	badKid, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, badKid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenFileStore(ctx, path, kek); err == nil {
+		t.Fatal("kid/thumbprint mismatch went undetected")
 	}
 }
 

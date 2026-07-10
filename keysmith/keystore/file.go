@@ -114,15 +114,23 @@ func (s *FileStore) decode(ctx context.Context, rec fileRecord) (Key, error) {
 	if !ok {
 		return Key{}, fmt.Errorf("private key type %T is not a crypto.Signer", priv)
 	}
-	vk, err := rec.PublicJWK.PublicKey()
+	// Public key is derived from the authenticated (AEAD-protected) private key,
+	// never trusted from the plaintext PublicJWK field. The kid MUST equal the
+	// thumbprint of that recovered public key, or a file-write attacker could
+	// publish their own key under a legitimate kid and forge tokens.
+	pub := signer.Public()
+	tp, err := jose.Thumbprint(pub)
 	if err != nil {
 		return Key{}, err
+	}
+	if tp != rec.ID {
+		return Key{}, fmt.Errorf("keystore: kid %q does not match thumbprint of private key (%q)", rec.ID, tp)
 	}
 	return Key{
 		ID: rec.ID, Alg: jose.Algorithm(rec.Alg), State: State(rec.State),
 		CreatedAt: rec.CreatedAt, PromotedAt: rec.PromotedAt,
 		RetiringAt: rec.RetiringAt, RetiredAt: rec.RetiredAt,
-		Private: signer, Public: vk.Public,
+		Private: signer, Public: pub,
 	}, nil
 }
 
