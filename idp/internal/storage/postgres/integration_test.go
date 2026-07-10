@@ -17,12 +17,26 @@ import (
 
 	"github.com/aikazzh/portfolio/idp/internal/oauth"
 	"github.com/aikazzh/portfolio/idp/internal/storage"
+	"github.com/aikazzh/portfolio/idp/internal/storage/storagetest"
 )
+
+// TestStoreContract runs the shared conformance suite the memory store already
+// passes. The tests below it cover what only a real database can show:
+// concurrent callers contending for the same row.
+func TestStoreContract(t *testing.T) {
+	storagetest.RunStoreContract(t, func(t *testing.T) storage.Store { return testStore(t) })
+}
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
+		// CI's integration job sets REQUIRE_TEST_DATABASE_URL. Skipping is the
+		// right default locally, but a suite that skips when the database
+		// disappears stops protecting anything without ever going red.
+		if os.Getenv("REQUIRE_TEST_DATABASE_URL") != "" {
+			t.Fatal("REQUIRE_TEST_DATABASE_URL is set but TEST_DATABASE_URL is empty")
+		}
 		t.Skip("TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
