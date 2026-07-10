@@ -85,7 +85,6 @@ services:
       SESSIOND_ADDR: ":8082"
       SESSIOND_REDIS_URL: redis://redis:6379/0
       SESSIOND_API_TOKENS: ${SESSIOND_API_TOKEN:?set in .env}
-      SESSIOND_DEMO: "1"
     ports:
       - "8082:8082"
     depends_on:
@@ -127,6 +126,9 @@ services:
     environment:
       PORT: "3000"
       DATABASE_URL: postgres://meridian:${POSTGRES_PASSWORD}@postgres:5432/portal
+      # Encrypts TOTP secrets at rest; the server refuses to start against a
+      # real database with the in-code placeholder key.
+      PORTAL_TOTP_KEK: ${PORTAL_TOTP_KEK:?set in .env — openssl rand -base64 32}
       BASE_URL: http://localhost:3000
       # The image bakes NODE_ENV=production, which turns on Secure cookies —
       # those never arrive over plain-http localhost. Override for local use.
