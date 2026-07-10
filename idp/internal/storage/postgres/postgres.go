@@ -86,6 +86,16 @@ func (s *Store) Consents() storage.ConsentStore           { return &consentStore
 func (s *Store) DeviceCodes() storage.DeviceCodeStore     { return &deviceStore{s.pool} }
 func (s *Store) Sessions() storage.SessionStore           { return &sessionStore{s.pool} }
 
+// arr converts a possibly-nil string slice to a non-nil one for array binds:
+// pgx encodes a nil slice as SQL NULL, which the NOT NULL array columns
+// rightly reject — DEFAULT '{}' never applies to an explicit NULL.
+func arr[S ~[]string](s S) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
 // isUniqueViolation reports a Postgres 23505.
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
