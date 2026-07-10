@@ -7,6 +7,7 @@ Fargate), CI/CD with security gates, and a one-command local stack.
 platform/
 ├── terraform/          # AWS: modules/{network,service,data,observability} + envs/dev
 ├── compose/            # local stack: docker-compose.yml + smoke.sh
+├── scripts/            # live-smoke.sh (e2e against AWS), pause.sh / resume.sh
 ├── docs/
 │   ├── adr/            # 0001 Fargate-over-EKS, 0002 SSM secrets + OIDC CI
 │   └── observability.md
@@ -190,10 +191,28 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
    and pushes all seven images (`:v0.1.0` + `:dev`) and rolls the services.
 8. **DNS records** — CNAME `idp/sso/portal/console.meridian.example.com` to
    `terraform output alb_dns_name`.
-9. **Verify** — `curl https://idp.meridian.example.com/healthz`, then the smoke flow
-   from `compose/smoke.sh` with `IDP_URL=https://idp.meridian.example.com` (the dev
-   realm only exists with `IDP_DEV_MODE=1`; in AWS, create a realm via the
-   registration API first).
+9. **Verify** — `MERIDIAN_DOMAIN=meridian.example.com scripts/live-smoke.sh`
+   runs the full end-to-end check against the deployed stack: TLS + health on
+   every public host, OIDC discovery, JWKS, a complete authorization-code
+   login, refresh rotation + replay revocation, portal API, bridge and
+   console. It exercises the seeded demo realm (`IDP_SEED_DEMO=1`). Before
+   DNS records exist, add `ALB_HOST=$(terraform output -raw alb_dns_name)`
+   to pin the hostnames to the ALB.
+
+## Day-2 operations
+
+- **Pause / resume** — the running stack costs real money (~$170/mo at dev
+  sizing); paused it drops to ~$1.5-2/day (ALB, Redis, WAF and storage keep
+  billing) while the CloudFront site stays up.
+  `scripts/pause.sh` scales all seven services to 0 (autoscaling floor first,
+  or it fights back) and stops RDS; `scripts/resume.sh` brings it all back in
+  ~5 min. AWS auto-restarts a stopped RDS after 7 days — re-run `pause.sh`
+  weekly if idle longer.
+- **Smoke after any change** — `MERIDIAN_DOMAIN=<domain> scripts/live-smoke.sh`.
+- **Rolling a service after Terraform env/secret changes** — the service
+  module sets `ignore_changes = [task_definition]` so CI releases don't fight
+  Terraform; consequence:
+  `aws ecs update-service --cluster meridian-dev --service <name> --task-definition meridian-dev-<name> --force-new-deployment`.
 
 ## Adding a prod environment
 
