@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { memoryQueue } from '../src/queue/memory.js';
 import { backoffMs } from '../src/queue/types.js';
 import { Worker } from '../src/queue/worker.js';
+import { runQueueContract } from './contract/queue.js';
 
 describe('backoffMs', () => {
   it('grows 1s, 4s, 16s ... capped at 5 minutes', () => {
@@ -12,38 +13,22 @@ describe('backoffMs', () => {
   });
 });
 
-describe('memory queue claim semantics (mirrors FOR UPDATE SKIP LOCKED)', () => {
+// The memory queue claims to mirror FOR UPDATE SKIP LOCKED exactly; the shared
+// contract is what holds it to that. postgres runs the same suite in pg.test.ts.
+describe('memory queue', () => {
+  runQueueContract(() => memoryQueue());
+});
+
+describe('memory queue claim semantics', () => {
   it('two concurrent claimers never receive the same job', async () => {
     const q = memoryQueue();
-    await q.enqueue('a', {});
-    await q.enqueue('a', {});
     const now = new Date();
+    await q.enqueue('a', {}, { runAt: now });
+    await q.enqueue('a', {}, { runAt: now });
     const [j1, j2, j3] = await Promise.all([q.claim(now), q.claim(now), q.claim(now)]);
     const ids = [j1, j2, j3].filter((j) => j !== null).map((j) => j!.id);
     expect(ids).toHaveLength(2);
     expect(new Set(ids).size).toBe(2);
-  });
-
-  it('a running job is invisible until failed back to pending', async () => {
-    const q = memoryQueue();
-    const job = await q.enqueue('a', {});
-    const now = new Date();
-    expect((await q.claim(now))?.id).toBe(job.id);
-    expect(await q.claim(now)).toBeNull();
-    await q.fail(job.id, 'boom', now);
-    // Rescheduled into the future by backoff: still not claimable "now".
-    expect(await q.claim(now)).toBeNull();
-    expect((await q.claim(new Date(now.getTime() + backoffMs(1))))?.id).toBe(job.id);
-  });
-
-  it('respects runAt scheduling and claims oldest first', async () => {
-    const q = memoryQueue();
-    const now = new Date();
-    const later = await q.enqueue('a', {}, { runAt: new Date(now.getTime() + 60_000) });
-    const early = await q.enqueue('a', {}, { runAt: new Date(now.getTime() - 60_000) });
-    expect((await q.claim(now))?.id).toBe(early.id);
-    expect(await q.claim(now)).toBeNull();
-    expect((await q.claim(new Date(now.getTime() + 60_000)))?.id).toBe(later.id);
   });
 });
 
@@ -104,16 +89,6 @@ describe('worker retry / dead-letter', () => {
     const job = await q.enqueue('unknown', {}, { maxAttempts: 1, runAt: clock });
     await worker.tick();
     expect((await q.get(job.id))?.status).toBe('dead');
-  });
-
-  it('recover() requeues jobs stranded in running back to pending', async () => {
-    const q = memoryQueue();
-    const job = await q.enqueue('a', {});
-    const now = new Date();
-    expect((await q.claim(now))?.id).toBe(job.id); // now 'running'
-    expect(await q.claim(now)).toBeNull(); // invisible while running
-    expect(await q.recover()).toBe(1);
-    expect((await q.claim(now))?.id).toBe(job.id); // reclaimable again
   });
 
   it('stop() awaits the in-flight tick so a mid-job shutdown does not strand work', async () => {
