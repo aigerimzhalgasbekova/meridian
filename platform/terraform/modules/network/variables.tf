@@ -14,3 +14,9 @@ variable "az_count" {
   type        = number
   default     = 2
 }
+
+variable "flow_log_retention_days" {
+  description = "CloudWatch Logs retention for VPC flow logs."
+  type        = number
+  default     = 30
+}

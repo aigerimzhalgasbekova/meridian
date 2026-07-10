@@ -18,6 +18,18 @@ resource "aws_security_group" "postgres" {
   tags        = { Name = "${var.name}-postgres" }
 }
 
+# Server-side enforcement that clients connect over TLS, independent of
+# whether every DSN remembers sslmode=require (SEC09-BP02: encrypt in transit).
+resource "aws_db_parameter_group" "postgres" {
+  name   = "${var.name}-postgres17"
+  family = "postgres17"
+
+  parameter {
+    name  = "rds.force_ssl"
+    value = "1"
+  }
+}
+
 resource "aws_db_instance" "postgres" {
   identifier     = "${var.name}-postgres"
   engine         = "postgres"
@@ -35,6 +47,7 @@ resource "aws_db_instance" "postgres" {
   # them to SSM Parameter Store.
   manage_master_user_password = true
 
+  parameter_group_name   = aws_db_parameter_group.postgres.name
   db_subnet_group_name   = aws_db_subnet_group.this.name
   vpc_security_group_ids = [aws_security_group.postgres.id]
   publicly_accessible    = false

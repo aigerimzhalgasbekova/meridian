@@ -8,8 +8,10 @@ terraform {
     }
   }
 
-  # Remote state — uncomment once the bootstrap bucket/table exist.
-  # Bootstrap (one-time, with admin credentials):
+  # Remote state — intentionally disabled: no AWS account/credentials exist
+  # yet, and local state lets `terraform init`/`validate` run without them.
+  # Enable once AWS is provisioned:
+  #   1. Bootstrap (one-time, with admin credentials):
   #   aws s3api create-bucket --bucket meridian-terraform-state \
   #     --create-bucket-configuration LocationConstraint=eu-central-1
   #   aws s3api put-bucket-versioning --bucket meridian-terraform-state \
@@ -20,6 +22,8 @@ terraform {
   #     --attribute-definitions AttributeName=LockID,AttributeType=S \
   #     --key-schema AttributeName=LockID,KeyType=HASH \
   #     --billing-mode PAY_PER_REQUEST
+  #   2. Uncomment the backend block below.
+  #   3. terraform init -migrate-state
   #
   # backend "s3" {
   #   bucket         = "meridian-terraform-state"
