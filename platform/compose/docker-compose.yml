@@ -1,0 +1,160 @@
+# Meridian local stack — all seven services + postgres + redis.
+#
+# Run from this directory:   docker compose up --build
+# Requires ../../ (repo root) as build context for idp and bridge, whose
+# Dockerfiles COPY keysmith/ alongside their own module (go.mod replace
+# directive). All other services build from their own directory.
+#
+# Go runtime images are distroless (no shell), so they carry no container
+# healthcheck; smoke.sh probes them over HTTP instead. postgres/redis/portal
+# have real healthchecks and gate startup ordering.
+
+name: meridian
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: meridian
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: idp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Creates the second database (portal) and applies its schema.
+      - ./initdb/01-portal.sh:/docker-entrypoint-initdb.d/01-portal.sh:ro
+      - ../../portal/server/schema.sql:/initdb-portal-schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meridian -d idp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  keysmith:
+    build:
+      context: ../../keysmith
+    environment:
+      KEYSMITH_ADDR: ":8081"
+      # Ephemeral in-memory keystore: the file store needs a writable volume
+      # the distroless nonroot user can own; for the local demo stack,
+      # dev mode is the honest trade-off (keys regenerate on restart).
+      KEYSMITH_DEV_MODE: "1"
+      KEYSMITH_SIGNER_TOKENS: ${KEYSMITH_SIGNER_TOKEN:?set in .env}
+      KEYSMITH_ADMIN_TOKENS: ${KEYSMITH_ADMIN_TOKEN:?set in .env}
+    ports:
+      - "8081:8081"
+
+  idp:
+    build:
+      context: ../..           # repo root: Dockerfile COPYs keysmith/ + idp/
+      dockerfile: idp/Dockerfile
+    environment:
+      IDP_ADDR: ":8080"
+      IDP_BASE_URL: http://localhost:8080
+      IDP_KEYSMITH_URL: http://keysmith:8081
+      IDP_KEYSMITH_TOKEN: ${KEYSMITH_SIGNER_TOKEN}
+      IDP_REGISTRATION_TOKEN: ${IDP_REGISTRATION_TOKEN:-}
+      # 1 = in-memory + seeded demo realm (what smoke.sh exercises).
+      # Set IDP_DEV_MODE=0 in .env to run against postgres instead
+      # (idp migrates itself on boot; no demo realm is seeded).
+      IDP_DEV_MODE: ${IDP_DEV_MODE:-1}
+      IDP_DATABASE_URL: postgres://meridian:${POSTGRES_PASSWORD}@postgres:5432/idp?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keysmith:
+        condition: service_started
+
+  sessiond:
+    build:
+      context: ../../sessiond
+    environment:
+      SESSIOND_ADDR: ":8082"
+      SESSIOND_REDIS_URL: redis://redis:6379/0
+      SESSIOND_API_TOKENS: ${SESSIOND_API_TOKEN:?set in .env}
+      SESSIOND_DEMO: "1"
+    ports:
+      - "8082:8082"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  sentinel:
+    build:
+      context: ../../sentinel
+    environment:
+      SENTINEL_ADDR: ":8084"
+      SENTINEL_TOKEN: ${SENTINEL_TOKEN:?set in .env}
+      # "memory" keeps the audit chain in RAM: the distroless nonroot user
+      # cannot write into a fresh named volume without an ownership chown
+      # step this demo stack doesn't need. AWS uses EFS (see terraform).
+      SENTINEL_AUDIT_PATH: memory
+    ports:
+      - "8084:8084"
+
+  bridge:
+    build:
+      context: ../..           # repo root: Dockerfile COPYs keysmith/ + bridge/
+      dockerfile: bridge/Dockerfile
+    environment:
+      BRIDGE_ADDR: ":8080"
+      # Dev mode spins up an in-process fake OIDC upstream. The fake binds a
+      # random loopback port inside the container, so the full browser flow
+      # only works from inside the container network; /healthz/providers and
+      # the home page work from the host.
+      BRIDGE_DEV_MODE: "1"
+      BRIDGE_BASE_URL: http://localhost:8083
+      BRIDGE_HMAC_KEY: ${BRIDGE_HMAC_KEY:?set in .env}
+    ports:
+      - "8083:8080"
+
+  portal:
+    build:
+      context: ../../portal
+    environment:
+      PORT: "3000"
+      DATABASE_URL: postgres://meridian:${POSTGRES_PASSWORD}@postgres:5432/portal
+      BASE_URL: http://localhost:3000
+      # The image bakes NODE_ENV=production, which turns on Secure cookies —
+      # those never arrive over plain-http localhost. Override for local use.
+      NODE_ENV: development
+      # /app is root-owned in the image and the server runs as "node";
+      # the default outbox path (cwd/outbox) is not creatable.
+      OUTBOX_DIR: /tmp/outbox
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  console:
+    build:
+      context: ../../console
+    environment:
+      CONSOLE_ADDR: ":8085"
+      # Demo personas + pre-minted tokens at /v1/dev/tokens. Production wires
+      # a keysmith-JWKS verifier instead (see console/cmd/consoled docs).
+      CONSOLE_DEV_MODE: "1"
+    ports:
+      - "8085:8085"
+
+volumes:
+  pgdata:

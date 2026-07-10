@@ -1,0 +1,132 @@
+name: release
+
+# On tag: build all seven images, push to ECR, roll the ECS services.
+#
+# AWS access is OIDC-only — no long-lived keys. One-time setup (documented in
+# platform/docs/adr/0002-ssm-secrets-and-oidc-ci.md):
+#   1. Create the GitHub OIDC provider in IAM (token.actions.githubusercontent.com).
+#   2. Create role meridian-ci with a trust policy limited to
+#      repo:<owner>/portfolio:ref:refs/tags/* and permissions for ECR push +
+#      ECS deploy (RegisterTaskDefinition/UpdateService/DescribeTaskDefinition
+#      + iam:PassRole on the meridian-dev-* task/execution roles).
+#   3. Set repository variables: AWS_ROLE_ARN, AWS_REGION, ECR_REGISTRY
+#      (e.g. 123456789012.dkr.ecr.eu-central-1.amazonaws.com).
+#
+# Until those variables exist the workflow skips with a notice instead of
+# failing — the repo stays green while there is no AWS account.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write # OIDC federation with AWS
+
+env:
+  # github.ref_name via env, never inline in run: (ref names are user input).
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: check AWS configuration
+        id: check
+        env:
+          ROLE: ${{ vars.AWS_ROLE_ARN }}
+          REGION: ${{ vars.AWS_REGION }}
+          REGISTRY: ${{ vars.ECR_REGISTRY }}
+        run: |
+          if [ -n "$ROLE" ] && [ -n "$REGION" ] && [ -n "$REGISTRY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AWS_ROLE_ARN / AWS_REGION / ECR_REGISTRY repository variables are not set — skipping release (expected until an AWS account exists)."
+          fi
+
+  build-push:
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # idp and bridge build from the repo root (their Dockerfiles COPY
+          # keysmith/ next to their module for the go.mod replace directive).
+          - service: keysmith
+            context: keysmith
+          - service: idp
+            context: .
+            dockerfile: idp/Dockerfile
+          - service: sessiond
+            context: sessiond
+          - service: sentinel
+            context: sentinel
+          - service: bridge
+            context: .
+            dockerfile: bridge/Dockerfile
+          - service: portal
+            context: portal
+          - service: console
+            context: console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: build and push
+        env:
+          REGISTRY: ${{ vars.ECR_REGISTRY }}
+          SERVICE: ${{ matrix.service }}
+          CONTEXT: ${{ matrix.context }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          image="$REGISTRY/meridian/$SERVICE"
+          docker build \
+            ${DOCKERFILE:+-f "$DOCKERFILE"} \
+            -t "$image:$TAG" -t "$image:dev" \
+            "$CONTEXT"
+          docker push "$image:$TAG"
+          docker push "$image:dev"
+
+  deploy:
+    needs: [preflight, build-push]
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        service: [keysmith, idp, sessiond, sentinel, bridge, portal, console]
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: fetch current task definition
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "meridian-dev-$SERVICE" \
+            --query taskDefinition > taskdef.json
+      - name: render task definition with new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: taskdef.json
+          container-name: ${{ matrix.service }}
+          image: ${{ vars.ECR_REGISTRY }}/meridian/${{ matrix.service }}:${{ github.ref_name }}
+      - name: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: meridian-dev
+          service: ${{ matrix.service }}
+          wait-for-service-stability: true
