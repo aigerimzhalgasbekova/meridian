@@ -7,7 +7,9 @@ deployment wires them — same env vars, same tokens, same ports.
 
 ```sh
 cd platform/compose
-cp .env.example .env          # then replace every change-me (openssl rand -hex 32)
+cp .env.example .env          # replace every change-me — each line names its generator
+                              # (tokens: openssl rand -hex 32; PORTAL_TOTP_KEK
+                              #  must be openssl rand -base64 32 — exactly 32 bytes)
 docker compose up -d --build
 ./smoke.sh                    # end-to-end: JWKS -> discovery -> auth-code flow
 ```
@@ -40,8 +42,11 @@ health probe.
 ## Dev-mode trade-offs (deliberate, local-only)
 
 - keysmith: in-memory keystore — keys regenerate on restart.
-- idp: `IDP_DEV_MODE=1` seeds the demo realm smoke.sh needs; set it to empty
-  in `.env` to run against Postgres instead (idp migrates itself).
+- idp: `IDP_DEV_MODE=1` seeds the demo realm smoke.sh needs; set
+  `IDP_DEV_MODE=0` in `.env` to run against Postgres instead (idp migrates
+  itself; no demo realm, so smoke.sh's flow steps won't pass). An empty value
+  does NOT work: compose's `${IDP_DEV_MODE:-1}` substitutes the default on
+  empty.
 - sentinel: audit chain in RAM (`SENTINEL_AUDIT_PATH=memory`).
 - console/bridge: dev mode (seeded personas / fake OIDC upstream).
 

@@ -99,7 +99,7 @@ cd idp      && make run    # IDP_DEV_MODE=1 — needs keysmith on :8081 first
 
 ```sh
 cd platform/compose
-cp .env.example .env       # replace every change-me (openssl rand -hex 32)
+cp .env.example .env       # replace every change-me — each line names its generator
 docker compose up -d --build
 ./smoke.sh                 # JWKS → discovery → full authorization-code flow
 ```
