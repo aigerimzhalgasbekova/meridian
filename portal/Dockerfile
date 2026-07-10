@@ -22,6 +22,9 @@ ENV NODE_ENV=production
 # /app is root-owned read-only application code; point the default outbox
 # somewhere the non-root node user can write.
 ENV OUTBOX_DIR=/tmp/outbox
+# Amazon RDS CA bundle so Postgres TLS can be *verified* (sslmode=verify-full
+# with sslrootcert=<this path> in the DSN) instead of downgraded to no-verify.
+ADD https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /etc/ssl/certs/rds-global-bundle.pem
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/server/dist ./server/dist
