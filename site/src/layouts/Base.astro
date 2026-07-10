@@ -1,0 +1,60 @@
+---
+import '../styles/global.css';
+import { GITHUB_REPO } from '../config';
+
+interface Props {
+  title: string;
+  description?: string;
+}
+const { title, description = 'Meridian — an identity platform built as 7 interlocking projects.' } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const path = Astro.url.pathname;
+const current = (prefix: string) =>
+  path === `${base}${prefix}` || (prefix !== '/' && path.startsWith(`${base}${prefix}`)) ? 'page' : undefined;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <title>{title}</title>
+    <script is:inline>
+      // Apply saved theme before first paint to avoid a flash.
+      const t = localStorage.getItem('theme');
+      if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
+    </script>
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="container" aria-label="Main">
+        <a class="brand" href={`${base}/`}>Meridian</a>
+        <a href={`${base}/#projects`}>Projects</a>
+        <a href={`${base}/guide/`} aria-current={current('/guide')}>Guide</a>
+        <a href={GITHUB_REPO}>GitHub</a>
+        <button class="theme-toggle" id="theme-toggle" aria-label="Toggle color theme">◐</button>
+      </nav>
+    </header>
+    <main class="container">
+      <slot />
+    </main>
+    <footer class="site-footer">
+      <div class="container">
+        Meridian — an IAM platform portfolio by <a href="https://github.com/aikazzh">aikazzh</a>. Built with Astro;
+        every claim on this site links to the code that backs it.
+      </div>
+    </footer>
+    <script is:inline>
+      document.getElementById('theme-toggle').addEventListener('click', () => {
+        const root = document.documentElement;
+        const dark = root.dataset.theme
+          ? root.dataset.theme === 'dark'
+          : matchMedia('(prefers-color-scheme: dark)').matches;
+        const next = dark ? 'light' : 'dark';
+        root.dataset.theme = next;
+        localStorage.setItem('theme', next);
+      });
+    </script>
+  </body>
+</html>

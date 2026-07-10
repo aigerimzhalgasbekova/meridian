@@ -1,0 +1,61 @@
+---
+import { getCollection, render } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+
+export async function getStaticPaths() {
+  const chapters = await getCollection('guide');
+  return chapters.map((c) => ({ params: { slug: c.id }, props: { chapter: c } }));
+}
+
+const { chapter } = Astro.props;
+const { Content } = await render(chapter);
+const all = (await getCollection('guide')).sort((a, b) => a.data.chapter - b.data.chapter);
+const idx = all.findIndex((c) => c.id === chapter.id);
+const prev = idx > 0 ? all[idx - 1] : undefined;
+const next = idx < all.length - 1 ? all[idx + 1] : undefined;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<Base title={`${chapter.data.title} — Meridian guide`} description={chapter.data.summary}>
+  <div class="guide-layout">
+    <nav class="guide-nav" aria-label="Guide chapters">
+      <ol>
+        {
+          all.map((c) => (
+            <li>
+              <a href={`${base}/guide/${c.id}/`} aria-current={c.id === chapter.id ? 'page' : undefined}>
+                {c.data.chapter}. {c.data.title}
+              </a>
+            </li>
+          ))
+        }
+      </ol>
+    </nav>
+    <article class="prose">
+      <h1>{chapter.data.title}</h1>
+      <Content />
+      <nav class="prevnext" aria-label="Chapter navigation">
+        {
+          prev ? (
+            <a href={`${base}/guide/${prev.id}/`}>
+              <span class="dir">← Previous</span>
+              {prev.data.title}
+            </a>
+          ) : (
+            <span />
+          )
+        }
+        {
+          next ? (
+            <a href={`${base}/guide/${next.id}/`} style="text-align: right;">
+              <span class="dir">Next →</span>
+              {next.data.title}
+            </a>
+          ) : (
+            <span />
+          )
+        }
+      </nav>
+    </article>
+  </div>
+</Base>

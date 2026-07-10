@@ -1,0 +1,55 @@
+---
+import { getCollection } from 'astro:content';
+import Base from '../layouts/Base.astro';
+import ArchDiagram from '../components/ArchDiagram.astro';
+import ProjectCard from '../components/ProjectCard.astro';
+import { GITHUB_REPO } from '../config';
+
+const projects = (await getCollection('projects')).sort((a, b) => a.data.order - b.data.order);
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<Base title="Meridian — an IAM platform built as 7 interlocking projects">
+  <section class="hero">
+    <h1>Meridian — an identity platform built as seven interlocking projects</h1>
+    <p class="lede">
+      A standards-aligned IAM stack — the kind a mid-size company would run to centralize authentication, sessions,
+      federation, and access control. Each project is a standalone, reviewable codebase with its own signature
+      architectural challenge: not seven CRUD apps with login screens, but seven distinct problem shapes.
+    </p>
+    <p>
+      <a href={`${base}/guide/`}><strong>Read the engineering guide →</strong></a>
+      &nbsp;·&nbsp;
+      <a href={GITHUB_REPO}>Browse the monorepo</a>
+    </p>
+  </section>
+
+  <section aria-labelledby="arch-h">
+    <h2 id="arch-h">Architecture</h2>
+    <ArchDiagram />
+  </section>
+
+  <section id="projects" aria-labelledby="projects-h">
+    <h2 id="projects-h">The projects</h2>
+    <ul class="card-grid">
+      {
+        projects.map((p) => (
+          <ProjectCard
+            slug={p.id}
+            name={p.data.name}
+            title={p.data.title}
+            pitch={p.data.pitch}
+            challenge={p.data.challenge}
+            tech={p.data.tech}
+          />
+        ))
+      }
+    </ul>
+    <p class="callout pending" style="margin-top: 1.5rem;">
+      <strong>Live demos are pending an AWS account.</strong> Everything is built deploy-ready (each service runs
+      locally with <code>make run-dev</code> / <code>npm run dev</code>); demo links activate when credentials
+      arrive. Until then, each card links to the code, README, and threat model — the parts a reviewer actually
+      reads first.
+    </p>
+  </section>
+</Base>

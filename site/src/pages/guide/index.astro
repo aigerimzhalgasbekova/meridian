@@ -1,0 +1,30 @@
+---
+import { getCollection } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+
+const chapters = (await getCollection('guide')).sort((a, b) => a.data.chapter - b.data.chapter);
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<Base title="Engineering guide — Meridian" description="A ten-chapter engineering walkthrough of the Meridian IAM platform.">
+  <div class="prose">
+    <h1>The engineering guide</h1>
+    <p class="lede">
+      Ten chapters on how Meridian was actually built — the design decisions, the sharp edges, and the bugs. Written
+      for engineers: every chapter cites the real ADRs and shows real code from the repo.
+    </p>
+    <ol style="padding-left: 1.25rem;">
+      {
+        chapters.map((c) => (
+          <li style="margin: 0.75rem 0;">
+            <a href={`${base}/guide/${c.id}/`}>
+              <strong>{c.data.title}</strong>
+            </a>
+            <br />
+            <span style="color: var(--text-soft); font-size: 0.95rem;">{c.data.summary}</span>
+          </li>
+        ))
+      }
+    </ol>
+  </div>
+</Base>

@@ -1,0 +1,30 @@
+---
+import { repoTree, repoFile, demoUrls } from '../config';
+
+interface Props {
+  name: string;
+  title: string;
+  pitch: string;
+  challenge: string;
+  tech: string[];
+  slug: string;
+}
+const { name, title, pitch, challenge, tech, slug } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const demo = demoUrls[name];
+---
+
+<li class="card">
+  <h3><a href={`${base}/projects/${slug}/`}>{title}</a></h3>
+  <p class="pitch">{pitch}</p>
+  <p class="challenge"><strong>Challenge:</strong> {challenge}</p>
+  <div class="tech">
+    {tech.map((t) => <span class="badge">{t}</span>)}
+    {demo ? <a class="badge" href={demo}>live demo</a> : <span class="badge pending">demo: deploy pending</span>}
+  </div>
+  <div class="links">
+    <a href={repoTree(name)}>Code</a>
+    <a href={repoFile(`${name}/README.md`)}>README</a>
+    <a href={repoFile(`${name}/THREAT_MODEL.md`)}>Threat model</a>
+  </div>
+</li>
