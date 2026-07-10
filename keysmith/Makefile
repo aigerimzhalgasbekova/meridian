@@ -1,6 +1,13 @@
 GO ?= go
 
-.PHONY: test bench vet build run-dev
+.PHONY: test bench vet fmt check build run run-dev
+
+fmt:
+	gofmt -l .
+
+check: vet test
+
+run: run-dev
 
 test:
 	$(GO) test -race ./...
