@@ -58,7 +58,14 @@ type Config struct {
 	RegistrationToken string
 	// InsecureDev drops the Secure cookie attribute for plain-HTTP local dev.
 	InsecureDev bool
-	Now         func() time.Time
+	// TrustProxyHeaders makes the brute-force guard key on the last
+	// X-Forwarded-For hop instead of the socket peer. Enable it only when
+	// every request provably arrives through a load balancer that appends
+	// the IP it observed (an AWS ALB does; see platform/terraform). If the
+	// process is reachable directly, a client can forge the header and
+	// evade per-IP lockout, so this defaults to off.
+	TrustProxyHeaders bool
+	Now               func() time.Time
 }
 
 // Server is the idp HTTP server.
@@ -105,7 +112,7 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("POST /realms/{realm}/register", s.handleRegister)
 	mux.HandleFunc("POST /realms/{realm}/logout", s.handleLogout)
 
-	s.handler = withRequestLog(cfg.Logger, withSecurityHeaders(mux))
+	s.handler = withRequestLog(cfg.Logger, withSecurityHeaders(withBodyLimit(mux)))
 	return s, nil
 }
 

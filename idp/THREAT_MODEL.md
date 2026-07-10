@@ -44,6 +44,8 @@ lifecycle, and multi-tenant realm isolation.
 | 12 | Introspection/revocation as a validity oracle | Confidential-caller-only introspection; revocation always 200; coarse errors |
 | 13 | Device user-code brute force | 8-char high-entropy code, 10-min TTL, one-shot approval, poll pacing (`slow_down`) |
 | 14 | Open dynamic registration abuse | Registration gated by an initial access token; https-only redirect URIs (loopback excepted) |
+| 15 | Unbounded request body (memory exhaustion) | Every request body is capped at 1 MiB before `ParseForm`/JSON decoding (`withBodyLimit`) |
+| 16 | Per-IP lockout evasion via forged `X-Forwarded-For` | The header is read only when `TrustProxyHeaders` is set, and only its last hop — the one an appending load balancer observed. Off by default |
 
 ## Residual risks (accepted)
 
@@ -55,3 +57,7 @@ lifecycle, and multi-tenant realm isolation.
   out. Accepted: it fails toward revocation.
 - **No built-in MFA in idp.** MFA enrollment/verification lives in `portal`;
   step-up would extend the login flow. Out of scope for this service.
+- **`TrustProxyHeaders` is an operator assertion, not a proof.** Enabling it
+  where the process is reachable off-LB re-opens abuse case 16. The deployment
+  earns it structurally: task security groups admit only the ALB's security
+  group, and the ALB pins `xff_header_processing_mode = "append"`.

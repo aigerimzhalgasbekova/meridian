@@ -66,6 +66,17 @@ resource "aws_lb" "this" {
   load_balancer_type = "application"
   security_groups    = [module.network.alb_security_group_id]
   subnets            = module.network.public_subnet_ids
+
+  # Services key their brute-force guards on the LAST X-Forwarded-For hop.
+  # That is only sound because the ALB appends the IP it actually observed;
+  # a client-supplied XFF can prepend entries but never forge the final one.
+  # Stated explicitly rather than inherited from an AWS default, because the
+  # security of the guard depends on it. Tasks accept ingress only from the
+  # ALB security group (modules/service), so the ALB cannot be bypassed.
+  xff_header_processing_mode = "append"
+
+  # Reject requests carrying malformed headers instead of normalizing them.
+  drop_invalid_header_fields = true
 }
 
 resource "aws_lb_listener" "https" {
@@ -164,6 +175,10 @@ module "idp" {
     IDP_ADDR         = ":8080"
     IDP_BASE_URL     = "https://idp.${var.domain}"
     IDP_KEYSMITH_URL = "http://keysmith.${local.sd_domain}:8081"
+    # Safe here and only here: tasks accept ingress solely from the ALB
+    # security group, and the ALB is pinned to xff_header_processing_mode
+    # = "append", so the last X-Forwarded-For hop cannot be forged.
+    IDP_TRUST_PROXY = "1"
   }
   secrets = {
     # IDP_KEYSMITH_TOKEN must be one of keysmith's KEYSMITH_SIGNER_TOKENS.

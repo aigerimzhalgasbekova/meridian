@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -20,6 +21,24 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func noStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
+}
+
+// maxBody caps every request body. The form endpoints (/token, /login,
+// /consent, /device, /introspect, /revoke) call r.ParseForm, which otherwise
+// reads the body into memory with no bound — an unauthenticated memory-
+// exhaustion DoS. Wrapping r.Body once here makes ParseForm and every JSON
+// decoder fail closed past the cap (handlers already surface that as 400).
+// 1 MiB matches the platform's other services; the register endpoint keeps
+// its own tighter 64 KiB inner cap.
+const maxBody = 1 << 20
+
+func withBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type statusRecorder struct {
@@ -71,33 +90,27 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// remoteIP extracts the client IP for rate limiting. Trusts X-Forwarded-For
-// only in deployments behind a load balancer that strips inbound values (the
-// ALB does); takes the last hop otherwise.
-func remoteIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// The last entry is appended by our own LB and is trustworthy.
-		ips := xff
-		for i := len(ips) - 1; i >= 0; i-- {
-			if ips[i] == ',' {
-				return trimSpace(ips[i+1:])
+// remoteIP extracts the client IP the brute-force guard keys on.
+//
+// X-Forwarded-For is attacker-controlled unless a proxy we trust rewrites it,
+// so it is consulted only when the operator asserts that topology
+// (Config.TrustProxyHeaders). Even then only the LAST hop is read: a proxy
+// that appends the peer address it observed — as an AWS ALB does — cannot be
+// made to forge that final entry, while everything to its left was supplied by
+// the client. Reading the first hop, the common mistake, would hand every
+// attacker a fresh lockout bucket per request.
+func remoteIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if i := strings.LastIndexByte(xff, ','); i >= 0 {
+				return strings.TrimSpace(xff[i+1:])
 			}
+			return strings.TrimSpace(xff)
 		}
-		return trimSpace(ips)
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-func trimSpace(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
-	}
-	return s
 }
