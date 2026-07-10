@@ -1,0 +1,33 @@
+---
+import { getCollection, render } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import { repoTree, repoFile, demoUrls } from '../../config';
+
+export async function getStaticPaths() {
+  const projects = await getCollection('projects');
+  return projects.map((p) => ({ params: { slug: p.id }, props: { project: p } }));
+}
+
+const { project } = Astro.props;
+const { Content } = await render(project);
+const d = project.data;
+const demo = demoUrls[d.name];
+---
+
+<Base title={`${d.title} — Meridian`} description={d.pitch}>
+  <article class="prose" style="max-width: 50rem;">
+    <h1>{d.title}</h1>
+    <p class="lede">{d.pitch}</p>
+    <div class="meta-row">
+      {d.tech.map((t) => <span class="badge">{t}</span>)}
+      {demo ? <a class="badge" href={demo}>live demo</a> : <span class="badge pending">demo: deploy pending</span>}
+    </div>
+    <div class="meta-row">
+      <a href={repoTree(d.name)}>Code</a> ·
+      <a href={repoFile(`${d.name}/README.md`)}>README</a> ·
+      <a href={repoFile(`${d.name}/THREAT_MODEL.md`)}>Threat model</a> ·
+      <a href={repoTree(`${d.name}/docs/adr`)}>ADRs</a>
+    </div>
+    <Content />
+  </article>
+</Base>
