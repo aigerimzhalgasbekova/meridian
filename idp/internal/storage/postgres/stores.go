@@ -476,8 +476,14 @@ func (s *sessionStore) Get(ctx context.Context, realm, idHash string) (storage.S
 }
 
 func (s *sessionStore) Delete(ctx context.Context, realm, idHash string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE realm_name=$1 AND id_hash=$2`, realm, idHash)
-	return err
+	tag, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE realm_name=$1 AND id_hash=$2`, realm, idHash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
 }
 
 func (s *sessionStore) DeleteByUser(ctx context.Context, realm, userID string) error {

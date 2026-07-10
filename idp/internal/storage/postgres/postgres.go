@@ -118,12 +118,6 @@ func mapErr(err error) error {
 // ttl helpers convert Go durations (nanoseconds) to/from BIGINT.
 func durMillis(d time.Duration) int64  { return int64(d) }
 func fromMillis(v int64) time.Duration { return time.Duration(v) }
-func nilTime(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	return &t
-}
 func orZero(t *time.Time) time.Time {
 	if t == nil {
 		return time.Time{}
