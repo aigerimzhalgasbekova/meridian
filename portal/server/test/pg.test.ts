@@ -74,6 +74,24 @@ describe.skipIf(!url)('postgres store + queue (integration)', () => {
     expect(await store.recoveryCodes.countUnused(user.id)).toBe(1);
   });
 
+  it('advanceTotpCounter: monotonic, rejects replays and stale counters', async () => {
+    const store = postgresStore(pool);
+    const user = await store.users.create({
+      email: 'totp@example.com',
+      emailVerified: true,
+      pendingEmail: null,
+      passwordHash: 'hash',
+      totpSecret: 'sealed',
+      totpPendingSecret: null,
+      totpLastCounter: null,
+    });
+    expect(await store.users.advanceTotpCounter(user.id, '100')).toBe(true);
+    expect(await store.users.advanceTotpCounter(user.id, '100')).toBe(false); // replay
+    expect(await store.users.advanceTotpCounter(user.id, '99')).toBe(false); // stale
+    expect(await store.users.advanceTotpCounter(user.id, '101')).toBe(true);
+    expect((await store.users.findById(user.id))?.totpLastCounter).toBe('101');
+  });
+
   it('sweep: removes expired sessions and used/expired tokens, keeps live ones', async () => {
     const store = postgresStore(pool);
     const user = await store.users.create({
@@ -151,7 +169,9 @@ describe.skipIf(!url)('postgres store + queue (integration)', () => {
   it('SKIP LOCKED: concurrent claimers on separate connections get distinct jobs', async () => {
     const q = postgresQueue(pool);
     const now = new Date();
-    for (let i = 0; i < 10; i++) await q.enqueue('t', { i });
+    // runAt must be pinned to `now`: the default is new Date() at enqueue
+    // time, which lands after `now` and makes claim(now) skip the job.
+    for (let i = 0; i < 10; i++) await q.enqueue('t', { i }, { runAt: now });
     const claims = await Promise.all(Array.from({ length: 10 }, () => q.claim(now)));
     const ids = claims.filter((j) => j !== null).map((j) => j!.id);
     expect(ids).toHaveLength(10);
