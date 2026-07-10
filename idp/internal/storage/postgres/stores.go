@@ -413,13 +413,33 @@ func (s *deviceStore) SetStatus(ctx context.Context, realm, hash string, status 
 }
 
 func (s *deviceStore) TouchPoll(ctx context.Context, realm, hash string, now time.Time) (time.Time, error) {
-	var prev *time.Time
-	err := s.pool.QueryRow(ctx,
-		`UPDATE device_codes SET last_polled_at=$3
-		 WHERE realm_name=$1 AND device_code_hash=$2
-		 RETURNING (SELECT last_polled_at FROM device_codes WHERE realm_name=$1 AND device_code_hash=$2)`,
-		realm, hash, now).Scan(&prev)
+	// The previous poll time gates slow_down (device.go), so it must be the
+	// value from the row we are about to overwrite. RETURNING can't yield the
+	// OLD value on PG17, and a scalar subquery in RETURNING (or a self-join)
+	// reads the statement snapshot — under READ COMMITTED a second concurrent
+	// poller re-locks the row via EvalPlanQual but still returns the pre-update
+	// timestamp, defeating the pacing check. SELECT ... FOR UPDATE locks the row
+	// and follows the update chain to the latest committed version, so the read
+	// and write are serialized on the row lock.
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return time.Time{}, err
+	}
+	defer tx.Rollback(ctx)
+	var prev *time.Time
+	if err := tx.QueryRow(ctx,
+		`SELECT last_polled_at FROM device_codes
+		 WHERE realm_name=$1 AND device_code_hash=$2 FOR UPDATE`,
+		realm, hash).Scan(&prev); err != nil {
+		return time.Time{}, mapErr(err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE device_codes SET last_polled_at=$3
+		 WHERE realm_name=$1 AND device_code_hash=$2`,
+		realm, hash, now); err != nil {
+		return time.Time{}, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return time.Time{}, mapErr(err)
 	}
 	return orZero(prev), nil

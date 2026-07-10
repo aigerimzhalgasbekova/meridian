@@ -41,6 +41,10 @@ type registrationRequest struct {
 	Scope                   string   `json:"scope"`
 }
 
+// registrationScopes is the allowlist a dynamically registered client may be
+// granted; it matches the default assigned when none are requested.
+var registrationScopes = oauth.Scopes{oauth.ScopeOpenID, oauth.ScopeProfile, oauth.ScopeEmail}
+
 var allowedGrantTypes = map[string]bool{
 	"authorization_code": true,
 	"refresh_token":      true,
@@ -106,9 +110,20 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		sum := sha256.Sum256([]byte(secretPlain))
 		secretHash = sum[:]
 	}
+	// A registration token must not become scope escalation: the requested
+	// scopes become this client's ceiling (checked at authorize/token via
+	// scopes.Subtract(client.Scopes)), so cap them to a fixed allowlist and
+	// reject anything outside it — same invalid_scope reject the other
+	// endpoints use.
+	// ponytail: realm-wide constant; promote to a per-realm column when a realm
+	// needs a different registration allowlist than another.
 	scopes := oauth.ParseScopes(req.Scope)
 	if len(scopes) == 0 {
 		scopes = oauth.Scopes{oauth.ScopeOpenID, oauth.ScopeProfile, oauth.ScopeEmail}
+	}
+	if invalid := scopes.Subtract(registrationScopes); len(invalid) > 0 {
+		writeJSON(w, http.StatusBadRequest, oauth.E(oauth.ErrInvalidScope, "scope not allowed: %s", invalid.String()))
+		return
 	}
 	client := storage.Client{
 		RealmName:    realm.Name,

@@ -337,6 +337,31 @@ func TestDynamicRegistration(t *testing.T) {
 			t.Errorf("status %d", status)
 		}
 	})
+	t.Run("out-of-allowlist scope rejected", func(t *testing.T) {
+		e := newEnv(t)
+		status, body := registerClient(t, e, map[string]any{
+			"client_name":   "Greedy",
+			"redirect_uris": []string{"https://greedy.example/cb"},
+			"scope":         "openid inventory:write",
+		})
+		if status != http.StatusBadRequest || str(body, "error") != "invalid_scope" {
+			t.Fatalf("status %d body %v, want 400 invalid_scope", status, body)
+		}
+	})
+	t.Run("allowlisted scope accepted", func(t *testing.T) {
+		e := newEnv(t)
+		status, body := registerClient(t, e, map[string]any{
+			"client_name":   "Modest",
+			"redirect_uris": []string{"https://modest.example/cb"},
+			"scope":         "openid email",
+		})
+		if status != http.StatusCreated {
+			t.Fatalf("status %d body %v", status, body)
+		}
+		if got := str(body, "scope"); got != "openid email" {
+			t.Fatalf("scope = %q, want %q", got, "openid email")
+		}
+	})
 	t.Run("wrong token rejected", func(t *testing.T) {
 		e := newEnv(t)
 		req, _ := http.NewRequest("POST", e.idp.URL+"/realms/test/register",

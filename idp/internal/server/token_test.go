@@ -319,6 +319,29 @@ func TestRefreshTokenRotation(t *testing.T) {
 			t.Fatalf("family not revoked: %d %v", status, body)
 		}
 	})
+	t.Run("signing failure leaves the token un-rotated (no forced re-auth)", func(t *testing.T) {
+		// Regression guard for the rotate-before-sign ordering bug: a transient
+		// keysmith outage during refresh must NOT rotate the presented token or
+		// revoke its family. Mint-then-commit ordering keeps the old token valid.
+		e := newEnv(t)
+		rt0 := str(e.exchangeCode(e.obtainCode(nil)), "refresh_token")
+
+		e.signer.fail.Store(true)
+		if status, body := refresh(e, rt0, nil); status != http.StatusInternalServerError || str(body, "error") != "server_error" {
+			t.Fatalf("signing outage: got %d %v, want 500 server_error", status, body)
+		}
+
+		// Keysmith recovers; the ORIGINAL token must still work — if it had been
+		// rotated, this retry would trip reuse detection and revoke the family.
+		e.signer.fail.Store(false)
+		status, body := refresh(e, rt0, nil)
+		if status != http.StatusOK {
+			t.Fatalf("token was rotated despite signing failure (forced re-auth): %d %v", status, body)
+		}
+		if rt1 := str(body, "refresh_token"); rt1 == "" || rt1 == rt0 {
+			t.Fatalf("retry did not issue a fresh successor: %q", rt1)
+		}
+	})
 	t.Run("wrong client presenting the token kills the family", func(t *testing.T) {
 		e := newEnv(t)
 		rt0 := str(e.exchangeCode(e.obtainCode(nil)), "refresh_token")

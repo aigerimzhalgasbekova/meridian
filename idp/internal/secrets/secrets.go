@@ -37,16 +37,24 @@ func Hash(token string) string {
 // resistant alphabet (no 0/O/1/I/L), grouped as XXXX-XXXX for display.
 func NewUserCode() (display, normalized string) {
 	const alphabet = "BCDFGHJKMNPQRSTVWXYZ23456789"
-	var buf [8]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		panic("secrets: crypto/rand unavailable: " + err.Error())
-	}
+	// Rejection sampling: bytes at or above this bound would bias the low
+	// symbols, so draw fresh ones until each falls in the uniform range.
+	const maxByte = 256 - (256 % len(alphabet))
+	var b [1]byte
 	var sb strings.Builder
-	for i, b := range buf {
+	for i := 0; i < 8; i++ {
 		if i == 4 {
 			sb.WriteByte('-')
 		}
-		sb.WriteByte(alphabet[int(b)%len(alphabet)])
+		for {
+			if _, err := rand.Read(b[:]); err != nil {
+				panic("secrets: crypto/rand unavailable: " + err.Error())
+			}
+			if int(b[0]) < maxByte {
+				sb.WriteByte(alphabet[int(b[0])%len(alphabet)])
+				break
+			}
+		}
 	}
 	display = sb.String()
 	return display, NormalizeUserCode(display)

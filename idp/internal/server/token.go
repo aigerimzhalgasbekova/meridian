@@ -258,17 +258,15 @@ func (s *Server) grantRefreshToken(r *http.Request, realm storage.Realm, client 
 		return nil, oauth.E(oauth.ErrInvalidGrant, "user unavailable")
 	}
 
+	// Mint and sign everything BEFORE committing the rotation. Signing is a
+	// remote keysmith call; a transient failure must leave the presented
+	// refresh token valid and un-rotated so the client can safely retry.
+	// Committing the rotation first would trip reuse detection (~:238) on that
+	// retry and force a family-wide logout — turning a keysmith blip into a
+	// permanent logout. Reuse-detection semantics are unchanged: Rotate below
+	// remains the single atomic consume point (including the ErrConsumed
+	// lost-race path).
 	newPlain, successor := token.RotateRefreshToken(rt, s.now())
-	if err := s.cfg.Store.RefreshTokens().Rotate(ctx, realm.Name, hash, successor, s.now()); err != nil {
-		if errors.Is(err, storage.ErrConsumed) {
-			// Lost the race with another redemption of the same token —
-			// same treatment as reuse.
-			_ = s.cfg.Store.RefreshTokens().RevokeFamily(ctx, realm.Name, rt.FamilyID)
-			return nil, oauth.E(oauth.ErrInvalidGrant, "invalid refresh token")
-		}
-		return nil, oauth.E(oauth.ErrServerError, "")
-	}
-
 	access, err := s.issuer.AccessToken(ctx, token.AccessTokenInput{
 		Realm: realm, ClientID: client.ClientID, UserID: user.ID,
 		Scopes: scopes, AuthTime: rt.AuthTime,
@@ -293,6 +291,18 @@ func (s *Server) grantRefreshToken(r *http.Request, realm storage.Realm, client 
 			return nil, oauth.E(oauth.ErrServerError, "")
 		}
 		resp.IDToken = idt
+	}
+
+	// Commit the rotation LAST: the atomic consume-and-insert. A failure here
+	// means the successor was never persisted and its plaintext is discarded.
+	if err := s.cfg.Store.RefreshTokens().Rotate(ctx, realm.Name, hash, successor, s.now()); err != nil {
+		if errors.Is(err, storage.ErrConsumed) {
+			// Lost the race with another redemption of the same token —
+			// same treatment as reuse.
+			_ = s.cfg.Store.RefreshTokens().RevokeFamily(ctx, realm.Name, rt.FamilyID)
+			return nil, oauth.E(oauth.ErrInvalidGrant, "invalid refresh token")
+		}
+		return nil, oauth.E(oauth.ErrServerError, "")
 	}
 	return resp, nil
 }
