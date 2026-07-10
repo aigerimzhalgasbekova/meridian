@@ -53,7 +53,9 @@ resource "aws_db_instance" "postgres" {
   publicly_accessible    = false
   multi_az               = false # dev cost trade-off; flip for prod
 
-  backup_retention_period   = 7
+  # Ephemeral (dev) keeps 1 day of backups: AWS free-plan accounts reject
+  # anything longer (FreeTierRestrictionError), and dev data is disposable.
+  backup_retention_period   = var.ephemeral ? 1 : 7
   deletion_protection       = !var.ephemeral
   skip_final_snapshot       = var.ephemeral
   final_snapshot_identifier = var.ephemeral ? null : "${var.name}-postgres-final"
