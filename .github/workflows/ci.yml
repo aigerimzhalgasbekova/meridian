@@ -281,17 +281,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: aquasecurity/trivy-action@0.28.0
+      - uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: .
           exit-code: '1'
           severity: HIGH,CRITICAL
+          skip-dirs: '**/node_modules'
+          trivyignores: .trivyignore
 
-  # Advisory only: transitive npm advisories churn too fast to gate merges on.
+  # Production dependencies only. The deployed artifacts ship no dev tooling, so
+  # --omit=dev is the security-relevant scope; it also keeps the gate off the
+  # fast-churning test-runner advisories (vitest/vite/esbuild) that never reach
+  # a running service.
   npm-audit:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -299,7 +303,7 @@ jobs:
           node-version: '22'
       - name: portal
         working-directory: portal
-        run: npm audit --audit-level=high
+        run: npm audit --omit=dev --audit-level=high
       - name: console-web
         working-directory: console/web
-        run: npm audit --audit-level=high
+        run: npm audit --omit=dev --audit-level=high

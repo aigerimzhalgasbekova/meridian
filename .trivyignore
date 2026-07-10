@@ -1,0 +1,36 @@
+# Trivy misconfiguration exceptions — dev environment.
+# Each entry is an accepted risk with rationale, not a blanket suppression.
+# Prod-profile hardening (envs/prod) closes several of these; see notes.
+
+# Unrestricted egress (0.0.0.0/0) on the ALB and service security groups.
+# Fargate tasks need egress to AWS APIs (ECR, SSM, CloudWatch, Secrets Manager),
+# to RDS/Redis, and — for bridge — to external IdPs (Google/Entra). Scoping
+# egress would require VPC endpoints for every service. The design is explicit
+# in modules/network/main.tf. Deferred to prod hardening.
+AWS-0104
+
+# ECR image tags are mutable. Intentional: release.yml re-points the ':dev' tag
+# on every build (see envs/dev/main.tf). Version tags (:vX.Y.Z) are immutable by
+# convention. Prod would set IMMUTABLE and drop the rolling ':dev' tag.
+AWS-0031
+
+# Public subnets auto-assign public IPs. The cheap dev profile (enable_nat=false)
+# runs tasks in public subnets for egress without a NAT gateway — documented in
+# modules/network/main.tf. Data services stay in private subnets. Prod uses
+# private subnets + NAT.
+AWS-0164
+
+# SNS topic is not encrypted. It carries only CloudWatch alarm metadata
+# ("CPU high"), which is non-sensitive, and AWS-managed-key SSE complicates
+# CloudWatch->SNS delivery (the key policy can't grant cloudwatch.amazonaws.com).
+# CMK-backed SNS is prod hardening.
+AWS-0095
+
+# ALB is internet-facing. That is the point — it fronts the public IdP, SSO,
+# portal, and console. WAFv2 and drop-invalid-header-fields are attached.
+AWS-0053
+
+# S3 buckets (ALB access logs, site) use SSE-S3 (AES256) rather than a customer
+# managed key. SSE-S3 is adequate for these non-sensitive objects; CMK adds
+# key-management cost and is deferred to prod hardening.
+AWS-0132
