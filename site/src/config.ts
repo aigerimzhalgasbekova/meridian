@@ -8,17 +8,18 @@ export const repoTree = (path: string) => `${GITHUB_REPO}/tree/main/${path}`;
 export const repoFile = (path: string) => `${GITHUB_REPO}/blob/main/${path}`;
 
 /**
- * Live demo URLs per project. `null` = deployment pending (no AWS account
- * yet — see /guide/running-it). Swap in real URLs when Terraform applies.
+ * Live demo URLs per project. `null` = no public endpoint: keysmith,
+ * sessiond and sentinel are internal services by design — reachable only
+ * inside the VPC, which is itself part of the story.
  */
 export const demoUrls: Record<string, string | null> = {
   keysmith: null,
-  idp: null,
+  idp: 'https://idp.iammeridian.cc/realms/demo/.well-known/openid-configuration',
   sessiond: null,
   sentinel: null,
-  bridge: null,
-  portal: null,
-  console: null,
+  bridge: 'https://sso.iammeridian.cc/',
+  portal: 'https://portal.iammeridian.cc/',
+  console: 'https://console.iammeridian.cc/',
 };
 
 export const AUTHOR = {

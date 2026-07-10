@@ -1,7 +1,7 @@
 ---
 title: Running it
 chapter: 9
-summary: The deployment design — ECS Fargate, RDS, ElastiCache, CloudWatch — CI security gates, and exactly what's pending AWS credentials.
+summary: The deployed stack — ECS Fargate, RDS, ElastiCache, CloudWatch on a real AWS account — CI security gates, and what is honestly still pending.
 ---
 
 Seven services exist and pass their suites. This chapter covers how they're designed to run in production, what runs today, and — honestly — what's blocked on an AWS account that doesn't exist yet.
@@ -53,16 +53,16 @@ The design doc specifies CI with security gates rather than a plain build-test p
 
 The iteration protocol from the design doc also belongs to this chapter: before the portfolio is called done, three structured passes over every project — a security pass (attack the implementations: token substitution, redirect manipulation, timing oracles, races on rotation/reuse paths), an architecture pass (failure modes: Redis down, IdP down, clock skew), and a DX pass (cold-start onboarding from a clean checkout, README truthfulness).
 
-## What's honestly pending
+## What's live, and what's honestly pending
 
-An AWS account now exists, but nothing is applied to it yet, so the following are designed and plan-verified but not deployed:
+The stack is **deployed and verified**: the `platform/` Terraform (VPC, one shared ALB with host routing, seven Fargate services, RDS Postgres, ElastiCache Redis, CloudWatch dashboard and alarms, CloudFront for this site) is applied to a real account in eu-west-1, and a 16-check live smoke passes against it — TLS on every public host, OIDC discovery, the full authorization-code flow with keysmith-signed tokens, userinfo, refresh rotation with reuse detection, and portal on RDS over CA-verified TLS. The public entry points are `idp` / `sso` / `portal` / `console` `.iammeridian.cc`; keysmith, sessiond and sentinel are reachable only inside the VPC by design. CI federates into the account through a repo-pinned GitHub OIDC role — no long-lived keys anywhere.
 
-- The `platform/` Terraform stacks (the eighth project) — now `terraform plan`-clean against the real account (166 resources, no diagnostics), but nothing has been applied.
-- Live demo URLs on this site — each project card says "deploy pending" and links to the code instead. The URLs live in [one config file](https://github.com/aigerimzhalgasbekova/meridian/blob/main/site/src/config.ts); when the platform deploys, they're a one-line change each.
-- SES-backed mail in portal (the `MailTransport` interface is one method; dev writes JSON files to an outbox).
-- KMS-backed KEK in keysmith, sentinel's external anchor push, and CloudWatch/X-Ray wiring.
+Still honestly pending:
 
-The remaining handoff sequence, per the design doc: bootstrap remote state, get a domain plus a DNS-validated ACM certificate, set up an OIDC role for CI (no long-lived keys), `terraform apply` per environment, then swap the demo URLs into this site's config. Until then, the local dev modes are the demo — which is arguably the more reviewable artifact anyway: `make run-dev` asks nothing of the reviewer but a Go toolchain.
+- **Bridge's upstream IdPs are placeholders** — a Google OAuth app hasn't been registered, so the provider picker renders but a real Google login round-trip needs client credentials in SSM.
+- SES-backed mail in portal (the `MailTransport` interface is one method; the deployed instance writes JSON files to an outbox).
+- KMS-backed KEK in keysmith, sentinel's external anchor push, and X-Ray tracing (CloudWatch dashboards and alarms are live; traces are not).
+- The `prod` environment profile — dev runs the cheap/ephemeral profile: single-AZ RDS with 1-day backups, no NAT, no WAF.
 
 ## Why "deploy-ready" is a real claim
 
