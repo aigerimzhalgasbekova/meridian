@@ -57,6 +57,14 @@ type Policy struct {
 	// FailWindow expires stale failure counts and escalation state; an
 	// entry untouched for this long is forgotten (default 1h).
 	FailWindow time.Duration
+	// MaxKeys bounds the tracked entries per dimension (default 100_000).
+	// A credential-stuffing run walks a distinct username per attempt, and
+	// nothing about a fresh entry is stale, so time-based expiry alone
+	// cannot bound memory inside a single FailWindow. On overflow the
+	// tracker reclaims stale entries, then unlocked ones; locked entries
+	// are never evicted, because forgetting a lockout is what the attacker
+	// is paying for. See the anti-DoS note in the package doc.
+	MaxKeys int
 }
 
 func (p Policy) withDefaults() Policy {
@@ -74,6 +82,9 @@ func (p Policy) withDefaults() Policy {
 	}
 	if p.FailWindow <= 0 {
 		p.FailWindow = time.Hour
+	}
+	if p.MaxKeys <= 0 {
+		p.MaxKeys = 100_000
 	}
 	return p
 }
@@ -150,6 +161,54 @@ func (t *Tracker) Fail(account, ip string) {
 	t.fail(t.ips, ip, IP, t.policy.IPCap, now)
 }
 
+// sweepStale drops entries past FailWindow and no longer locked. Caller holds t.mu.
+func (t *Tracker) sweepStale(m map[string]*state, now time.Time) {
+	for k, s := range m {
+		if now.Sub(s.touched) > t.policy.FailWindow && now.After(s.lockedUntil) {
+			delete(m, k)
+		}
+	}
+}
+
+// reclaim makes room for a new key in m, returning false if the dimension is
+// full of entries too valuable to drop.
+//
+// Triggering on size rather than on elapsed time is the whole point: a
+// stuffing run walks a fresh username per attempt, so every entry is young and
+// a time-based sweep reclaims nothing until the burst is long over. Stale
+// entries go first; then unlocked ones, which are only failure counters below
+// the threshold. A locked entry is never dropped — releasing a lockout early
+// is precisely the outcome an attacker would be buying with the memory
+// pressure. If everything is locked we stop tracking new keys in this
+// dimension and lean on the other one (an attacker walking a million
+// usernames still walks them from few IPs).
+//
+// Reclaiming down to a low-water mark rather than to exactly one free slot is
+// load-bearing: freeing a single entry per insert would rescan the whole map
+// on every subsequent failure, trading the memory DoS for a CPU one (measured
+// at ~0.5ms per failed login at 50k keys). Batching amortizes the O(n) scan
+// over the headroom it frees.
+func (t *Tracker) reclaim(m map[string]*state, now time.Time) bool {
+	if len(m) < t.policy.MaxKeys {
+		return true
+	}
+	lowWater := t.policy.MaxKeys - t.policy.MaxKeys/10
+
+	t.sweepStale(m, now)
+	if len(m) <= lowWater {
+		return true
+	}
+	for k, s := range m {
+		if len(m) <= lowWater {
+			break
+		}
+		if now.After(s.lockedUntil) {
+			delete(m, k)
+		}
+	}
+	return len(m) < t.policy.MaxKeys
+}
+
 // Success records a successful authentication. It resets failure state ONLY
 // when neither dimension is locked: a success that lands while locked must
 // not unlock — otherwise an attacker who finds the password mid-lockout
@@ -189,6 +248,9 @@ func (t *Tracker) lockLeft(m map[string]*state, key string, now time.Time) time.
 func (t *Tracker) fail(m map[string]*state, key string, dim Dimension, cap time.Duration, now time.Time) {
 	s, ok := m[key]
 	if !ok || (now.Sub(s.touched) > t.policy.FailWindow && now.After(s.lockedUntil)) {
+		if !ok && !t.reclaim(m, now) {
+			return // dimension saturated; the other dimension still tracks this attempt
+		}
 		s = &state{}
 		m[key] = s
 	}

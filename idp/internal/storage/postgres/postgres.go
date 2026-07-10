@@ -49,6 +49,34 @@ func (s *Store) Migrate(ctx context.Context) error {
 // Close releases the pool.
 func (s *Store) Close() { s.pool.Close() }
 
+// Sweep deletes rows that have outlived their expiry: auth codes, refresh
+// tokens, device codes, and sessions. Every Get/Consume already filters on
+// expiry, so nothing reads these rows — the deletes are pure space reclamation
+// that keeps the tables (and their indexes) from growing without bound as
+// logins accumulate. Returns the total number of rows removed.
+//
+// ponytail: range-delete without a dedicated expires_at index on refresh
+// tokens / device codes / sessions — a periodic sweep can afford the scan, and
+// paying index maintenance on every token insert (the hot path) would cost
+// more than it saves. Add per-table expires_at indexes if the sweep cadence
+// ever needs to be sub-minute on a large table.
+func (s *Store) Sweep(ctx context.Context, now time.Time) (int64, error) {
+	var total int64
+	for _, stmt := range []string{
+		`DELETE FROM auth_codes WHERE expires_at < $1`,
+		`DELETE FROM refresh_tokens WHERE expires_at < $1`,
+		`DELETE FROM device_codes WHERE expires_at < $1`,
+		`DELETE FROM sessions WHERE expires_at < $1`,
+	} {
+		tag, err := s.pool.Exec(ctx, stmt, now)
+		if err != nil {
+			return total, err
+		}
+		total += tag.RowsAffected()
+	}
+	return total, nil
+}
+
 func (s *Store) Realms() storage.RealmStore               { return &realmStore{s.pool} }
 func (s *Store) Clients() storage.ClientStore             { return &clientStore{s.pool} }
 func (s *Store) Users() storage.UserStore                 { return &userStore{s.pool} }

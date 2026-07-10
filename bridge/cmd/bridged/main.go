@@ -22,13 +22,18 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"html"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/aikazzh/portfolio/bridge/internal/directory"
 	"github.com/aikazzh/portfolio/bridge/internal/fakeidp"
@@ -147,8 +152,37 @@ func run() error {
 		})
 	}
 
-	log.Printf("bridge listening on %s (base %s)", addr, baseURL)
-	return http.ListenAndServe(addr, mux)
+	// Timeouts are not optional on a public listener: without them a handful
+	// of idle connections holds sockets open indefinitely (Slowloris).
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("bridge listening on %s (base %s)", addr, baseURL)
+		if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+	}
+
+	log.Print("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return httpSrv.Shutdown(shutdownCtx)
 }
 
 func envOr(key, def string) string {

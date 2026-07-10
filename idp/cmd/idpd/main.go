@@ -74,6 +74,27 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 		store = pg
+		// Reap expired auth codes, refresh tokens, device codes, and sessions.
+		// Nothing reads an expired row, so unswept they only bloat the tables;
+		// hourly reclamation is plenty and safe to run on every replica.
+		go func() {
+			t := time.NewTicker(time.Hour)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					// Detached context so an in-flight sweep finishes on shutdown.
+					n, err := pg.Sweep(context.Background(), time.Now())
+					if err != nil {
+						logger.Warn("storage sweep failed", "err", err)
+					} else if n > 0 {
+						logger.Info("storage sweep", "rows", n)
+					}
+				}
+			}
+		}()
 	}
 
 	ks := ksclient.New(env("IDP_KEYSMITH_URL", "http://localhost:8081"), os.Getenv("IDP_KEYSMITH_TOKEN"))

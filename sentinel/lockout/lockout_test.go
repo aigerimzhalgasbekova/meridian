@@ -1,6 +1,7 @@
 package lockout
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -199,5 +200,105 @@ func TestConcurrentUse(t *testing.T) {
 	wg.Wait()
 	if d := tr.Check("acct", "1.2.3.4"); !d.Locked {
 		t.Fatal("want locked after concurrent failures")
+	}
+}
+
+// A credential-stuffing run walks a distinct username per attempt, all inside
+// one FailWindow. Every entry is therefore young, so time-based expiry can
+// reclaim nothing: only the size-triggered eviction bounds memory. Without it
+// the attacker chooses how much RAM sentinel allocates.
+func TestBurstOfDistinctKeysIsBounded(t *testing.T) {
+	c := newClock()
+	policy := testPolicy
+	policy.MaxKeys = 512
+	tr := New(policy, c.now)
+
+	// Clock never advances: the burst arrives faster than FailWindow.
+	for i := 0; i < 20*policy.MaxKeys; i++ {
+		tr.Fail(fmt.Sprintf("drive-by-%d", i), "10.0.0.2")
+	}
+
+	tr.mu.Lock()
+	accounts := len(tr.accounts)
+	tr.mu.Unlock()
+
+	if accounts > policy.MaxKeys {
+		t.Errorf("accounts map held %d entries, over the %d cap", accounts, policy.MaxKeys)
+	}
+	// The attacker's own IP is few and stays tracked, which is the dimension
+	// that actually stops the run.
+	if d := tr.Check("someone", "10.0.0.2"); !d.Locked || d.Dimension != IP {
+		t.Error("attacker IP should be locked out by the IP dimension")
+	}
+}
+
+// Eviction must never release a lockout: that is the outcome an attacker would
+// be buying by flooding the map. A locked victim survives a full cap-exceeding
+// burst of unrelated usernames.
+func TestEvictionNeverDropsALockedEntry(t *testing.T) {
+	c := newClock()
+	policy := testPolicy
+	policy.MaxKeys = 64
+	tr := New(policy, c.now)
+
+	failN(tr, "victim", "10.0.0.1", policy.Threshold)
+	if d := tr.Check("victim", "10.0.0.1"); !d.Locked {
+		t.Fatal("victim should be locked after threshold failures")
+	}
+
+	for i := 0; i < 10*policy.MaxKeys; i++ {
+		tr.Fail(fmt.Sprintf("filler-%d", i), "10.0.0.3")
+	}
+
+	if d := tr.Check("victim", "10.0.0.1"); !d.Locked || d.Dimension != Account {
+		t.Error("victim lockout was evicted by a flood of unrelated usernames")
+	}
+}
+
+// Stale entries are still reclaimed the moment time moves past FailWindow,
+// so a quiet system does not hold yesterday's failure counters forever.
+func TestSweepReclaimsStaleEntries(t *testing.T) {
+	c := newClock()
+	tr := New(testPolicy, c.now)
+
+	tr.Fail("alice", "1.1.1.1") // one failure: counter only, no lock
+	c.advance(testPolicy.FailWindow + time.Minute)
+
+	tr.mu.Lock()
+	tr.sweepStale(tr.accounts, c.now())
+	n := len(tr.accounts)
+	tr.mu.Unlock()
+
+	if n != 0 {
+		t.Errorf("stale account entry survived the sweep (%d left)", n)
+	}
+}
+
+// A still-locked entry is older than FailWindow yet must not be swept: the
+// lock outlives the failure-counting window it was born in.
+func TestSweepKeepsStillLockedEntries(t *testing.T) {
+	c := newClock()
+	policy := Policy{
+		Threshold:  3,
+		BaseLock:   30 * time.Minute, // lock outlives FailWindow
+		AccountCap: time.Hour,
+		IPCap:      time.Hour,
+		FailWindow: time.Minute,
+	}
+	tr := New(policy, c.now)
+
+	failN(tr, "victim", "10.0.0.1", policy.Threshold)
+	c.advance(policy.FailWindow + time.Second)
+
+	tr.mu.Lock()
+	tr.sweepStale(tr.accounts, c.now())
+	_, kept := tr.accounts["victim"]
+	tr.mu.Unlock()
+
+	if !kept {
+		t.Fatal("sweep dropped an account that is still locked out")
+	}
+	if d := tr.Check("victim", "9.9.9.9"); !d.Locked || d.Dimension != Account {
+		t.Error("still-locked account stopped being locked after a sweep")
 	}
 }

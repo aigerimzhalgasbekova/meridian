@@ -78,6 +78,56 @@ func TestAuthCodeConsumeIsSingleUse(t *testing.T) {
 	}
 }
 
+func TestSweepDeletesExpired(t *testing.T) {
+	s := testStore(t)
+	seedRealm(t, s)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// One expired auth code and one still-valid one.
+	mustCreate := func(hash string, exp time.Time) {
+		if err := s.AuthCodes().Create(ctx, storage.AuthCode{
+			CodeHash: hash, RealmName: "test", ClientID: "c", UserID: "u",
+			RedirectURI: "https://x/cb", Scopes: oauth.Scopes{"openid"},
+			ExpiresAt: exp, CreatedAt: now.Add(-time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustCreate("expired", now.Add(-time.Minute))
+	mustCreate("valid", now.Add(time.Hour))
+	// Expired refresh token and session.
+	if err := s.RefreshTokens().Create(ctx, storage.RefreshToken{
+		TokenHash: "rt", RealmName: "test", FamilyID: "f", ClientID: "c", UserID: "u",
+		ExpiresAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sessions().Create(ctx, storage.Session{
+		IDHash: "sess", RealmName: "test", UserID: "u",
+		CreatedAt: now.Add(-time.Hour), AuthenticatedAt: now.Add(-time.Hour),
+		ExpiresAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.Sweep(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 { // expired auth code + refresh token + session
+		t.Fatalf("swept %d rows, want 3", n)
+	}
+	// The valid code survives.
+	if _, err := s.AuthCodes().Consume(ctx, "valid", now); err != nil {
+		t.Fatalf("valid code was swept: %v", err)
+	}
+	// A second sweep with nothing expired is a no-op.
+	if n, err := s.Sweep(ctx, now); err != nil || n != 0 {
+		t.Fatalf("second sweep: n=%d err=%v, want 0,nil", n, err)
+	}
+}
+
 func TestAuthCodeConsumeConcurrent(t *testing.T) {
 	s := testStore(t)
 	seedRealm(t, s)
