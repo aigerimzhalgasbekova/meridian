@@ -69,18 +69,26 @@ make report         # sample compliance report from the bundled fixture
 
 Cross-language proof: `audit`'s Go tests run `verify_chain.py` against a
 Go-written chain, and the Python suite re-verifies a Go-generated fixture
-byte-for-byte (`testdata/sample_audit.jsonl`).
+byte-for-byte (`tools/compliance/testdata/sample_audit.jsonl`).
 
 ## Compliance tooling
+
+Both tools expect the log's out-of-band anchor sidecar, `audit.jsonl.anchors`,
+beside it. Verification is two halves and needs both: the hash chain catches
+modification, reordering, and gaps, while the sidecar catches *truncation* —
+a log with its tail lopped off is a valid prefix of a valid chain, so the walk
+alone reports it intact. A missing sidecar fails closed, because deleting it
+is exactly what an attacker who truncated the log would do.
 
 ```sh
 python3 tools/compliance/verify_chain.py audit.jsonl   # exit 0 = intact
 python3 tools/compliance/report.py audit.jsonl [out.md]
 ```
 
-The report covers decision breakdown, failure trends, lockouts, and risky
-IPs, and re-verifies chain integrity first — it exits non-zero on a tampered
-log.
+The report covers decision breakdown, failure trends, lockouts, and risky IPs.
+It runs the same two-part verification first and exits non-zero on a tampered
+log. Pass `--allow-missing-anchors` to either tool only for logs written
+before the sidecar existed — never for a live one.
 
 ## Docs
 

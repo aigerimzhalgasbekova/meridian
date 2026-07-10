@@ -52,11 +52,14 @@ Sign up at <http://localhost:5173>. "Emails" are JSON files written to
 `server/outbox/` — the server log prints a preview path for each one; copy the
 link out of the file to complete verification / reset flows.
 
-Against Postgres:
+Against Postgres — `PORTAL_TOTP_KEK` becomes mandatory here, because the
+in-code placeholder key must never protect a real database:
 
 ```sh
 psql "$DATABASE_URL" -f server/schema.sql
-DATABASE_URL=postgres://… npm run dev -w server
+DATABASE_URL=postgres://… \
+PORTAL_TOTP_KEK=$(openssl rand -base64 32) \
+  npm run dev -w server
 ```
 
 ## Test
@@ -75,9 +78,11 @@ SKIP LOCKED concurrency) is skipped when `TEST_DATABASE_URL` is unset.
 |---|---|---|
 | `PORT` | `3000` | API port |
 | `DATABASE_URL` | *(unset — in-memory)* | Postgres store + queue |
+| `PORTAL_TOTP_KEK` | *(placeholder; required once `DATABASE_URL` is set)* | 32-byte base64 key sealing TOTP secrets at rest |
 | `OUTBOX_DIR` | `./outbox` | Where dev mail files are written |
 | `BASE_URL` | `http://localhost:5173` | Origin used in emailed links |
-| `NODE_ENV` | — | `production` adds `Secure` to cookies |
+| `WEB_DIST` | `./web/dist` | Built SPA; served when the directory exists |
+| `NODE_ENV` | — | `development` drops `Secure` from cookies; secure by default otherwise |
 
 ## Seams left for the platform
 

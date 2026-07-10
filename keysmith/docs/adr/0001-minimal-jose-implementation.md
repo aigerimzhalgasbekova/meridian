@@ -11,7 +11,7 @@ instinct — "never write your own crypto" — points at importing one.
 ## Decision
 
 Implement JWS compact serialization, JWT claims validation, and JWK/JWKS
-handling in `keysmith/jose` (~600 lines), using **only** stdlib crypto
+handling in `keysmith/jose` (~700 lines), using **only** stdlib crypto
 primitives (`crypto/ed25519`, `crypto/ecdsa`, `crypto/rsa`). No cryptographic
 algorithm is implemented here — signing and verification are one-call stdlib
 operations. What this package owns is the *protocol* layer: parsing,
@@ -44,7 +44,7 @@ test (`jose/jws_test.go: TestKnownAttackPatterns`).
 
 ## Consequences
 
-- We accept maintenance of ~600 lines of security-critical parsing code, with
+- We accept maintenance of ~700 lines of security-critical parsing code, with
   the mitigation that the surface is frozen and heavily tested.
 - Interop is deliberately narrower than full JOSE (no JWE, no nested JWTs, no
   RSA-PSS). Downstream services must live within this profile — which is the

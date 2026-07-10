@@ -7,9 +7,9 @@ deployment wires them — same env vars, same tokens, same ports.
 
 ```sh
 cd platform/compose
-cp .env.example .env          # replace every change-me — each line names its generator
-                              # (tokens: openssl rand -hex 32; PORTAL_TOTP_KEK
-                              #  must be openssl rand -base64 32 — exactly 32 bytes)
+cp .env.example .env          # replace every change-me. The file header names the
+                              # default generator (openssl rand -hex 32); PORTAL_TOTP_KEK
+                              # is the exception — openssl rand -base64 32, exactly 32 bytes
 docker compose up -d --build
 ./smoke.sh                    # end-to-end: JWKS -> discovery -> auth-code flow
 ```

@@ -12,9 +12,10 @@ install:
 test:
 	$(NPM) test
 
-# Requires TEST_DATABASE_URL pointing at a scratch Postgres database.
+# Same suite as `test`, but REQUIRE_TEST_DATABASE_URL turns an unset
+# TEST_DATABASE_URL into a failure instead of 23 silently skipped tests.
 test-int:
-	$(NPM) test
+	REQUIRE_TEST_DATABASE_URL=1 $(NPM) test
 
 typecheck:
 	$(NPM) run typecheck

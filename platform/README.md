@@ -105,6 +105,12 @@ per-second), or drop the four internal/demo services from `desired_count`.
    `CREATE DATABASE portal;` and apply `portal/server/schema.sql` to it
    (idp migrates its own database on boot). Write the DSNs:
 
+   > This database and its schema live **outside Terraform state**. Only `idp`
+   > is a managed `db_name`; nothing detects drift on `portal`, and replacing
+   > the RDS instance silently drops it. Re-run this step if the instance is
+   > ever recreated. The local compose stack hides the asymmetry by creating it
+   > automatically (`compose/initdb/01-portal.sh`).
+
    ```sh
    # sslmode=require: the parameter group sets rds.force_ssl=1 server-side
    # anyway; require just makes the client-side expectation explicit. Upgrade

@@ -49,7 +49,7 @@ Several design decisions made months of AWS work into drop-ins:
 
 ## CI security gates
 
-The design doc specifies CI with security gates rather than a plain build-test pipeline: `go test -race` and the TypeScript suites as table stakes, plus `govulncheck` / `npm audit` dependency scanning, static analysis, and the cross-language audit-chain verification as a pipeline step (the Python verifier against a Go-written chain — the same check the test suites run). Container images build locally today; CI definitions land with the platform project.
+The design doc specifies CI with security gates rather than a plain build-test pipeline: `go test -race` and the TypeScript suites as table stakes, plus `govulncheck` / `npm audit` dependency scanning, static analysis, and the cross-language audit-chain verification as a pipeline step (the Python verifier against a Go-written chain — the same check the test suites run). CI lives in `.github/workflows/`: `ci.yml` runs the suites and the security gates on every PR, `release.yml` builds and pushes the images on a tag.
 
 The iteration protocol from the design doc also belongs to this chapter: before the portfolio is called done, three structured passes over every project — a security pass (attack the implementations: token substitution, redirect manipulation, timing oracles, races on rotation/reuse paths), an architecture pass (failure modes: Redis down, IdP down, clock skew), and a DX pass (cold-start onboarding from a clean checkout, README truthfulness).
 

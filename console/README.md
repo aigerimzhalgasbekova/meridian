@@ -123,3 +123,11 @@ The engine tests assert inheritance chains, wildcard-vs-exact matching, deny ove
 (including across assignments), scope isolation, cycle rejection, and the shape of
 explanation traces. The API tests prove the dog-fooding: an operator cannot create
 roles, a realm-admin cannot act outside their realm, and denied attempts are audited.
+
+## Docs
+
+- [THREAT_MODEL.md](THREAT_MODEL.md) — assets, trust boundaries, abuse cases,
+  residual risk
+- [ADR 0001](docs/adr/0001-rbac-with-explanation.md) — RBAC with an explanation trace
+- [ADR 0002](docs/adr/0002-deny-overrides-allow.md) — deny overrides allow
+- [ADR 0003](docs/adr/0003-scope-model.md) — the scope model
