@@ -1,0 +1,106 @@
+/* Hand-rolled styles; no framework. */
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --ink: #1c2330;
+  --muted: #6b7280;
+  --accent: #274690;
+  --accent-ink: #ffffff;
+  --error: #b3261e;
+  --ok: #1c7c43;
+  --warn: #9a6a00;
+  --border: #d9dde3;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1.25rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand { font-weight: 700; }
+
+nav { display: flex; gap: 1rem; align-items: center; }
+
+main { max-width: 34rem; margin: 2rem auto; padding: 0 1rem; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+
+h1 { font-size: 1.35rem; margin: 0 0 1rem; }
+h2 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; }
+
+label { display: block; margin: 0.75rem 0; font-weight: 600; }
+
+input {
+  display: block;
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.5rem 0.65rem;
+  font: inherit;
+  font-weight: 400;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+button {
+  margin-top: 0.5rem;
+  padding: 0.5rem 1rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--accent-ink);
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button:disabled { opacity: 0.6; cursor: default; }
+
+button.secondary {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+a { color: var(--accent); }
+
+.error { color: var(--error); }
+.notice { background: #eef3ff; border-radius: 6px; padding: 0.75rem 1rem; }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); font-weight: 600; }
+.warn { color: var(--warn); font-weight: 600; }
+
+.qr { display: block; margin: 0.5rem 0; width: 200px; height: 200px; }
+
+.codes { columns: 2; list-style: none; padding: 0; margin: 0.5rem 0 0; }
+.codes code { font-size: 0.95rem; }
+
+table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); }
+th { font-size: 0.85rem; color: var(--muted); }
+
+dl { margin: 0; }
+dt { font-weight: 600; margin-top: 0.5rem; }
+dd { margin: 0; }
+
+hr { border: none; border-top: 1px solid var(--border); margin: 1.5rem 0 1rem; }
