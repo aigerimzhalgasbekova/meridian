@@ -131,3 +131,9 @@ variable "log_retention_days" {
 variable "region" {
   type = string
 }
+
+variable "stop_before_start" {
+  description = "Deploy 0/100 (stop old task before starting new). Required when the task holds an exclusive resource, e.g. a flock'd file on EFS."
+  type        = bool
+  default     = false
+}
