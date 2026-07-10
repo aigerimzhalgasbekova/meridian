@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and fill in. No secrets belong in this file —
+# secrets live in SSM Parameter Store (see ../../README.md, runbook step 3).
+
+region          = "eu-central-1"
+domain          = "dev.meridian.example.com"
+certificate_arn = "arn:aws:acm:eu-central-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+image_tag       = "dev"
+alarm_email     = "you@example.com"

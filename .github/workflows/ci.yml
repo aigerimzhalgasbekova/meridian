@@ -1,0 +1,198 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GO_MODULES: keysmith idp sessiond sentinel bridge console
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      portal: ${{ steps.filter.outputs.portal }}
+      console-web: ${{ steps.filter.outputs.console-web }}
+      python: ${{ steps.filter.outputs.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            go:
+              - 'keysmith/**'
+              - 'idp/**'
+              - 'sessiond/**'
+              - 'sentinel/**'
+              - 'bridge/**'
+              - 'console/**'
+              - 'go.work'
+              - 'go.work.sum'
+              - '.github/workflows/ci.yml'
+            portal:
+              - 'portal/**'
+              - '.github/workflows/ci.yml'
+            console-web:
+              - 'console/web/**'
+              - '.github/workflows/ci.yml'
+            python:
+              - 'sentinel/tools/compliance/**'
+              - '.github/workflows/ci.yml'
+
+  # One job for all Go modules: keysmith changes ripple into idp/bridge via
+  # the replace directive, so per-module filtering would under-test.
+  go:
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $GO_MODULES)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:" && echo "$unformatted" && exit 1
+          fi
+      - name: build, vet, test -race
+        run: |
+          for m in $GO_MODULES; do
+            echo "::group::$m"
+            (cd "$m" && go build ./... && go vet ./... && go test -race ./...)
+            echo "::endgroup::"
+          done
+
+  portal:
+    needs: changes
+    if: needs.changes.outputs.portal == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: portal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  console-web:
+    needs: changes
+    if: needs.changes.outputs.console-web == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: console/web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  python:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: unittest (compliance tooling)
+        working-directory: sentinel/tools/compliance
+        run: python -m unittest -v
+
+  # --- Security gates (always run) -------------------------------------------
+
+  gosec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+      # Gate on high severity + high confidence. G703 excluded: it flags
+      # console's SPA fallback (cmd/consoled withSPA), where the path is
+      # Clean()ed, Join()ed under the fixed web dir, and only ever answered
+      # with index.html or http.FileServer — accepted, documented here.
+      - name: gosec per module
+        run: |
+          for m in $GO_MODULES; do
+            echo "::group::$m"
+            (cd "$m" && gosec -severity high -confidence high -exclude=G703 ./...)
+            echo "::endgroup::"
+          done
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: govulncheck per module
+        run: |
+          for m in $GO_MODULES; do
+            echo "::group::$m"
+            (cd "$m" && govulncheck ./...)
+            echo "::endgroup::"
+          done
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Config/misconfig scan only: no Docker locally and no images built in CI —
+  # image scanning happens on push in ECR (scan_on_push) instead.
+  trivy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+
+  # Advisory only: transitive npm advisories churn too fast to gate merges on.
+  npm-audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: portal
+        working-directory: portal
+        run: npm audit --audit-level=high
+      - name: console-web
+        working-directory: console/web
+        run: npm audit --audit-level=high
