@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"syscall"
 )
 
 // MemStore is an in-memory Store for tests and dev mode.
@@ -53,6 +54,14 @@ func OpenFileStore(path string) (*FileStore, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("audit: open store: %w", err)
+	}
+	// Exclusive advisory lock held for the store's lifetime (released on
+	// Close): stops a second process interleaving appends and forking the
+	// chain. Non-blocking so a conflicting writer fails fast, not hangs.
+	// Unix-only, which suits this deployment.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("audit: lock store %s (another process holds it?): %w", path, err)
 	}
 	return &FileStore{path: path, f: f}, nil
 }

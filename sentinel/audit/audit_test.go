@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -189,6 +190,142 @@ func TestFileStoreResume(t *testing.T) {
 	}
 }
 
+func TestFileStoreExclusiveLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	s1, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+	// A second opener on the same file must be refused (no forked chain).
+	if s2, err := OpenFileStore(path); err == nil {
+		s2.Close()
+		t.Fatal("second OpenFileStore succeeded; expected the advisory lock to block it")
+	}
+}
+
+// TestAnchorSidecarDetectsTruncation proves the out-of-band sidecar gives the
+// truncation resistance in-file anchors lack: lopping the tail off the main
+// log is now caught by verify_chain.py via the sidecar cross-check.
+func TestAnchorSidecarDetectsTruncation(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	script, err := filepath.Abs("../tools/compliance/verify_chain.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	s, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar, err := os.OpenFile(path+".anchors", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := New(s, Options{Now: fixedClock(), AnchorEvery: 3, AnchorSink: sidecar})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendN(t, l, 6) // sidecar anchors vouch for head_seq 3 and 6
+	s.Close()
+	sidecar.Close()
+
+	// Intact chain + sidecar verifies.
+	if out, err := exec.Command(py, script, path).CombinedOutput(); err != nil {
+		t.Fatalf("verifier rejected an intact anchored chain:\n%s", out)
+	}
+
+	// Tail-truncate the main log below the last anchor; the sidecar catches it.
+	keepFirstLines(t, path, 3)
+	out, err := exec.Command(py, script, path).CombinedOutput()
+	if err == nil {
+		t.Fatalf("verifier accepted a truncated log the sidecar should catch:\n%s", out)
+	}
+	if !strings.Contains(string(out), "BROKEN") {
+		t.Fatalf("expected BROKEN from sidecar cross-check, got:\n%s", out)
+	}
+}
+
+// TestRetentionFrontTruncationDetected pins the retention policy (ADR 0003):
+// a naive retention sweep that deletes the OLDEST records to reclaim space
+// must not verify. Dropping the first records leaves the new head's prev
+// pointing at a hash no longer in the file, which the chain walk catches —
+// distinct from tail-truncation, which the sidecar catches. Either way,
+// removing records without an accounting is never OK.
+func TestRetentionFrontTruncationDetected(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	script, err := filepath.Abs("../tools/compliance/verify_chain.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	s, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar, err := os.OpenFile(path+".anchors", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := New(s, Options{Now: fixedClock(), AnchorEvery: 3, AnchorSink: sidecar})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendN(t, l, 6)
+	s.Close()
+	sidecar.Close()
+
+	// Naive retention: drop the oldest records to save space.
+	dropFirstLines(t, path, 3)
+	out, err := exec.Command(py, script, path).CombinedOutput()
+	if err == nil {
+		t.Fatalf("verifier accepted a log with its oldest records deleted:\n%s", out)
+	}
+	if !strings.Contains(string(out), "BROKEN") {
+		t.Fatalf("expected BROKEN from front-truncation, got:\n%s", out)
+	}
+}
+
+func dropFirstLines(t *testing.T, path string, n int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	if len(lines) > n {
+		lines = lines[n:]
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func keepFirstLines(t *testing.T, path string, n int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestConcurrentAppend(t *testing.T) {
 	l, err := New(NewMemStore(), Options{AnchorEvery: 7})
 	if err != nil {
@@ -234,7 +371,13 @@ func TestPythonVerifierAgrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := New(s, Options{Now: fixedClock(), AnchorEvery: 4})
+	// The verifier fails closed on a missing sidecar, so a live chain must
+	// write one (matches production wiring in cmd/sentineld).
+	sidecar, err := os.OpenFile(path+".anchors", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := New(s, Options{Now: fixedClock(), AnchorEvery: 4, AnchorSink: sidecar})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,6 +393,7 @@ func TestPythonVerifierAgrees(t *testing.T) {
 		}
 	}
 	s.Close()
+	sidecar.Close()
 
 	out, err := exec.Command(py, script, path).CombinedOutput()
 	if err != nil {

@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"sync"
 	"time"
@@ -117,6 +118,7 @@ type Log struct {
 	store       Store
 	now         func() time.Time
 	anchorEvery uint64
+	anchorSink  io.Writer // out-of-band anchor sidecar; nil disables it
 	// chain head, cached to avoid re-reading the store per append
 	lastSeq  uint64
 	lastHash string
@@ -128,6 +130,12 @@ type Options struct {
 	// AnchorEvery appends an anchor record after every N ordinary records.
 	// 0 disables anchoring.
 	AnchorEvery uint64
+	// AnchorSink, if set, receives each anchor (chain head seq+hash+ts) as a
+	// JSON line in a separate append-only file. Living out-of-band gives
+	// truncation resistance the in-file anchors cannot: tail-truncating the
+	// main log leaves the sidecar's last anchor pointing past the new head, so
+	// verify_chain.py detects the loss.
+	AnchorSink io.Writer
 	// Now supplies the clock; defaults to time.Now.
 	Now func() time.Time
 }
@@ -138,7 +146,7 @@ func New(store Store, opts Options) (*Log, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	l := &Log{store: store, now: opts.Now, anchorEvery: opts.AnchorEvery, empty: true, lastHash: GenesisPrev}
+	l := &Log{store: store, now: opts.Now, anchorEvery: opts.AnchorEvery, anchorSink: opts.AnchorSink, empty: true, lastHash: GenesisPrev}
 	last, ok, err := store.Last()
 	if err != nil {
 		return nil, fmt.Errorf("audit: reading chain head: %w", err)
@@ -173,8 +181,35 @@ func (l *Log) Append(e Event) (Record, error) {
 		}); err != nil {
 			return rec, fmt.Errorf("audit: appending anchor: %w", err)
 		}
+		if err := l.writeAnchor(rec); err != nil {
+			return rec, fmt.Errorf("audit: writing anchor sidecar: %w", err)
+		}
 	}
 	return rec, nil
+}
+
+// writeAnchor durably records the checkpointed chain head to the out-of-band
+// sidecar (if configured), so truncation of the main log is detectable.
+func (l *Log) writeAnchor(head Record) error {
+	if l.anchorSink == nil {
+		return nil
+	}
+	line, err := json.Marshal(map[string]any{
+		"head_seq":  head.Seq,
+		"head_hash": head.Hash,
+		"ts":        head.TS,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := l.anchorSink.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	// Sidecar durability matters as much as the chain's; fsync if we can.
+	if sync, ok := l.anchorSink.(interface{ Sync() error }); ok {
+		return sync.Sync()
+	}
+	return nil
 }
 
 func (l *Log) append(e Event) (Record, error) {

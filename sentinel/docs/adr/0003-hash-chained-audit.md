@@ -49,5 +49,45 @@ fields present, string-only detail values.
 - Verification is O(n) over the log; fine for service-lifetime logs, and the
   `Store` interface documents the streaming-verification seam for a
   Postgres-backed store.
-- The log is append-only by construction; log rotation must cut over to a new
-  chain whose genesis references the old head (operational runbook item).
+- The log is append-only and grows without bound. Retention is a policy, not a
+  feature you can bolt on with `logrotate` — see below.
+
+## Retention and rotation policy
+
+The chain is tamper-*evident* precisely because removing any record breaks
+verification. That property and naive retention are in direct conflict: you
+cannot free space by deleting old records, because `verify_chain.py` will (by
+design) then report `BROKEN`. Deleting the oldest lines leaves the new first
+record's `prev` pointing at a hash no longer in the file (chain-walk failure);
+deleting a middle span opens a sequence gap; truncating the tail is caught by
+the anchor sidecar. Every removal mode is detected — that is the point, and
+`TestRetentionFrontTruncationDetected` pins it.
+
+So retention MUST preserve verifiability. Operational rules, in order of
+preference:
+
+1. **Archive, never truncate in place.** When the active log is large, copy the
+   whole `sentinel-audit.jsonl` (and its `.anchors` sidecar) to WORM/cold
+   storage, then start a *new* chain file. Keep the archived files verifiable:
+   an auditor concatenates archive + live and runs `verify_chain.py` over the
+   whole thing. Nothing is deleted from a live chain.
+2. **Roll by sealing, not cutting.** To start a fresh file whose size resets,
+   record the sealed file's head (seq + hash) as the genesis reference of the
+   next file. The prior agent's out-of-band anchor sidecar already captures
+   every head hash, so a sealed segment's head is durably recorded off-file;
+   the sidecar makes the boundary explicit and any later gap detectable rather
+   than silent.
+3. **Pruning requires accounting.** Only sealed, externally-anchored, archived
+   segments may be pruned from hot storage. Their head hashes remain in the
+   `.anchors` sidecar and in the WORM archive, so a pruned segment's absence is
+   provable, not silent. Never prune a segment whose head is not anchored
+   out-of-band.
+
+Explicitly **not** implemented (YAGNI at current volume): automatic
+multi-segment rotation with a prune sweeper, and a `verify_chain.py` that walks
+across segment boundaries accepting an anchored non-genesis start. Add these
+only when log volume actually forces rotation; until then the sidecar +
+archive-don't-truncate rules above are sufficient and cannot silently lose
+history. The invariant to preserve if that feature is ever built:
+`verify_chain.py` must never print `OK` for a log whose records were removed
+without a corresponding anchor accounting for them.

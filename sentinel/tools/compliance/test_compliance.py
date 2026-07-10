@@ -106,5 +106,35 @@ class ReportTest(unittest.TestCase):
         self.assertIn("Records: **0**", md)
 
 
+class AnchorTest(unittest.TestCase):
+    """The out-of-band anchor cross-check that gives truncation resistance."""
+
+    def setUp(self):
+        self.records = verify_chain.load(FIXTURE)
+
+    def _anchor_for(self, rec):
+        return {"head_seq": rec["seq"], "head_hash": rec["hash"], "ts": rec["ts"]}
+
+    def test_matching_anchor_ok(self):
+        anchors = [self._anchor_for(self.records[-1])]
+        ok, reason = verify_chain.check_anchors(self.records, anchors)
+        self.assertTrue(ok, reason)
+
+    def test_truncation_detected_by_anchor(self):
+        # Anchor vouches for the current head; drop the tail below it.
+        anchors = [self._anchor_for(self.records[-1])]
+        truncated = self.records[:-3]
+        ok, reason = verify_chain.check_anchors(truncated, anchors)
+        self.assertFalse(ok)
+        self.assertIn("truncated", reason)
+
+    def test_empty_anchors_fails_closed(self):
+        # An emptied sidecar is indistinguishable from an attacker deleting the
+        # evidence, so it must not verify as intact.
+        ok, reason = verify_chain.check_anchors(self.records, [])
+        self.assertFalse(ok)
+        self.assertIn("empty", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

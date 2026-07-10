@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -43,6 +44,7 @@ func run(logger *slog.Logger) error {
 	addr := envOr("SENTINEL_ADDR", ":8084")
 
 	var store audit.Store
+	var anchorSink io.Writer
 	auditPath := envOr("SENTINEL_AUDIT_PATH", "sentinel-audit.jsonl")
 	if auditPath == "memory" {
 		store = audit.NewMemStore()
@@ -53,8 +55,15 @@ func run(logger *slog.Logger) error {
 		}
 		defer fs.Close()
 		store = fs
+		// Out-of-band anchor sidecar for truncation resistance (see audit.Options).
+		anchorFile, err := os.OpenFile(auditPath+".anchors", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		defer anchorFile.Close()
+		anchorSink = anchorFile
 	}
-	log, err := audit.New(store, audit.Options{AnchorEvery: 100})
+	log, err := audit.New(store, audit.Options{AnchorEvery: 100, AnchorSink: anchorSink})
 	if err != nil {
 		return err
 	}
