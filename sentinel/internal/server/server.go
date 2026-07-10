@@ -173,7 +173,7 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
 	}
 
-	s.audit(audit.Event{
+	if err := s.audit(audit.Event{
 		Type:   "sentinel.decision",
 		Actor:  req.Account,
 		Action: resp.Decision,
@@ -183,7 +183,12 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 			"reasons":  strings.Join(resp.Reasons, ","),
 			"decision": resp.Decision,
 		},
-	})
+	}); err != nil {
+		// Fail closed: without a durable audit record the decision is not
+		// authoritative, so we must not return it.
+		s.internalError(w, "audit append", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -217,7 +222,7 @@ func (s *Server) handleReportAuthResult(w http.ResponseWriter, r *http.Request) 
 	if req.Success {
 		result = "success"
 	}
-	s.audit(audit.Event{
+	if err := s.audit(audit.Event{
 		Type:   "auth.result",
 		Actor:  req.Account,
 		Action: result,
@@ -225,7 +230,10 @@ func (s *Server) handleReportAuthResult(w http.ResponseWriter, r *http.Request) 
 			"ip":      req.IP,
 			"success": strconv.FormatBool(req.Success),
 		},
-	})
+	}); err != nil {
+		s.internalError(w, "audit append", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 }
 
@@ -246,6 +254,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "type and action are required")
 		return
 	}
+	// Reserved prefixes name sentinel's own internal events; a client must not
+	// be able to forge them into the audit chain.
+	if strings.HasPrefix(req.Type, "sentinel.") || strings.HasPrefix(req.Type, "auth.") {
+		writeError(w, http.StatusBadRequest, "event type uses a reserved prefix (sentinel.*, auth.*)")
+		return
+	}
 	rec, err := s.cfg.Audit.Append(audit.Event(req))
 	if err != nil {
 		s.internalError(w, "audit append", err)
@@ -263,12 +277,15 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, audit.Verify(recs))
 }
 
-// audit appends best-effort: a decision must not fail because the log write
-// did, but the failure is loud in logs (and would page in production).
-func (s *Server) audit(e audit.Event) {
+// audit appends and returns any error: the audit chain IS the compliance
+// evidence, so callers fail closed when the write fails rather than return an
+// unlogged (and thus non-authoritative) decision.
+func (s *Server) audit(e audit.Event) error {
 	if _, err := s.cfg.Audit.Append(e); err != nil {
 		s.cfg.Logger.Error("audit append failed", "type", e.Type, "err", err)
+		return err
 	}
+	return nil
 }
 
 func (s *Server) internalError(w http.ResponseWriter, what string, err error) {

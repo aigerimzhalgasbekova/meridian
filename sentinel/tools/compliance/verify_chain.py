@@ -16,6 +16,7 @@ Exit status: 0 chain intact, 1 broken or unreadable.
 """
 import hashlib
 import json
+import os
 import sys
 
 GENESIS = "0" * 64
@@ -96,7 +97,34 @@ def verify(records):
     return True, None, None
 
 
+def check_anchors(records, anchors):
+    """Cross-check the chain head against the last out-of-band anchor.
+
+    Anchors live in a separate append-only sidecar, so tail-truncating the
+    main log cannot also delete them. If the last anchor vouches for a
+    (seq, hash) the truncated log no longer contains, the loss is detected.
+    Returns (ok, reason).
+    """
+    if not anchors:
+        return False, "anchor sidecar is empty (deleted or truncated?)"
+    last = anchors[-1]
+    head_seq = int(last["head_seq"])
+    head_hash = last["head_hash"]
+    by_seq = {int(r["seq"]): r for r in records}
+    rec = by_seq.get(head_seq)
+    if rec is None:
+        return False, "anchor vouches for seq %d, absent from log (truncated?)" % head_seq
+    if rec["hash"] != head_hash:
+        return False, "anchor hash mismatch at seq %d" % head_seq
+    return True, None
+
+
 def main(argv):
+    # --allow-missing-anchors exists only for logs written before the sidecar
+    # was introduced. Never pass it when verifying a live audit log: a missing
+    # sidecar is indistinguishable from an attacker deleting the evidence.
+    allow_missing = "--allow-missing-anchors" in argv
+    argv = [a for a in argv if a != "--allow-missing-anchors"]
     if len(argv) != 2:
         print(__doc__.strip(), file=sys.stderr)
         return 2
@@ -106,12 +134,32 @@ def main(argv):
         print("ERROR: %s" % e, file=sys.stderr)
         return 1
     ok, seq, reason = verify(records)
-    if ok:
-        print("OK: chain of %d records intact (head %s)"
-              % (len(records), records[-1]["hash"][:16] + "..." if records else "empty"))
-        return 0
-    print("BROKEN at seq %s: %s" % (seq, reason))
-    return 1
+    if not ok:
+        print("BROKEN at seq %s: %s" % (seq, reason))
+        return 1
+    # Cross-check the out-of-band anchor sidecar: this is what catches
+    # tail-truncation the chain walk alone cannot see. Its absence fails
+    # closed, otherwise deleting it would restore the very blind spot the
+    # sidecar exists to remove.
+    anchor_path = argv[1] + ".anchors"
+    if not os.path.exists(anchor_path):
+        if not allow_missing:
+            print("BROKEN: anchor sidecar %s missing (deleted?); pass "
+                  "--allow-missing-anchors only for pre-sidecar logs" % anchor_path)
+            return 1
+    else:
+        try:
+            anchors = load(anchor_path)
+        except (OSError, ValueError) as e:
+            print("ERROR: %s" % e, file=sys.stderr)
+            return 1
+        aok, areason = check_anchors(records, anchors)
+        if not aok:
+            print("BROKEN: %s" % areason)
+            return 1
+    print("OK: chain of %d records intact (head %s)"
+          % (len(records), records[-1]["hash"][:16] + "..." if records else "empty"))
+    return 0
 
 
 if __name__ == "__main__":

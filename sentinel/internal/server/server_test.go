@@ -251,6 +251,41 @@ func TestUnknownClientClassStillChecksClient(t *testing.T) {
 	}
 }
 
+func TestEventsRejectReservedTypes(t *testing.T) {
+	e := newEnv(t)
+	for _, typ := range []string{"sentinel.decision", "auth.result", "sentinel.anchor"} {
+		body := fmt.Sprintf(`{"type":%q,"actor":"eve","action":"forge"}`, typ)
+		w := e.do(t, "POST", "/v1/events", testToken, body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("type %q: status %d, want 400", typ, w.Code)
+		}
+	}
+	// Confirm no forged record slipped into the chain.
+	if recs, _ := e.log.Records(); len(recs) != 0 {
+		t.Fatalf("reserved events were appended: %+v", recs)
+	}
+}
+
+// failStore fails every append, simulating a dead audit backend.
+type failStore struct{}
+
+func (failStore) Append(audit.Record) error         { return fmt.Errorf("disk full") }
+func (failStore) Records() ([]audit.Record, error)  { return nil, nil }
+func (failStore) Last() (audit.Record, bool, error) { return audit.Record{}, false, nil }
+
+func TestCheckFailsClosedWhenAuditFails(t *testing.T) {
+	e := newEnv(t)
+	log, err := audit.New(failStore{}, audit.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.srv.cfg.Audit = log // swap in the failing log
+	w := e.do(t, "POST", "/v1/check", testToken, `{"account":"alice","ip":"203.0.113.10"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("check with failing audit: status %d, want 500 (fail closed)", w.Code)
+	}
+}
+
 func hasPrefix(ss []string, prefix string) bool {
 	for _, s := range ss {
 		if strings.HasPrefix(s, prefix) {
