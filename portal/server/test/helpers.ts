@@ -28,7 +28,13 @@ export function testApp(): TestApp {
   const ctx: AppContext = {
     store: memoryStore(),
     queue: memoryQueue(),
-    config: { ...defaultConfig, uniformDelayMs: 50, rateLimit: { limit: 1000, windowMs: 60_000 } },
+    config: {
+      ...defaultConfig,
+      uniformDelayMs: 50,
+      rateLimit: { limit: 1000, windowMs: 60_000 },
+      // Tests run over plain http; explicit opt-out, not a weakened default.
+      secureCookies: false,
+    },
     now: () => clock.now,
   };
   const mail = memoryTransport();

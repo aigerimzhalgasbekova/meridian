@@ -62,5 +62,11 @@ export function memoryQueue(): JobQueue {
     async listByStatus(status: JobStatus) {
       return [...jobs.values()].filter((j) => j.status === status).map((j) => ({ ...j }));
     },
+
+    async recover() {
+      let n = 0;
+      for (const j of jobs.values()) if (j.status === 'running') { j.status = 'pending'; n++; }
+      return n;
+    },
   };
 }

@@ -8,35 +8,59 @@ const EMAIL = 'ada@example.com';
 const PASSWORD = 'correct horse battery';
 
 async function signup(t: TestApp, email = EMAIL, password = PASSWORD) {
-  const res = await request(t.app).post('/api/auth/signup').send({ email, password });
-  expect(res.status).toBe(201);
+  // Signup is enumeration-safe and does not auto-login; log in to get a session.
+  await request(t.app).post('/api/auth/signup').send({ email, password }).expect(202);
+  const res = await request(t.app).post('/api/auth/login').send({ email, password });
+  expect(res.status).toBe(200);
   return { cookie: sessionCookieOf(res), csrf: res.body.csrfToken as string };
 }
 
 describe('signup and login', () => {
-  it('signs up, sets a session cookie, and enqueues a verification email', async () => {
+  it('signs up (enumeration-safe 202), then login sets a session cookie and a verify email is enqueued', async () => {
     const t = testApp();
     const res = await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD });
-    expect(res.status).toBe(201);
-    expect(res.body.user).toMatchObject({ email: EMAIL, emailVerified: false, totpEnabled: false });
-    const cookie = sessionCookieOf(res);
-    expect(res.headers['set-cookie']![0]).toMatch(/HttpOnly/);
-    expect(res.headers['set-cookie']![0]).toMatch(/SameSite=Lax/);
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ ok: true }); // no session, no account details leaked
+    expect(res.headers['set-cookie']).toBeUndefined();
 
-    const me = await request(t.app).get('/api/me').set('Cookie', cookie);
-    expect(me.status).toBe(200);
+    const login = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD });
+    expect(login.status).toBe(200);
+    const cookie = sessionCookieOf(login);
+    expect(login.headers['set-cookie']![0]).toMatch(/HttpOnly/);
+    expect(login.headers['set-cookie']![0]).toMatch(/SameSite=Lax/);
+    await request(t.app).get('/api/me').set('Cookie', cookie).expect(200);
 
     const mails = await t.drainMail();
     expect(mails).toHaveLength(1);
     expect(mails[0]!.to).toBe(EMAIL);
   });
 
-  it('rejects duplicate signups, bad emails, short passwords', async () => {
+  it('signup is enumeration-safe on a taken address; rejects bad emails, short passwords', async () => {
     const t = testApp();
-    await signup(t);
-    expect((await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD })).status).toBe(409);
+    const fresh = await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD });
+    // A repeat with the same address is indistinguishable from the first attempt.
+    const dup = await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD });
+    expect(dup.status).toBe(fresh.status);
+    expect(dup.body).toEqual(fresh.body);
+    // and it did not create a second account: the original login still works
+    await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD }).expect(200);
     expect((await request(t.app).post('/api/auth/signup').send({ email: 'nope', password: PASSWORD })).status).toBe(400);
     expect((await request(t.app).post('/api/auth/signup').send({ email: 'x@y.io', password: 'short' })).status).toBe(400);
+  });
+
+  it('signup on a taken address emails the owner a reset link, not silence', async () => {
+    const t = testApp();
+    await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD }).expect(202);
+    await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: 'a-different-password' }).expect(202);
+    const mails = await t.drainMail();
+    // One verification mail for the real signup, one notice for the taken retry.
+    expect(mails).toHaveLength(2);
+    expect(mails[1]!.to).toBe(EMAIL);
+    expect(mails[1]!.text).toContain('/reset?token=');
+    // The notice must not become a password-change oracle: the reset link is a
+    // token, and the attacker's chosen password was never applied.
+    await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: 'a-different-password' }).expect(401);
+    await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD }).expect(200);
   });
 
   it('logs in with correct password, rejects wrong password and unknown user identically', async () => {
@@ -199,6 +223,21 @@ describe('TOTP MFA', () => {
     return { cookie, csrf, secret, recoveryCodes };
   }
 
+  it('stores the pending secret sealed at rest, not plaintext', async () => {
+    const t = testApp();
+    const { cookie, csrf } = await signup(t);
+    const setup = await request(t.app)
+      .post('/api/security/totp/setup')
+      .set('Cookie', cookie)
+      .set('x-csrf-token', csrf)
+      .expect(200);
+    const plainBase32 = setup.body.secret as string;
+    const user = await t.ctx.store.users.findByEmail(EMAIL);
+    expect(user!.totpPendingSecret).not.toBeNull();
+    expect(user!.totpPendingSecret).not.toBe(plainBase32);
+    expect(user!.totpPendingSecret).not.toContain(plainBase32);
+  });
+
   it('enrolls, then login requires the TOTP step-up', async () => {
     const t = testApp();
     const { secret } = await enroll(t);
@@ -249,6 +288,25 @@ describe('TOTP MFA', () => {
     t.clock.advance(30_000);
     const next = totp(secret, t.clock.now.getTime() / 1000);
     await request(t.app).post('/api/auth/totp').set('Cookie', s2.cookie).set('x-csrf-token', s2.csrf).send({ code: next }).expect(200);
+  });
+
+  it('TOCTOU: two concurrent uses of the same code, exactly one succeeds', async () => {
+    const t = testApp();
+    const { secret } = await enroll(t);
+    t.clock.advance(60_000);
+    const code = totp(secret, t.clock.now.getTime() / 1000);
+
+    const login = async () => {
+      const res = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD });
+      return { cookie: sessionCookieOf(res), csrf: res.body.csrfToken as string };
+    };
+    const [a, b] = await Promise.all([login(), login()]);
+    const step = (s: { cookie: string; csrf: string }) =>
+      request(t.app).post('/api/auth/totp').set('Cookie', s.cookie).set('x-csrf-token', s.csrf).send({ code });
+
+    const results = await Promise.all([step(a), step(b)]);
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual([200, 401]); // the atomic counter advance rejects the replayer
   });
 
   it('recovery codes complete the step-up and are single-use', async () => {

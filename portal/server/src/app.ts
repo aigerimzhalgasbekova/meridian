@@ -5,6 +5,7 @@ import { withMinDuration, type AppContext } from './context.js';
 import { decoyHash, hashPassword, verifyPassword } from './crypto/password.js';
 import { hashToken, newToken } from './crypto/tokens.js';
 import { base32Decode } from './crypto/base32.js';
+import { open, seal } from './crypto/secretbox.js';
 import { generateTotpSecret, otpauthUri, verifyTotp } from './crypto/totp.js';
 import {
   newCsrfToken,
@@ -98,6 +99,22 @@ export function createApp(ctx: AppContext): Express {
     }, { runAt: ctx.now() });
   }
 
+  async function sendResetEmail(userId: string, address: string, subject: string, lead: string): Promise<void> {
+    const { token, hash } = newToken();
+    await store.tokens.create({
+      userId,
+      purpose: 'password_reset',
+      tokenHash: hash,
+      payload: null,
+      expiresAt: new Date(ctx.now().getTime() + config.resetTokenTtlMs),
+    });
+    await queue.enqueue(SEND_EMAIL, {
+      to: address,
+      subject,
+      text: `${lead}\n\n${config.baseUrl}/reset?token=${token}\n\nThis link expires in ${Math.round(config.resetTokenTtlMs / 60_000)} minutes and can be used once.`,
+    }, { runAt: ctx.now() });
+  }
+
   const wrap = (fn: RequestHandler): RequestHandler => {
     return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
   };
@@ -108,22 +125,30 @@ export function createApp(ctx: AppContext): Express {
     const { email, password } = req.body ?? {};
     if (!isEmail(email)) return badRequest(res, 'valid email required');
     if (!isPassword(password)) return badRequest(res, `password must be at least ${MIN_PASSWORD} characters`);
-    if (await store.users.findByEmail(email)) {
-      res.status(409).json({ error: 'an account with that email already exists' });
-      return;
-    }
-    const user = await store.users.create({
-      email,
-      emailVerified: false,
-      pendingEmail: null,
-      passwordHash: await hashPassword(password),
-      totpSecret: null,
-      totpPendingSecret: null,
-      totpLastCounter: null,
+    // Enumeration-safe (mirrors /forgot): identical body + minimum duration
+    // whether or not the address is taken. Both branches send mail, so the
+    // address owner always has somewhere to go — a taken address gets a reset
+    // link rather than the silence the UI's "check your email" would belie.
+    await withMinDuration(config.uniformDelayMs, async () => {
+      const existing = await store.users.findByEmail(email);
+      if (existing) {
+        await sendResetEmail(existing.id, existing.email,
+          `Someone tried to create a ${config.issuer} account with your email`,
+          'You already have an account with this address. If that was you, sign in — or reset your password by opening:');
+        return;
+      }
+      const user = await store.users.create({
+        email,
+        emailVerified: false,
+        pendingEmail: null,
+        passwordHash: await hashPassword(password),
+        totpSecret: null,
+        totpPendingSecret: null,
+        totpLastCounter: null,
+      });
+      await sendVerifyEmail(user.id, email);
     });
-    await sendVerifyEmail(user.id, email);
-    const session = await startSession(res, user.id, false);
-    res.status(201).json(meBody(user, session));
+    res.status(202).json({ ok: true });
   }));
 
   app.post('/api/auth/login', limited, wrap(async (req, res) => {
@@ -148,13 +173,14 @@ export function createApp(ctx: AppContext): Express {
     if (typeof code !== 'string' || !user.totpSecret) return badRequest(res, 'code required');
 
     if (/^\d{6}$/.test(code)) {
-      const counter = verifyTotp(base32Decode(user.totpSecret), code, ctx.now().getTime() / 1000);
-      // Replay defense: a time-step at or before the last accepted one is rejected.
-      if (counter === null || (user.totpLastCounter !== null && counter <= BigInt(user.totpLastCounter))) {
+      const secret = base32Decode(open(user.totpSecret, config.totpKek));
+      const counter = verifyTotp(secret, code, ctx.now().getTime() / 1000);
+      // Replay defense is atomic: advanceTotpCounter rejects (0 rows) any counter
+      // at or before the last accepted one, so concurrent replays can't both pass.
+      if (counter === null || !(await store.users.advanceTotpCounter(user.id, counter.toString()))) {
         res.status(401).json({ error: 'invalid code' });
         return;
       }
-      await store.users.update(user.id, { totpLastCounter: counter.toString() });
     } else {
       const consumed = await store.recoveryCodes.consume(user.id, hashToken(code.trim().toLowerCase()));
       if (!consumed) {
@@ -185,19 +211,9 @@ export function createApp(ctx: AppContext): Express {
     await withMinDuration(config.uniformDelayMs, async () => {
       const user = await store.users.findByEmail(email);
       if (!user) return;
-      const { token, hash } = newToken();
-      await store.tokens.create({
-        userId: user.id,
-        purpose: 'password_reset',
-        tokenHash: hash,
-        payload: null,
-        expiresAt: new Date(ctx.now().getTime() + config.resetTokenTtlMs),
-      });
-      await queue.enqueue(SEND_EMAIL, {
-        to: user.email,
-        subject: `Reset your ${config.issuer} password`,
-        text: `Reset your password by opening:\n\n${config.baseUrl}/reset?token=${token}\n\nThis link expires in ${Math.round(config.resetTokenTtlMs / 60_000)} minutes and can be used once.`,
-      }, { runAt: ctx.now() });
+      await sendResetEmail(user.id, user.email,
+        `Reset your ${config.issuer} password`,
+        'Reset your password by opening:');
     });
     res.status(202).json({ ok: true });
   }));
@@ -278,7 +294,8 @@ export function createApp(ctx: AppContext): Express {
       return;
     }
     const { base32 } = generateTotpSecret();
-    await store.users.update(user.id, { totpPendingSecret: base32 });
+    // Encrypted at rest like totpSecret: it lives across the setup->activate hop.
+    await store.users.update(user.id, { totpPendingSecret: seal(base32, config.totpKek) });
     const uri = otpauthUri(base32, user.email, config.issuer);
     const qrSvg = new QRCode({ content: uri, padding: 2, width: 200, height: 200, ecl: 'M', join: true }).svg();
     res.json({ secret: base32, otpauthUri: uri, qrSvg });
@@ -289,7 +306,8 @@ export function createApp(ctx: AppContext): Express {
     const { code } = req.body ?? {};
     if (!user.totpPendingSecret) return badRequest(res, 'no enrollment in progress');
     if (typeof code !== 'string') return badRequest(res, 'code required');
-    const counter = verifyTotp(base32Decode(user.totpPendingSecret), code, ctx.now().getTime() / 1000);
+    const pendingBase32 = open(user.totpPendingSecret, config.totpKek);
+    const counter = verifyTotp(base32Decode(pendingBase32), code, ctx.now().getTime() / 1000);
     if (counter === null) {
       res.status(401).json({ error: 'invalid code' });
       return;
@@ -297,7 +315,8 @@ export function createApp(ctx: AppContext): Express {
     const { raw, hashes } = generateRecoveryCodes();
     await store.recoveryCodes.replaceForUser(user.id, hashes);
     await store.users.update(user.id, {
-      totpSecret: user.totpPendingSecret,
+      // Encrypted at rest (recoverable, so cannot be hashed).
+      totpSecret: seal(pendingBase32, config.totpKek),
       totpPendingSecret: null,
       totpLastCounter: counter.toString(),
     });

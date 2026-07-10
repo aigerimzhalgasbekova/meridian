@@ -6,8 +6,8 @@ CREATE TABLE IF NOT EXISTS users (
     email_verified      BOOLEAN NOT NULL DEFAULT FALSE,
     pending_email       TEXT,
     password_hash       TEXT NOT NULL,
-    totp_secret         TEXT,           -- base32; set only after verify-to-activate
-    totp_pending_secret TEXT,           -- enrollment in progress
+    totp_secret         TEXT,           -- AES-256-GCM sealed (base64 nonce||tag||ct); set only after verify-to-activate
+    totp_pending_secret TEXT,           -- AES-256-GCM sealed; enrollment in progress
     totp_last_counter   TEXT,           -- last accepted time-step (replay defense)
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );

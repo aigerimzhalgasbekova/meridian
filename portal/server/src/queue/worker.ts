@@ -16,6 +16,7 @@ export interface WorkerOptions {
 export class Worker {
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
+  private running: Promise<unknown> | null = null;
 
   constructor(
     private readonly queue: JobQueue,
@@ -27,15 +28,23 @@ export class Worker {
     this.stopped = false;
     const poll = async () => {
       if (this.stopped) return;
-      await this.tick();
+      this.running = this.tick();
+      try {
+        await this.running;
+      } finally {
+        this.running = null;
+      }
       if (!this.stopped) this.timer = setTimeout(poll, this.opts.pollIntervalMs ?? 500);
     };
-    void poll();
+    // Reclaim jobs stranded 'running' by a previous crash/kill before polling.
+    void this.queue.recover().then(poll);
   }
 
-  stop(): void {
+  /** Stop polling and await the currently-running tick so no claimed job is stranded. */
+  async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
+    await this.running;
   }
 
   /** Drain everything currently eligible. Used by tests and graceful shutdown. */
