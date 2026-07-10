@@ -98,6 +98,13 @@ func New(cfg Config, reg *provider.Registry, dir directory.Store, signer Signer)
 	s.mux.HandleFunc("POST /link/{provider}", s.handleLink)
 	s.mux.HandleFunc("GET /account", s.handleAccount)
 	s.mux.HandleFunc("POST /logout", s.handleLogout)
+	// Liveness: always 200 while the process serves. Provider readiness is
+	// deliberately separate — an upstream IdP outage must not make a load
+	// balancer recycle otherwise-healthy bridge tasks.
+	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	})
 	s.mux.HandleFunc("GET /healthz/providers", s.handleProviderHealth)
 	return s, nil
 }

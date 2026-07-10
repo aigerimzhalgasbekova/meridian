@@ -249,9 +249,9 @@ module "sentinel" {
 }
 
 # bridge — public SSO federation gateway (Google / Entra ID upstream).
-# Note: bridge has no plain /healthz (only /healthz/providers, which reports
-# 503 while an upstream breaker is open) — the home page is the honest
-# liveness signal for the ALB.
+# /healthz is pure liveness; /healthz/providers (503 while an upstream
+# breaker is open) is readiness and deliberately NOT the ALB check — an
+# IdP outage must not recycle healthy bridge tasks.
 module "bridge" {
   source = "../../modules/service"
 
@@ -276,7 +276,7 @@ module "bridge" {
     security_group_id = module.network.alb_security_group_id
     host              = "sso.${var.domain}"
     priority          = 20
-    health_check_path = "/"
+    health_check_path = "/healthz"
   }
 
   env_name                       = local.common.env_name
@@ -289,7 +289,6 @@ module "bridge" {
 
 # portal — public self-service identity portal (TypeScript; Postgres-backed
 # job queue). Writes its mail outbox to local disk, so no read-only root.
-# Note: portal exposes no /healthz; "/" (the SPA index) is the health path.
 module "portal" {
   source = "../../modules/service"
 
@@ -315,7 +314,7 @@ module "portal" {
     security_group_id = module.network.alb_security_group_id
     host              = "portal.${var.domain}"
     priority          = 30
-    health_check_path = "/"
+    health_check_path = "/healthz"
   }
 
   env_name                       = local.common.env_name

@@ -19,6 +19,9 @@ RUN npm ci --omit=dev -w server
 
 FROM node:22-slim
 ENV NODE_ENV=production
+# /app is root-owned read-only application code; point the default outbox
+# somewhere the non-root node user can write.
+ENV OUTBOX_DIR=/tmp/outbox
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/server/dist ./server/dist
