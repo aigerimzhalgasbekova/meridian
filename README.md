@@ -113,22 +113,51 @@ make test    # all six Go modules (-race) + portal (vitest) + sentinel Python su
 make check   # + go vet per module + portal typecheck
 ```
 
-No test needs Docker, a database, or the network. Current counts (from a local
+`make test` needs no Docker, database, or network. Current counts (from a local
 run; Go numbers include subtests):
 
 | Suite | Tests | Highlights |
 |-------|------:|-----------|
-| keysmith | 94 | every historical JOSE attack class as a regression test; rotation under a fake clock; concurrent signing during rotation |
-| idp | 98 | full browser flows via cookie jar against an in-process keysmith; refresh-reuse detection under real concurrency |
-| sessiond | 23 | staleness-bound proof on a node missing every broadcast; parallel cap-invariant hammer on miniredis |
-| sentinel (Go) | 59 | sliding-window/lockout/risk contracts; Go tests invoke the Python verifier cross-language |
-| sentinel (Python) | 11 | stdlib-only chain verification of a Go-written fixture |
-| bridge | 56 | fake upstream misbehavior: Entra tenanted issuer, breaker transitions, stale JWKS |
+| keysmith | 95 | every historical JOSE attack class as a regression test; rotation under a fake clock; concurrent signing during rotation |
+| idp | 117 | full browser flows via cookie jar against an in-process keysmith; refresh-reuse detection under real concurrency |
+| sessiond | 24 | staleness-bound proof on a node missing every broadcast; parallel cap-invariant hammer on miniredis |
+| sentinel (Go) | 68 | sliding-window/lockout/risk contracts; Go tests invoke the Python verifier cross-language |
+| sentinel (Python) | 14 | stdlib-only chain verification of a Go-written fixture |
+| bridge | 57 | fake upstream misbehavior: Entra tenanted issuer, breaker transitions, stale JWKS |
 | console | 68 | trace-shape assertions; dog-fooded authz negative cases |
-| portal | 50 (+3 skipped) | RFC 6238 Appendix B vectors; queue claim/backoff/dead-letter (pg integration tests skip without `TEST_DATABASE_URL`) |
+| portal | 100 (23 need Postgres) | RFC 6238 Appendix B vectors; queue claim/backoff/dead-letter; enumeration-safe reset flows |
 
-Integration extras: `idp: make test-int` and portal's pg suite run the same
-contracts against real Postgres when you point them at one.
+### Integration tests
+
+idp and portal each ship **two** implementations of one storage interface —
+in-memory (dev, and what the flow tests run against) and Postgres (production).
+A single shared conformance suite runs against both, so the backends cannot
+drift apart unnoticed:
+
+| Project | Suite | Memory | Postgres |
+|---------|-------|--------|----------|
+| idp | `internal/storage/storagetest` | every `go test` | `make test-int` |
+| portal | `server/test/contract/` | every `npm test` | `npm test` with `TEST_DATABASE_URL` |
+
+Both Postgres suites are gated on `TEST_DATABASE_URL` and skip without it, so
+the default run stays dependency-free. To run them, give each project its own
+database — idp and portal both define a `users` table:
+
+```sh
+docker run -d --name meridian-pg-test -p 5433:5432 -e POSTGRES_PASSWORD=pw postgres:17
+docker exec meridian-pg-test sh -c 'until pg_isready -U postgres -q; do sleep 1; done'
+docker exec meridian-pg-test createdb -U postgres idp_test
+docker exec meridian-pg-test createdb -U postgres portal_test
+
+(cd idp    && TEST_DATABASE_URL='postgres://postgres:pw@localhost:5433/idp_test?sslmode=disable' make test-int)
+(cd portal && TEST_DATABASE_URL='postgres://postgres:pw@localhost:5433/portal_test'              make test-int)
+
+docker rm -f meridian-pg-test   # schemas are applied by the suites; the container is disposable
+```
+
+CI runs both against an ephemeral `postgres:17` service. Those jobs also set
+`REQUIRE_TEST_DATABASE_URL=1`, which turns a missing database into a red build
+rather than a suite that silently skips.
 
 ## Repo layout & docs map
 

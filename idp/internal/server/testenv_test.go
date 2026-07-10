@@ -50,8 +50,8 @@ func (c *clock) Advance(d time.Duration) {
 
 // env is a fully wired idp + keysmith test environment.
 type env struct {
-	t     *testing.T
-	clock *clock
+	t      *testing.T
+	clock  *clock
 	store  storage.Store
 	signer *tokenSigner
 	idp    *httptest.Server
