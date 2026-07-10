@@ -84,6 +84,9 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY") // login/consent pages must never be framed
 		h.Set("Referrer-Policy", "no-referrer")
+		// TLS terminates at the ALB and reaches us as HTTP, but the browser
+		// still sees HTTPS, so HSTS belongs here (2 years, subdomains).
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		h.Set("Content-Security-Policy",
 			"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		next.ServeHTTP(w, r)

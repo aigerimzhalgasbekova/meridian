@@ -162,6 +162,55 @@ func TestAuthCodeConsumeConcurrent(t *testing.T) {
 	}
 }
 
+// TestTouchPollConcurrent guards the device-flow slow_down pacing: the
+// previous poll time each caller gets back must reflect a genuine per-caller
+// serialization on the row, not a shared pre-update snapshot. The old
+// RETURNING-subquery SQL let every concurrent poller read the same stale
+// (zero) previous timestamp, so all of them would appear to be the first
+// poll and the interval check could be bypassed. Under the fix exactly one
+// caller sees the initial (zero) value.
+func TestTouchPollConcurrent(t *testing.T) {
+	s := testStore(t)
+	seedRealm(t, s)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.DeviceCodes().Create(ctx, storage.DeviceCode{
+		DeviceCodeHash: "dev0", UserCode: "AAAA-BBBB", RealmName: "test", ClientID: "c",
+		Scopes: oauth.Scopes{"openid"}, Status: storage.DeviceStatusPending,
+		Interval: 5, ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const n = 16
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	sawZero := make([]bool, n)
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			prev, err := s.DeviceCodes().TouchPoll(ctx, "test", "dev0", now.Add(time.Duration(i)*time.Second))
+			if err != nil {
+				t.Errorf("TouchPoll: %v", err)
+				return
+			}
+			sawZero[i] = prev.IsZero()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	zeros := 0
+	for _, z := range sawZero {
+		if z {
+			zeros++
+		}
+	}
+	if zeros != 1 {
+		t.Fatalf("%d pollers saw the initial (zero) previous timestamp, want exactly 1", zeros)
+	}
+}
+
 func TestRefreshRotateConcurrent(t *testing.T) {
 	s := testStore(t)
 	seedRealm(t, s)

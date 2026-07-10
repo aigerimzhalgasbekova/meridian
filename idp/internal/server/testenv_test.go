@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"html"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,8 +52,9 @@ func (c *clock) Advance(d time.Duration) {
 type env struct {
 	t     *testing.T
 	clock *clock
-	store storage.Store
-	idp   *httptest.Server
+	store  storage.Store
+	signer *tokenSigner
+	idp    *httptest.Server
 	// client follows no redirects and carries a cookie jar.
 	client *http.Client
 }
@@ -95,7 +98,8 @@ func newEnv(t *testing.T) *env {
 	ks := ksclient.New(ksSrv.URL, "test-signer", ksclient.WithClock(ck.Now))
 
 	store := memory.New()
-	e := &env{t: t, clock: ck, store: store}
+	signer := &tokenSigner{c: ks}
+	e := &env{t: t, clock: ck, store: store, signer: signer}
 
 	// idp server; BaseURL must equal the httptest URL for issuer checks,
 	// so create the server after the listener exists.
@@ -109,7 +113,7 @@ func newEnv(t *testing.T) *env {
 	idpSrv, err = server.New(server.Config{
 		BaseURL:           e.idp.URL,
 		Store:             store,
-		Signer:            &tokenSigner{ks},
+		Signer:            signer,
 		Keysmith:          ks,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		RegistrationToken: "test-registration-token",
@@ -134,9 +138,15 @@ func newEnv(t *testing.T) *env {
 	return e
 }
 
-type tokenSigner struct{ c *ksclient.Client }
+type tokenSigner struct {
+	c    *ksclient.Client
+	fail atomic.Bool // when set, Sign fails — simulates a keysmith outage
+}
 
 func (s *tokenSigner) Sign(ctx context.Context, claims jose.Claims, ttl time.Duration) (string, error) {
+	if s.fail.Load() {
+		return "", errors.New("keysmith unavailable")
+	}
 	return s.c.Sign(ctx, ksclient.SignRequest{Claims: claims, TTLSeconds: int64(ttl.Seconds())})
 }
 
