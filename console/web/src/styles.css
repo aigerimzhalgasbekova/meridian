@@ -1,0 +1,320 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --muted: #8b93a3;
+  --accent: #5aa9ff;
+  --allow: #3ecf8e;
+  --deny: #ff6b6b;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.92em;
+  background: #232836;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.8rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  font-size: 1.1rem;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+.accent {
+  color: var(--accent);
+}
+
+nav {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.5rem 1.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+  font: inherit;
+}
+
+.tab-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+h2 {
+  margin-top: 0;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.55rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+thead th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+.subrow td {
+  background: #12151b;
+  color: var(--muted);
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+.badge-allow {
+  color: var(--allow);
+  border-color: var(--allow);
+}
+
+.badge-deny {
+  color: var(--deny);
+  border-color: var(--deny);
+}
+
+.perm {
+  display: inline-block;
+  margin: 0.1rem 0.15rem;
+}
+
+.perm-allow {
+  color: var(--allow);
+}
+
+.perm-deny {
+  color: var(--deny);
+  text-decoration: line-through;
+}
+
+.btn {
+  background: #232836;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+  font: inherit;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1220;
+  font-weight: 600;
+}
+
+.btn-danger {
+  color: var(--deny);
+}
+
+.btn-ghost {
+  background: none;
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.form-row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.75rem 0;
+}
+
+input,
+select {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.6rem;
+  font: inherit;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.matrix-pair {
+  display: flex;
+  gap: 2rem;
+  flex-wrap: wrap;
+}
+
+.matrix {
+  width: auto;
+}
+
+.matrix td,
+.matrix th {
+  text-align: center;
+  padding: 0.3rem 0.6rem;
+}
+
+.matrix tbody th {
+  text-align: right;
+  color: var(--text);
+  font-weight: 500;
+}
+
+/* --- decision trace --- */
+
+.trace {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--muted);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+}
+
+.trace-allow {
+  border-left-color: var(--allow);
+}
+
+.trace-deny {
+  border-left-color: var(--deny);
+}
+
+.trace-verdict {
+  font-size: 1.05em;
+  margin-bottom: 0.35rem;
+}
+
+.trace-allow .trace-verdict b {
+  color: var(--allow);
+}
+
+.trace-deny .trace-verdict b {
+  color: var(--deny);
+}
+
+.trace-decider {
+  color: var(--muted);
+  margin-bottom: 0.5rem;
+}
+
+.trace-tree,
+.trace-tree ul {
+  list-style: none;
+  margin: 0.25rem 0;
+  padding-left: 1.25rem;
+  border-left: 1px dotted var(--border);
+}
+
+.trace-tree > li,
+.trace-tree ul > li {
+  padding: 0.15rem 0;
+}
+
+.trace-skip {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.trace-rule-allow {
+  color: var(--allow);
+}
+
+.trace-rule-deny {
+  color: var(--deny);
+}
+
+.error-box {
+  background: #2a1518;
+  border: 1px solid var(--deny);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin: 0.75rem 0;
+}
+
+.error-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.error-head b {
+  color: var(--deny);
+}
+
+.who form {
+  display: flex;
+  gap: 0.4rem;
+}
