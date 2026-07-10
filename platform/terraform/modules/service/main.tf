@@ -240,6 +240,13 @@ resource "aws_ecs_service" "this" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
+  # Default (100/200) rolls start-before-stop. A service holding an exclusive
+  # resource — sentinel's flock'd audit file on EFS — must deploy
+  # stop-before-start (0/100): otherwise the replacement can never take the
+  # lock and the deployment crash-loops while the old task stays healthy.
+  deployment_minimum_healthy_percent = var.stop_before_start ? 0 : 100
+  deployment_maximum_percent         = var.stop_before_start ? 100 : 200
+
   network_configuration {
     subnets          = var.subnet_ids
     security_groups  = [aws_security_group.this.id]
