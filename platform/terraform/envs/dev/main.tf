@@ -328,6 +328,9 @@ module "idp" {
     # security group, and the ALB is pinned to xff_header_processing_mode
     # = "append", so the last X-Forwarded-For hop cannot be forged.
     IDP_TRUST_PROXY = "1"
+    # Demo deployment: provision the demo realm/users/clients idempotently on
+    # boot so the public instance has something to show. Drop for a real IdP.
+    IDP_SEED_DEMO = "1"
   }
   secrets = {
     # IDP_KEYSMITH_TOKEN must be one of keysmith's KEYSMITH_SIGNER_TOKENS.
@@ -473,6 +476,9 @@ module "portal" {
   }
   secrets = {
     DATABASE_URL = "${local.ssm}/portal/DATABASE_URL"
+    # 32-byte base64 KEK that envelope-encrypts TOTP secrets at rest; the
+    # server refuses to run against a real database without it.
+    PORTAL_TOTP_KEK = "${local.ssm}/portal/PORTAL_TOTP_KEK"
   }
 
   readonly_root_filesystem = false
