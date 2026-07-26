@@ -211,5 +211,6 @@ sequence. Everything above runs locally today.
 
 ## License
 
-No license granted yet — this is a portfolio work; all rights reserved. Open an
-issue if you want to use something from it.
+Licensed under the [Apache License, Version 2.0](LICENSE) — permissive reuse with
+an explicit patent grant and warranty disclaimer, which is what security-critical
+code should carry. Copyright 2026 Aigerim Zhalgasbekova.
