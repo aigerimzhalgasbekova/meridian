@@ -132,4 +132,42 @@ describe('worker retry / dead-letter', () => {
     expect(new Set(seen).size).toBe(20);
     expect(await q.listByStatus('done')).toHaveLength(20);
   });
+  it('survives a database that is not up yet instead of crash-looping', async () => {
+    // recover() rejecting on a cold boot (or a tick rejecting mid-run) used to
+    // be an unhandled rejection, which under Node's default
+    // --unhandled-rejections=throw kills the process. index.ts calls start()
+    // unconditionally, so that turns a transient blip into a crash-loop.
+    const q = memoryQueue();
+    let up = false;
+    const failing = {
+      ...q,
+      recover: async () => {
+        if (!up) throw new Error('ECONNREFUSED');
+        return q.recover();
+      },
+      claim: async (now: Date) => {
+        if (!up) throw new Error('ECONNREFUSED');
+        return q.claim(now);
+      },
+    };
+    const seen: string[] = [];
+    const errors: unknown[] = [];
+    const worker = new Worker(
+      failing as typeof q,
+      { work: async (job: { id: string }) => void seen.push(job.id) },
+      { now: () => new Date(), pollIntervalMs: 5, onPollError: (e) => void errors.push(e) },
+    );
+
+    await q.enqueue('work', {});
+    worker.start();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(errors.length).toBeGreaterThan(0);
+    expect(seen).toHaveLength(0);
+
+    // Database comes back: the worker is still polling and drains the backlog.
+    up = true;
+    for (let i = 0; i < 100 && seen.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    await worker.stop();
+    expect(seen).toHaveLength(1);
+  });
 });

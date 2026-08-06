@@ -1,6 +1,7 @@
 package risk
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -212,5 +213,38 @@ func TestReasonDetailsPresent(t *testing.T) {
 		if strings.TrimSpace(r.Detail) == "" {
 			t.Fatalf("signal %s has empty detail", r.Signal)
 		}
+	}
+}
+
+// TestAccountMapIsBounded pins the OOM defense: account names come straight
+// from login forms, so a stuffing run walking fresh usernames must not grow
+// the engine without limit. Sentinel also holds the rate-limit windows and
+// lockout state — an OOM-kill would hand the attacker a clean slate.
+func TestAccountMapIsBounded(t *testing.T) {
+	e := New(Config{MaxAccounts: 100, Geo: nil})
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	for i := range 10_000 {
+		e.Observe(Attempt{Account: fmt.Sprintf("victim-%d", i), IP: "203.0.113.9", At: now}, false)
+	}
+	e.mu.Lock()
+	n := len(e.accounts)
+	e.mu.Unlock()
+	if n > 100 {
+		t.Fatalf("tracking %d accounts, cap is 100", n)
+	}
+
+	// A real account with a device baseline survives a burst of junk: the
+	// bound must not become a way to evict the signal history that matters.
+	e2 := New(Config{MaxAccounts: 100})
+	e2.Observe(Attempt{Account: "real", IP: "198.51.100.4", DeviceID: "dev-1", At: now}, true)
+	for i := range 1_000 {
+		e2.Observe(Attempt{Account: fmt.Sprintf("junk-%d", i), IP: "203.0.113.9", At: now}, false)
+	}
+	e2.mu.Lock()
+	h, ok := e2.accounts["real"]
+	trusted := ok && h.Devices["dev-1"]
+	e2.mu.Unlock()
+	if !trusted {
+		t.Error("eviction dropped an account with a trusted-device baseline first")
 	}
 }

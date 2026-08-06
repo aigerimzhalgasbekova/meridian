@@ -183,6 +183,15 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		Now:      s.cfg.Now,
 		Leeway:   30 * time.Second,
 	}); err == nil {
+		// RFC 7662 §5: introspection must not be a cross-client oracle. A
+		// caller only learns about tokens issued to itself — the same
+		// ownership rule handleRevoke enforces below.
+		if stringClaim(claims.Extra, "azp") != caller.ClientID {
+			s.cfg.Logger.Warn("introspection attempt for another client's token",
+				"realm", realm.Name, "caller", caller.ClientID, "owner", stringClaim(claims.Extra, "azp"))
+			inactive()
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"active":     true,
 			"token_type": "Bearer",
@@ -201,6 +210,12 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	// Then as a refresh token.
 	rt, err := s.cfg.Store.RefreshTokens().Get(r.Context(), realm.Name, secrets.Hash(presented))
 	if err != nil || rt.Revoked || !rt.RotatedAt.IsZero() || s.now().After(rt.ExpiresAt) {
+		inactive()
+		return
+	}
+	if rt.ClientID != caller.ClientID {
+		s.cfg.Logger.Warn("introspection attempt for another client's token",
+			"realm", realm.Name, "caller", caller.ClientID, "owner", rt.ClientID)
 		inactive()
 		return
 	}

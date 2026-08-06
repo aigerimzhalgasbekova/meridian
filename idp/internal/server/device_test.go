@@ -84,6 +84,24 @@ func approveDevice(t *testing.T, e *env, userCode, decision string) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("device submit: %d %s", resp.StatusCode, firstLine(body))
 	}
+	if decision != "allow" {
+		return
+	}
+	// Approval is two-step: the code POST answers with the consent page
+	// naming the client and its scopes, and only the confirmed POST grants.
+	if !strings.Contains(body, "Authorize") {
+		t.Fatalf("no device consent page: %s", firstLine(body))
+	}
+	csrf = csrfRe.FindStringSubmatch(body)
+	resp, body = e.postForm("/realms/test/device", url.Values{
+		"csrf_token": {csrf[1]},
+		"user_code":  {userCode},
+		"decision":   {"allow"},
+		"confirmed":  {"1"},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("device confirm: %d %s", resp.StatusCode, firstLine(body))
+	}
 }
 
 func TestDeviceFlow(t *testing.T) {
@@ -117,6 +135,42 @@ func TestDeviceFlow(t *testing.T) {
 		e.clock.Advance(6 * time.Second)
 		if status, body = e.pollDevice(t, dc); status != http.StatusBadRequest || str(body, "error") != "invalid_grant" {
 			t.Fatalf("spent device code: %d %v", status, body)
+		}
+	})
+
+	t.Run("approval names the client and its scopes, and records consent", func(t *testing.T) {
+		// RFC 8628 §3.3: the user typed a code with no idea what it belongs
+		// to. Approving without seeing the application and the permissions is
+		// a grant /authorize would never have issued unasked.
+		e := newEnv(t)
+		grant := startDeviceFlow(t, e)
+
+		resp, body := e.get("/realms/test/device")
+		if strings.Contains(body, "Sign in") {
+			resp, _ = e.login(body, "alice", testUserPassword)
+			_, body = e.get(resp.Header.Get("Location"))
+		}
+		_, body = e.postForm("/realms/test/device", url.Values{
+			"csrf_token": {csrfRe.FindStringSubmatch(body)[1]},
+			"user_code":  {str(grant, "user_code")},
+			"decision":   {"allow"},
+		})
+		if !strings.Contains(body, "Test CLI") {
+			t.Errorf("approval page does not name the client:\n%s", body)
+		}
+		if !strings.Contains(body, "refresh tokens") {
+			t.Errorf("approval page does not list the offline_access scope:\n%s", body)
+		}
+
+		// Confirming records a reviewable/revocable consent, as /authorize does.
+		e.postForm("/realms/test/device", url.Values{
+			"csrf_token": {csrfRe.FindStringSubmatch(body)[1]},
+			"user_code":  {str(grant, "user_code")},
+			"decision":   {"allow"},
+			"confirmed":  {"1"},
+		})
+		if _, err := e.store.Consents().Get(t.Context(), "test", "usr_1", "cli"); err != nil {
+			t.Errorf("device approval left no consent record: %v", err)
 		}
 	})
 

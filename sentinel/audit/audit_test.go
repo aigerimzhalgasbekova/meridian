@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -418,4 +419,64 @@ func TestPythonVerifierAgrees(t *testing.T) {
 	if err == nil {
 		t.Fatalf("python verifier accepted a tampered chain:\n%s", out)
 	}
+}
+
+// TestVerifyAllCatchesTruncation is the Go-side twin of
+// TestAnchorSidecarDetectsTruncation: /v1/audit/verify must not pronounce a
+// tail-truncated log intact just because a prefix of a valid chain is itself a
+// valid chain.
+func TestVerifyAllCatchesTruncation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	openLog := func() (*Log, *FileStore, *os.File) {
+		s, err := OpenFileStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sidecar, err := os.OpenFile(path+".anchors", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l, err := New(s, Options{
+			Now: fixedClock(), AnchorEvery: 3, AnchorSink: sidecar,
+			AnchorSource: func() (io.ReadCloser, error) { return os.Open(path + ".anchors") },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l, s, sidecar
+	}
+
+	l, s, sidecar := openLog()
+	appendN(t, l, 6) // sidecar anchors vouch for head_seq 3 and 6
+	if res := l.VerifyAll(); !res.OK {
+		t.Fatalf("intact anchored chain rejected: %+v", res)
+	}
+	s.Close()
+	sidecar.Close()
+
+	// Lop off the tail below the last anchor and reopen, as a restart would.
+	keepFirstLines(t, path, 3)
+	l2, s2, sidecar2 := openLog()
+	defer s2.Close()
+	defer sidecar2.Close()
+	if res := Verify(mustRecords(t, l2)); !res.OK {
+		t.Fatalf("the chain walk alone should still pass — that is the whole point: %+v", res)
+	}
+	res := l2.VerifyAll()
+	if res.OK {
+		t.Fatal("VerifyAll pronounced a truncated log intact")
+	}
+	if !strings.Contains(res.Reason, "anchor") {
+		t.Errorf("reason %q does not point at the anchor cross-check", res.Reason)
+	}
+}
+
+func mustRecords(t *testing.T, l *Log) []Record {
+	t.Helper()
+	recs, err := l.Records()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return recs
 }

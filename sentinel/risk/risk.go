@@ -138,6 +138,8 @@ type Engine struct {
 	accounts   map[string]*History
 	// retention prunes attempt history older than this (default 1h).
 	retention time.Duration
+	// maxAccounts bounds the account map (default 50k).
+	maxAccounts int
 }
 
 // Config assembles an Engine.
@@ -151,12 +153,21 @@ type Config struct {
 	BadIPs []string
 	// Retention bounds per-account attempt history (default 1h).
 	Retention time.Duration
+	// MaxAccounts bounds how many accounts are tracked at once (default
+	// 50000). Account names are attacker-chosen — idp forwards raw login-form
+	// usernames — so without a cap a stuffing run walking fresh usernames is
+	// an OOM, and sentinel restarting loses every rate-limit window and
+	// lockout it holds. Mirrors lockout.Policy.MaxKeys.
+	MaxAccounts int
 }
 
 // New builds an engine. With cfg.Signals nil, the default pipeline is used.
 func New(cfg Config) *Engine {
 	if cfg.Retention <= 0 {
 		cfg.Retention = time.Hour
+	}
+	if cfg.MaxAccounts <= 0 {
+		cfg.MaxAccounts = 50_000
 	}
 	if cfg.Signals == nil {
 		bad := make(map[string]bool, len(cfg.BadIPs))
@@ -171,11 +182,12 @@ func New(cfg Config) *Engine {
 		}
 	}
 	return &Engine{
-		signals:    cfg.Signals,
-		thresholds: cfg.Thresholds.withDefaults(),
-		geo:        cfg.Geo,
-		accounts:   make(map[string]*History),
-		retention:  cfg.Retention,
+		signals:     cfg.Signals,
+		thresholds:  cfg.Thresholds.withDefaults(),
+		geo:         cfg.Geo,
+		accounts:    make(map[string]*History),
+		retention:   cfg.Retention,
+		maxAccounts: cfg.MaxAccounts,
 	}
 }
 
@@ -216,6 +228,7 @@ func (e *Engine) Observe(a Attempt, success bool) {
 	defer e.mu.Unlock()
 	h, ok := e.accounts[a.Account]
 	if !ok {
+		e.reclaim(a.At)
 		h = &History{Devices: make(map[string]bool)}
 		e.accounts[a.Account] = h
 	}
@@ -252,6 +265,39 @@ func (e *Engine) snapshot(account string, now time.Time) History {
 	}
 	out.Attempts = append([]time.Time(nil), h.Attempts...)
 	return out
+}
+
+// reclaim bounds the account map before a new key is inserted. Caller holds e.mu.
+//
+// Triggering on size rather than elapsed time is the point: a stuffing run
+// walks a fresh username per attempt, so every entry is young and a time-based
+// sweep reclaims nothing until the burst is long over. Histories with nothing
+// left in the retention window go first, then those that never saw a
+// successful login — those are bare failure counters. A history with a
+// device/geo baseline is what the signals actually need, so it goes last, and
+// only because an unbounded map is the worse failure.
+//
+// Reclaiming to a low-water mark rather than to one free slot amortizes the
+// O(n) scan over the headroom it frees, as in lockout.reclaim.
+func (e *Engine) reclaim(now time.Time) {
+	if len(e.accounts) < e.maxAccounts {
+		return
+	}
+	lowWater := e.maxAccounts - e.maxAccounts/10
+	for _, pass := range []func(*History) bool{
+		func(h *History) bool { e.prune(h, now); return len(h.Attempts) == 0 && h.LastSeen.IsZero() },
+		func(h *History) bool { return h.LastSeen.IsZero() },
+		func(*History) bool { return true },
+	} {
+		for k, h := range e.accounts {
+			if len(e.accounts) <= lowWater {
+				return
+			}
+			if pass(h) {
+				delete(e.accounts, k)
+			}
+		}
+	}
 }
 
 // prune drops attempts outside the retention window. Caller holds e.mu.

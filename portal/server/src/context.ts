@@ -11,6 +11,13 @@ export interface Config {
   /** Minimum duration for enumeration-sensitive endpoints (uniform timing). */
   uniformDelayMs: number;
   rateLimit: { limit: number; windowMs: number };
+  /**
+   * Behind a load balancer that appends X-Forwarded-For, so `req.ip` is the
+   * client rather than the LB — without it every request shares one rate-limit
+   * bucket. Off by default: the header is attacker-controlled unless a proxy
+   * we trust rewrites it. Mirrors idp's IDP_TRUST_PROXY.
+   */
+  trustProxy: boolean;
   secureCookies: boolean;
   /** 32-byte key-encryption key for at-rest secrets (TOTP). From env in prod. */
   totpKek: Buffer;
@@ -24,6 +31,7 @@ export const defaultConfig: Config = {
   verifyTokenTtlMs: 24 * 60 * 60 * 1000,
   uniformDelayMs: 100,
   rateLimit: { limit: 10, windowMs: 60_000 },
+  trustProxy: false,
   // Secure-by-default: an unset/misspelled NODE_ENV must not silently ship
   // insecure cookies. Local dev opts out explicitly (see index.ts).
   secureCookies: true,

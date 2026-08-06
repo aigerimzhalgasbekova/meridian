@@ -195,6 +195,19 @@ func TestExplain(t *testing.T) {
 	if w := do(t, s, "vera", "GET", "/v1/authz/explain?permission=users:read", "", nil); w.Code != http.StatusBadRequest {
 		t.Errorf("missing subject: got %d, want 400", w.Code)
 	}
+
+	// Realm confinement: alice holds authz:explain only in engineering, so
+	// she must not read finance's authorization graph — the same rule
+	// /v1/users and /v1/users/{id}/sessions enforce.
+	if w := do(t, s, "alice", "GET", "/v1/authz/explain?subject=bob&permission=users:write&realm=engineering", "", nil); w.Code != http.StatusOK {
+		t.Errorf("own-realm explain: got %d, want 200: %s", w.Code, w.Body)
+	}
+	if w := do(t, s, "alice", "GET", "/v1/authz/explain?subject=bob&permission=users:write&realm=finance", "", nil); w.Code != http.StatusForbidden {
+		t.Errorf("cross-realm explain: got %d, want 403: %s", w.Code, w.Body)
+	}
+	if w := do(t, s, "alice", "GET", "/v1/authz/explain?subject=bob&permission=users:write", "", nil); w.Code != http.StatusForbidden {
+		t.Errorf("global-scope explain by a realm-admin: got %d, want 403", w.Code)
+	}
 }
 
 func TestUserLifecycleAndRealmFilter(t *testing.T) {

@@ -45,6 +45,7 @@ func run(logger *slog.Logger) error {
 
 	var store audit.Store
 	var anchorSink io.Writer
+	var anchorSource func() (io.ReadCloser, error)
 	auditPath := envOr("SENTINEL_AUDIT_PATH", "sentinel-audit.jsonl")
 	if auditPath == "memory" {
 		store = audit.NewMemStore()
@@ -62,8 +63,14 @@ func run(logger *slog.Logger) error {
 		}
 		defer anchorFile.Close()
 		anchorSink = anchorFile
+		// Reopened per verification: /v1/audit/verify must cross-check the
+		// sidecar, and an append-only handle cannot be read back.
+		anchorPath := auditPath + ".anchors"
+		anchorSource = func() (io.ReadCloser, error) { return os.Open(anchorPath) }
 	}
-	log, err := audit.New(store, audit.Options{AnchorEvery: 100, AnchorSink: anchorSink})
+	log, err := audit.New(store, audit.Options{
+		AnchorEvery: 100, AnchorSink: anchorSink, AnchorSource: anchorSource,
+	})
 	if err != nil {
 		return err
 	}

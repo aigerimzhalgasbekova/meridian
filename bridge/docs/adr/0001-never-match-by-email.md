@@ -48,6 +48,12 @@ Consequences we accept and design for:
   upstream account to the victim's identity (the reverse takeover).
 - No auto-merge exists anywhere, even when emails match exactly and both are
   verified. `AddLink` refuses a `(provider, subject)` already linked anywhere.
+- An email the upstream does not vouch for (`email_verified` absent or false)
+  is **dropped at the callback** — not recorded on the identity and not put in
+  the app-facing assertion. Refusing to *match* on an untrusted address while
+  still forwarding it downstream, signed by bridge, would just move the
+  takeover to any relying app that keys accounts on the `email` claim.
+  Assertions carry an explicit `email_verified` so apps need not infer it.
 
 ## Alternatives considered
 

@@ -267,7 +267,10 @@ func (s *Server) issueIDToken(nonce string) (string, error) {
 		Extra: map[string]any{
 			"nonce": nonce,
 			"email": user.Email,
-			"name":  user.Name,
+			// Real upstreams (Google, Entra) send this; bridge refuses to
+			// record or forward an email without it. Overridable via extra.
+			"email_verified": true,
+			"name":           user.Name,
 		},
 	}
 	for k, v := range extra {

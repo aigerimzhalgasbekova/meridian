@@ -88,6 +88,22 @@ var deviceTemplate = template.Must(template.Must(pageTemplate.Clone()).Parse(`{{
 </form>
 {{end}}`))
 
+// deviceConfirmTemplate is the device flow's consent step: the user has typed
+// a code, now they see which application it belongs to and what it is asking
+// for before the grant is recorded.
+var deviceConfirmTemplate = template.Must(template.Must(pageTemplate.Clone()).Parse(`{{define "body"}}
+<h1>Authorize {{.ClientName}}</h1>
+<p class="sub">{{.Username}}, this device requests access to:</p>
+<ul class="scopes">{{range .ScopeDescriptions}}<li>{{.}}</li>{{end}}</ul>
+<form method="post" action="{{.Action}}">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <input type="hidden" name="user_code" value="{{.UserCode}}">
+  <input type="hidden" name="confirmed" value="1">
+  <button type="submit" name="decision" value="allow">Allow</button>
+  <button type="submit" name="decision" value="deny" class="secondary">Deny</button>
+</form>
+{{end}}`))
+
 var messageTemplate = template.Must(template.Must(pageTemplate.Clone()).Parse(`{{define "body"}}
 <h1>{{.Title}}</h1>
 <p class="sub">{{.Message}}</p>

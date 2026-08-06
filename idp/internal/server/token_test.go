@@ -147,6 +147,20 @@ func TestAuthorizationCodeGrant(t *testing.T) {
 			t.Fatalf("%d: %v", status, body)
 		}
 	})
+	t.Run("single registered URI may be omitted at both endpoints", func(t *testing.T) {
+		// RFC 6749 §4.1.3: redirect_uri is REQUIRED at /token only if the
+		// authorization request carried it. web-app has exactly one
+		// registered URI, which /authorize backfills — omitting it in both
+		// requests must still redeem.
+		e := newEnv(t)
+		code := e.obtainCode(map[string]string{"redirect_uri": ""})
+		status, body := e.tokenRequest("web-app", webAppSecret, url.Values{
+			"grant_type": {"authorization_code"}, "code": {code},
+		})
+		if status != http.StatusOK || str(body, "access_token") == "" {
+			t.Fatalf("%d: %v", status, body)
+		}
+	})
 	t.Run("expired code rejected", func(t *testing.T) {
 		e := newEnv(t)
 		code := e.obtainCode(nil)

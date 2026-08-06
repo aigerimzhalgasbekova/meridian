@@ -8,10 +8,11 @@ terraform {
     }
   }
 
-  # Remote state. The bucket name carries the account id because S3 names are
-  # global — the bare name was already taken (runbook step 1).
+  # Remote state, partial configuration: the bucket name carries the account id
+  # (S3 names are global — the bare name was already taken), so it lives in a
+  # gitignored backend.hcl rather than here. See backend.hcl.example and
+  # runbook step 1: terraform init -backend-config=backend.hcl
   backend "s3" {
-    bucket         = "meridian-terraform-state-123456789012"
     key            = "envs/dev/terraform.tfstate"
     region         = "eu-west-1"
     dynamodb_table = "meridian-terraform-lock"

@@ -21,8 +21,10 @@ Plus `site/` — the Astro portfolio site with the 10-chapter `/guide`, deployed
 
 ## What is live right now
 
-Account `123456789012`, region `eu-west-1`, ~166 Terraform-managed resources
-(state in `s3://meridian-terraform-state-123456789012`):
+Account `123456789012` (placeholder — the real id stays out of the repo), region
+`eu-west-1`, ~166 Terraform-managed resources (state in
+`s3://meridian-terraform-state-<account-id>`, configured via the gitignored
+`platform/terraform/envs/dev/backend.hcl`):
 
 - **ALB** `meridian-dev-914590008.eu-west-1.elb.amazonaws.com` with host routing and the `*.iammeridian.cc` ACM cert; XFF handling pinned (`append` + drop-invalid-headers) because idp's brute-force guard depends on it.
 - **7 Fargate services**, all running: idp/sso/portal/console public behind the ALB; keysmith/sessiond/sentinel VPC-internal via Cloud Map.
@@ -68,7 +70,7 @@ After that: `https://iammeridian.cc` is the portfolio, `https://idp.iammeridian.
 ## Operational notes that will bite otherwise
 
 - The service module sets `ignore_changes = [task_definition]` so CI releases don't fight Terraform. Consequence: after changing env/secrets via Terraform, roll the service yourself — `aws ecs update-service --cluster meridian-dev --service <name> --task-definition meridian-dev-<name> --force-new-deployment`.
-- `terraform.tfvars` is gitignored and holds the cert ARNs; `versions.tf` carries the S3 backend (bucket name is account-suffixed — the bare name was globally taken).
+- `terraform.tfvars` is gitignored and holds the cert ARNs; `versions.tf` carries a *partial* S3 backend and the account-suffixed bucket name lives in the gitignored `backend.hcl` (bare name was globally taken), so `terraform init` needs `-backend-config=backend.hcl`.
 - Cost: roughly $170/mo at dev sizing. `terraform destroy` in `platform/terraform/envs/dev` tears it all down (the ALB-logs S3 bucket may need emptying first).
 
 ## Where to read more

@@ -2,11 +2,14 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -204,4 +207,63 @@ func TestClientColdStartAgainstDeadServer(t *testing.T) {
 	if errors.Is(err, jose.ErrSignatureInvalid) {
 		t.Fatal("should fail on key fetch, not signature")
 	}
+}
+
+// TestUnknownKidRefreshIsThrottled pins the amplification defense: jose
+// reports ErrUnknownKey after only base64-decoding the token header, before
+// any cryptography, so the kid is attacker-chosen. Without a bound, one bearer
+// token per request is one JWKS fetch per request and a verifier under load
+// becomes a load generator against the key server it depends on.
+func TestUnknownKidRefreshIsThrottled(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	warm, err := f.client.Sign(ctx, SignRequest{Claims: jose.Claims{Subject: "a"}, TTLSeconds: 3000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.client.Verify(ctx, warm, jose.Expect{}); err != nil {
+		t.Fatal(err)
+	}
+	before := f.jwksHits.Load()
+
+	// A token whose kid names a key that does not exist, 200 times over.
+	forged := forgeUnknownKid(t, warm)
+	for range 200 {
+		if _, err := f.client.Verify(ctx, forged, jose.Expect{}); err == nil {
+			t.Fatal("a token with an unknown kid must not verify")
+		}
+	}
+	if got := f.jwksHits.Load() - before; got > 1 {
+		t.Errorf("%d JWKS fetches for 200 unknown-kid verifies within the throttle window, want 1", got)
+	}
+
+	// Past the window a genuine rotation is still picked up promptly.
+	f.clock.Advance(unknownKidInterval + time.Second)
+	_, _ = f.client.Verify(ctx, forged, jose.Expect{})
+	if got := f.jwksHits.Load() - before; got != 2 {
+		t.Errorf("fetches after the window: %d, want 2 — the throttle must not wedge rotation", got)
+	}
+}
+
+// forgeUnknownKid rewrites a token's header kid to one that does not exist.
+func forgeUnknownKid(t *testing.T, token string) string {
+	t.Helper()
+	parts := strings.SplitN(token, ".", 3)
+	if len(parts) != 3 {
+		t.Fatalf("not a JWT: %q", token)
+	}
+	hdr, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(hdr, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["kid"] = "no-such-key"
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(out) + "." + parts[1] + "." + parts[2]
 }
