@@ -201,7 +201,11 @@ func (l *Log) Append(e Event) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	if l.anchorEvery > 0 && rec.Seq%l.anchorEvery == 0 {
+	// Anchor the first record as well as every Nth: until an anchor exists the
+	// sidecar is empty, and an empty sidecar is indistinguishable from a
+	// deleted one — VerifyExport would call a healthy young log tampered, and
+	// a log truncated below the first anchor untampered.
+	if l.anchorEvery > 0 && (rec.Seq == 1 || rec.Seq%l.anchorEvery == 0) {
 		// The anchor checkpoints the head we just wrote; in production its
 		// hash would also go to the external notary (see package doc).
 		if _, err := l.append(Event{
@@ -330,8 +334,15 @@ func Verify(records []Record) VerifyResult {
 // touch. This mirrors verify_chain.py's verify_export; any entry point that
 // pronounces on integrity must call this, never Verify on its own.
 //
-// The sidecar's absence fails closed: deleting it would otherwise restore the
-// blind spot it exists to remove.
+// What this covers: truncating or rewriting the log alone, and deleting or
+// emptying the sidecar (both fail closed — every non-empty log is anchored
+// from its first record). What it does not cover: an attacker who edits *both*
+// files, since the sidecar sits beside the log with the same owner and mode —
+// trimming the anchors to match a truncated log still verifies. Nor does it
+// see the last (AnchorEvery-1) records, which no anchor vouches for yet.
+// ponytail: closing that needs the sidecar somewhere this service cannot
+// rewrite (object-locked S3 or a separate writer identity), which is what the
+// package doc's "external notary" means.
 func VerifyExport(records []Record, anchors []Anchor, anchorErr error) VerifyResult {
 	res := Verify(records)
 	if !res.OK {
@@ -339,6 +350,9 @@ func VerifyExport(records []Record, anchors []Anchor, anchorErr error) VerifyRes
 	}
 	if anchorErr != nil {
 		return VerifyResult{Records: len(records), Reason: "anchor sidecar unreadable: " + anchorErr.Error()}
+	}
+	if len(records) == 0 && len(anchors) == 0 {
+		return res // nothing logged yet, so nothing to vouch for
 	}
 	if len(anchors) == 0 {
 		return VerifyResult{Records: len(records), Reason: "anchor sidecar is empty (deleted or truncated?)"}

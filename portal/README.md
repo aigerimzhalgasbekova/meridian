@@ -55,6 +55,11 @@ link out of the file to complete verification / reset flows.
 Against Postgres — `PORTAL_TOTP_KEK` becomes mandatory here, because the
 in-code placeholder key must never protect a real database:
 
+Re-applying `schema.sql` also lower-cases `users.email` and adds the check
+constraint that keeps it that way. If the backfill trips the unique index, two
+accounts differ only by case: keep one, migrate its data, delete the other,
+re-run.
+
 ```sh
 psql "$DATABASE_URL" -f server/schema.sql
 DATABASE_URL=postgres://… \

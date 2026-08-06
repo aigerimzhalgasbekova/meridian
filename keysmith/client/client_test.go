@@ -267,3 +267,50 @@ func forgeUnknownKid(t *testing.T, token string) string {
 	}
 	return base64.RawURLEncoding.EncodeToString(out) + "." + parts[1] + "." + parts[2]
 }
+
+// TestRefreshOnceContextIsolation pins the singleflight's two context rules:
+// a waiter honours its own deadline instead of the leader's, and the shared
+// fetch survives the leader going away. Verify runs on r.Context(), so binding
+// the fetch to whoever arrived first would let one client disconnecting fail
+// every other caller's perfectly valid token.
+func TestRefreshOnceContextIsolation(t *testing.T) {
+	hit := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"keys":[]}`)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "")
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() { _, err := c.refreshOnce(leaderCtx); leaderErr <- err }()
+	<-hit // the fetch is in flight and parked in the handler
+
+	// A waiter with a tight deadline must not inherit the leader's.
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelWait()
+	start := time.Now()
+	if _, err := c.refreshOnce(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("impatient waiter got %v, want DeadlineExceeded", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("waiter blocked %v past its own deadline", d)
+	}
+
+	// The leader walks away mid-fetch; the callers still parked on the flight
+	// it started must get the keys anyway.
+	patient := make(chan error, 1)
+	go func() { _, err := c.refreshOnce(context.Background()); patient <- err }()
+	cancelLeader()
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader got %v, want Canceled", err)
+	}
+	close(release) // completes the in-flight fetch, and any the patient started
+	if err := <-patient; err != nil {
+		t.Fatalf("patient caller punished for the leader's cancellation: %v", err)
+	}
+}

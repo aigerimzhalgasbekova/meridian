@@ -41,7 +41,7 @@ lifecycle, and multi-tenant realm isolation.
 | 9 | CSRF on login/consent/device | Double-submit token, `SameSite=Lax` cookies |
 | 10 | Token substitution via alg confusion | keysmith's allowlist JOSE (no HS/none/embedded-jwk) |
 | 11 | Cross-realm token use | Per-realm issuer in every token; userinfo/introspection check issuer + audience |
-| 12 | Introspection/revocation as a validity oracle | Confidential-caller-only introspection, and only for the caller's *own* tokens (RFC 7662 §5) — another client's token reads `active:false`; revocation always 200; coarse errors |
+| 12 | Introspection/revocation as a validity oracle | Confidential-caller-only introspection, and only for the caller's *own* tokens — another client's token reads `active:false`; revocation always 200; coarse errors. Stricter than RFC 7662 §5 requires: no resource-server introspection until a client can be registered as one |
 | 13 | Device user-code brute force | 8-char high-entropy code, 10-min TTL, one-shot approval, poll pacing (`slow_down`) |
 | 13a | Device flow as a consent bypass | Approval is two-step: the code POST answers with a page naming the client and itemizing scopes, and only the confirmed POST grants — recording a reviewable `Consent`, as `/authorize` does |
 | 14 | Open dynamic registration abuse | Registration gated by an initial access token; https-only redirect URIs (loopback excepted) |

@@ -458,9 +458,14 @@ module "bridge" {
   # task that did not begin the flow fails with "link already used" on
   # 1 - 1/N of sign-ins.
   # ponytail: pin to one task; scaling out needs a shared flow/session store.
-  desired_count = 1
-  min_count     = 1
-  max_count     = 1
+  # The pin alone is not enough: the default rolling deploy starts the
+  # replacement before draining the old task, so every release would run two
+  # bridges behind a non-sticky ALB. Trade a few seconds of hard downtime for
+  # never serving a callback from the wrong process.
+  stop_before_start = true
+  desired_count     = 1
+  min_count         = 1
+  max_count         = 1
 
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
@@ -544,9 +549,13 @@ module "console" {
   # The RBAC engine and audit log are in-memory and mutated through the API,
   # so a second task would serve a divergent policy and a partial audit trail.
   # ponytail: pin to one task; scaling out needs the Postgres-backed store.
-  desired_count = 1
-  min_count     = 1
-  max_count     = 1
+  # Same reason as bridge: without this the rolling deploy overlaps two tasks,
+  # and here that means two divergent copies of the policy. The state is lost
+  # on restart either way, so the drain-first outage costs nothing extra.
+  stop_before_start = true
+  desired_count     = 1
+  min_count         = 1
+  max_count         = 1
 
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn

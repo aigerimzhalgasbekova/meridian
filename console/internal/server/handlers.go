@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 
 	"github.com/aikazzh/portfolio/console/rbac"
 )
@@ -197,6 +198,12 @@ func (s *Server) explain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d := s.cfg.Engine.Check(sub, perm, scope)
+	// Scoping the *authorization* is not enough: Check traces every assignment
+	// the subject holds, so a realm-scoped caller would still read another
+	// realm's subject→role graph (and learn whether a subject exists at all).
+	// A non-matching assignment decided nothing here — its Chain is empty —
+	// so dropping it costs the answer nothing.
+	d.Trace = slices.DeleteFunc(d.Trace, func(at rbac.AssignmentTrace) bool { return !at.ScopeMatch })
 	writeJSON(w, http.StatusOK, d)
 }
 

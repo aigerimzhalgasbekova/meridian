@@ -183,9 +183,13 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		Now:      s.cfg.Now,
 		Leeway:   30 * time.Second,
 	}); err == nil {
-		// RFC 7662 §5: introspection must not be a cross-client oracle. A
-		// caller only learns about tokens issued to itself — the same
-		// ownership rule handleRevoke enforces below.
+		// A caller only learns about tokens issued to itself — the same
+		// ownership rule handleRevoke enforces below. RFC 7662 §5 asks that
+		// introspection not become a cross-client oracle but does not require
+		// this specific rule; a resource server introspecting a token it
+		// received is the spec's main use case and this rejects it.
+		// ponytail: no resource servers exist here, so no flag for them yet —
+		// add a per-client `resource_server` bit when one does.
 		if stringClaim(claims.Extra, "azp") != caller.ClientID {
 			s.cfg.Logger.Warn("introspection attempt for another client's token",
 				"realm", realm.Name, "caller", caller.ClientID, "owner", stringClaim(claims.Extra, "azp"))

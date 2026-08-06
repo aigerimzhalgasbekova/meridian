@@ -126,15 +126,21 @@ export function newCsrfToken(): string {
  */
 export function rateLimit(ctx: AppContext): RequestHandler {
   const windows = new Map<string, { count: number; resetAt: number }>();
+  let sweptAt = 0;
   return (req, res, next) => {
     const { limit, windowMs } = ctx.config.rateLimit;
     const key = `${req.ip}:${req.path}`;
     const now = ctx.now().getTime();
+    // Sweep at most once per window, never per key: keys are attacker-chosen
+    // (one per source IP and path), so without a sweep the map is an unbounded
+    // leak — but sweeping on every first-sight key is an O(n^2) CPU wedge,
+    // which on a single-threaded runtime is the worse of the two bugs.
+    if (now - sweptAt >= windowMs) {
+      for (const [k, v] of windows) if (v.resetAt <= now) windows.delete(k);
+      sweptAt = now;
+    }
     let w = windows.get(key);
     if (!w || w.resetAt <= now) {
-      // Sweep on window rollover: keys are attacker-chosen (one per source
-      // IP and path), so without this the map is an unbounded leak.
-      for (const [k, v] of windows) if (v.resetAt <= now) windows.delete(k);
       w = { count: 0, resetAt: now + windowMs };
       windows.set(key, w);
     }

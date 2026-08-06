@@ -178,20 +178,34 @@ func (c *Client) refreshOnce(ctx context.Context) (*jose.KeySet, error) {
 	c.flightMu.Lock()
 	if f := c.flight; f != nil {
 		c.flightMu.Unlock()
-		<-f.done
-		return f.set, f.err
+		select {
+		case <-f.done:
+			return f.set, f.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	f := &flight{done: make(chan struct{})}
 	c.flight = f
 	c.flightMu.Unlock()
 
-	f.set, f.err = c.forceRefresh(ctx)
-
-	c.flightMu.Lock()
-	c.flight = nil
-	c.flightMu.Unlock()
-	close(f.done)
-	return f.set, f.err
+	// The fetch outlives whoever started it: with Verify called on r.Context(),
+	// binding it to the leader lets one client disconnecting mid-fetch fail
+	// every parked caller's perfectly valid token. Each caller then honours its
+	// own deadline instead of inheriting the leader's.
+	go func() {
+		f.set, f.err = c.forceRefresh(context.WithoutCancel(ctx))
+		c.flightMu.Lock()
+		c.flight = nil
+		c.flightMu.Unlock()
+		close(f.done)
+	}()
+	select {
+	case <-f.done:
+		return f.set, f.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // keySet returns cached keys, refreshing if stale. Serves stale on refresh
