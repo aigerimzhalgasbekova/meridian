@@ -48,9 +48,14 @@ One-time setup:
    `ecs:RegisterTaskDefinition`, `ecs:UpdateService`, `ecs:DescribeServices`
    on the `meridian-dev` cluster; `iam:PassRole` restricted to the
    `meridian-dev-*-task` / `-execution` roles.
-3. Repo variables: `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REGISTRY`.
+3. Repo **secrets** `AWS_ROLE_ARN` and `ECR_REGISTRY`; repo **variable**
+   `AWS_REGION`. The first two embed the AWS account id, and repository
+   variables are interpolated into workflow logs verbatim while secrets are
+   masked — on a public repo that is the difference between publishing the
+   account id and not. `AWS_REGION` carries nothing sensitive.
 
 The trust policy's `sub` condition pins deploys to **tag pushes on this
 repository** — a compromised PR branch or fork cannot assume the role.
-Until the variables exist, release.yml exits with a notice instead of failing
-(the CI variables stay unset even though the account now exists — a supported state).
+release.yml is also tag-triggered only, so no fork-originated run is ever in a
+position to ask for the secrets. Until the config exists, release.yml exits
+with a notice instead of failing (a supported state).
