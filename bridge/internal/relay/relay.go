@@ -87,12 +87,19 @@ var (
 	ErrStateExpired = errors.New("relay: state expired")
 	ErrStateUsed    = errors.New("relay: state already used or unknown (possible replay)")
 	ErrUnbound      = errors.New("relay: callback came from a different browser than started the flow")
-	ErrTooBusy      = errors.New("relay: too many login flows in flight")
 )
 
-// maxFlows caps in-flight flows. /login/{provider} is unauthenticated, so
-// without a cap an anonymous flood grows the map without bound; a full map
-// sheds new logins instead of the process.
+// maxFlows bounds the flow table's memory: /login/{provider} is
+// unauthenticated, so an anonymous flood must not grow the map without bound.
+// A full table *evicts* rather than refusing, because refusing hands any
+// anonymous client a global login outage for a whole TTL for the price of
+// maxFlows plain GETs — a worse failure than the memory it was guarding.
+// Map iteration order is random and under a flood the flood owns nearly the
+// whole table, so a random victim is nearly always the attacker's own flow.
+//
+// ponytail: random eviction, not LRU — an ordered index only earns its keep if
+// legitimate load reaches 50k concurrent logins, and then the cap is the thing
+// to raise.
 const maxFlows = 50_000
 
 // sweepInterval throttles the opportunistic expiry sweep. Sweeping on *every*
@@ -165,7 +172,11 @@ func (m *Manager) Begin(provider string, mode Mode, appID, sessionID string) (Fl
 		}
 	}
 	if len(m.flows) >= maxFlows {
-		return Flow{}, "", ErrTooBusy
+		// Make room in O(1) instead of shedding the new flow — see maxFlows.
+		for id := range m.flows {
+			delete(m.flows, id)
+			break
+		}
 	}
 	m.flows[f.ID] = f
 	return f, state, nil

@@ -167,6 +167,33 @@ export function UndoTotp() {
   );
 }
 
+// Reached from the "your sign-in address was changed" email, which goes to the
+// address the change moved away from. Reachable without a session by design:
+// the account no longer answers to the address its owner still has.
+export function UndoEmail() {
+  const token = new URLSearchParams(location.search).get('token') ?? '';
+  const [restored, setRestored] = useState('');
+  const { error, busy, submit } = useForm();
+
+  if (restored) {
+    return <div className="card"><h1>Sign-in address restored</h1>
+      <p>{restored} signs in again and every session was signed out. <Link to="/forgot">Reset your password</Link> —
+        whoever moved the address knew it.</p></div>;
+  }
+  return (
+    <form className="card" onSubmit={submit(async () => {
+      const r = await api<{ email: string }>('POST', '/api/auth/undo-email', { token });
+      setRestored(r.email);
+    })}>
+      <h1>Restore your sign-in address</h1>
+      {error && <p className="error">{error}</p>}
+      <p>This puts the address back, signs out every session, and removes any authenticator
+        app and recovery codes added since the change.</p>
+      <button disabled={busy}>Put it back</button>
+    </form>
+  );
+}
+
 export function VerifyEmail() {
   const token = new URLSearchParams(location.search).get('token') ?? '';
   const [state, setState] = useState<'working' | 'ok' | 'error'>('working');

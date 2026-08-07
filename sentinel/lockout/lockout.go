@@ -42,8 +42,13 @@ const (
 
 // Policy configures escalation.
 type Policy struct {
-	// Threshold is the number of consecutive failures that triggers a
-	// lockout (default 5).
+	// Threshold is the number of consecutive failures that triggers an
+	// account lockout (default 5). Consecutive, NOT per-window: the account
+	// dimension exists to catch a distributed attacker guessing one victim's
+	// password, and such an attacker only has to pace guesses under any
+	// counting window to never trip it. The counter is cleared by Success
+	// and by the entry going idle for FailWindow — both of which mean the
+	// attack stopped — but never by the mere passage of time under load.
 	Threshold int
 	// IPThreshold is the number of failures per FailWindow from one IP that
 	// triggers an IP lockout (default 10x Threshold). Deliberately higher than
@@ -60,10 +65,10 @@ type Policy struct {
 	// IPCap bounds IP-dimension lockout (default 24h). High on purpose:
 	// escalation here only hurts the attacker's own address.
 	IPCap time.Duration
-	// FailWindow is the counting window: a threshold means "this many
-	// failures per FailWindow", and escalation state decays after a full
-	// quiet window. An entry untouched for this long is forgotten
-	// entirely (default 1h).
+	// FailWindow is the IP counting window — IPThreshold means "that many
+	// failures per FailWindow", and IP escalation decays after a full quiet
+	// window. It is also the idle expiry for BOTH dimensions: an entry
+	// untouched for this long is forgotten entirely (default 1h).
 	FailWindow time.Duration
 	// MaxKeys bounds the tracked entries per dimension (default 100_000).
 	// A credential-stuffing run walks a distinct username per attempt, and
@@ -108,10 +113,10 @@ type Decision struct {
 }
 
 type state struct {
-	fails       int       // failures inside the current window
+	fails       int       // failures since the last lock/success (per window on the IP dimension)
 	lockLevel   int       // completed lockouts; drives exponential escalation
 	lockedUntil time.Time // zero when not locked
-	windowStart time.Time // start of the current FailWindow; fails counts from here
+	windowStart time.Time // start of the current FailWindow; IP dimension only
 	touched     time.Time // last activity; drives expiry/GC only
 }
 
@@ -278,13 +283,20 @@ func (t *Tracker) fail(m map[string]*state, key string, dim Dimension, threshold
 		// caller should have rejected before attempting auth at all.
 		return
 	}
-	// Roll the counting window. This keys off windowStart, NOT touched:
-	// touched is refreshed by every failure, so a key that sees any traffic
-	// at all never goes stale and its counters would accumulate forever —
-	// a shared egress (office NAT, CGNAT, a carrier) that fumbles a few
-	// passwords an hour would eventually cross IPThreshold and lock every
-	// user behind it, permanently, with no attacker present.
-	if now.Sub(s.windowStart) > t.policy.FailWindow {
+	// Roll the counting window — IP dimension ONLY. The IP counter is never
+	// cleared by a success (see Success), so without a roll a shared egress
+	// (office NAT, CGNAT, a carrier) that fumbles a few passwords an hour
+	// would accumulate forever, cross IPThreshold and lock every user behind
+	// it, permanently, with no attacker present. It keys off windowStart, not
+	// touched, because touched is refreshed by every failure.
+	//
+	// The account counter must NOT roll: a distributed attacker would just
+	// pace guesses under the window (3/h at Threshold 5, FailWindow 1h = a
+	// never-locking account) and that attacker is the entire reason the
+	// account dimension exists. Nothing unbounded follows from a monotonic
+	// account counter — Success clears the entry, and an idle FailWindow
+	// sweeps it (sweepStale/lockLeft), so only an ongoing attack survives.
+	if dim == IP && now.Sub(s.windowStart) > t.policy.FailWindow {
 		s.fails = 0
 		s.windowStart = now
 		if now.Sub(s.lockedUntil) > t.policy.FailWindow {

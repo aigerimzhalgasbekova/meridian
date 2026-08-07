@@ -41,10 +41,19 @@ its outstanding verification token — a change queued by an attacker who held a
 session would otherwise still flip the login address 24 h later, since
 `verify-email` is authorized by the token alone.
 
-**Email change.** The old address remains the login until the new address
-proves receipt. Requesting a new change revokes prior pending tokens; a
-superseded token is rejected. Duplicate-address checks at request *and*
-confirm time.
+**Email change.** The login address is treated as a credential, not a profile
+field, because it is the root of every mailed recovery path: `/api/account/email`
+re-verifies the account password, so a stolen cookie alone cannot move it and
+then simply ask `/forgot` for a new one. The old address remains the login until
+the new address proves receipt. Requesting a new change revokes prior pending
+tokens; a superseded token is rejected. Duplicate-address checks at request *and*
+confirm time. Confirming a change mails the address it moved *away from* a
+single-use `undo_email` token (24 h): redeeming it restores that address, signs
+out every session, and clears any second factor enrolled since — a factor
+enrolled after the move belongs to whoever moved it, and its own `undo_totp`
+notice went to the new address. That is not a new MFA bypass: `undo_totp`
+already lets the account inbox clear a factor, and this needs the old inbox
+*plus* a change only the password could have started.
 
 **TOTP.** Verify-to-activate (a wrong-device enrollment can't lock you out).
 ±1 step drift only. Replay defense: the last accepted time-step counter is
@@ -53,7 +62,10 @@ compared with `timingSafeEqual`. Recovery codes: 10, single-use, hashed,
 displayed exactly once, count surfaced on `/api/me` so the last one is not
 spent unnoticed. Enrolling, disabling, and regenerating codes all re-verify the
 account password — a stolen session cookie alone cannot enroll an attacker's
-authenticator, which reset deliberately does not undo. Disabling additionally
+authenticator, which reset deliberately does not undo. That property only holds
+because `/api/account/email` re-authenticates too: a cookie that could move the
+login address would reach the password in three more calls (verify, forgot,
+reset). Disabling additionally
 requires a fully stepped-up session, so it is not an MFA bypass for a password
 holder. That password check does nothing against an attacker who *knows* the
 password (stuffing, phishing), so activation also mails the account address a
@@ -110,9 +122,18 @@ treated as secret-bearing: dead-lettered rows should be purged, not archived.
   password. TOTP step-up is deliberately *not* bypassed by reset — reset does
   not disable TOTP. The exit is `POST /api/security/totp/disable`, which needs
   the password *and* a session that already passed the step-up. The inbox alone
-  clears a second factor in exactly one window: the single-use `undo_totp` link
-  mailed when that factor is enabled, expiring 24 h later. The uncovered case is
-  therefore a lost authenticator, all ten recovery codes spent, and that window
-  long gone: unrecoverable in-product by design, since any standing escape hatch
-  is a standing MFA bypass. An out-of-band identity-proofed support path is the
+  clears a second factor in exactly two windows, both single-use and both 24 h:
+  the `undo_totp` link mailed when the factor is enabled, and the `undo_email`
+  link mailed to the address a confirmed change moved away from. Uncovered:
+  a lost authenticator, all ten recovery codes spent, and both windows long
+  gone — unrecoverable in-product by design, since any standing escape hatch is
+  a standing MFA bypass. An out-of-band identity-proofed support path is the
   upgrade.
+- **A *chain* of address changes still ends with whoever redeems last.** Each
+  confirmed change mints its own `undo_email` token, and redeeming one does not
+  revoke the others — revoking siblings would let a password-holding attacker
+  destroy the owner's token by moving the address twice, which is the worse
+  failure. So `A→B→C` leaves two live tokens (to A and to B) and the last
+  redemption wins. Closing it means ordering tokens by `created_at` and
+  revoking only those minted after the one redeemed. Strictly better than
+  before, where one change and no notice was the whole attack.

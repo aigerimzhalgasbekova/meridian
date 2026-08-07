@@ -56,6 +56,25 @@ run "efs_mount_with_stop_before_start_drains_first" {
   }
 }
 
+# A SIGKILLed EFS task leaves its NFSv4 lock lease held for ~90s. Replacements
+# exit instantly on the LOCK_NB while it drains, and at desired_count = 1 three
+# of those trip the breaker's floor — with rollback = true ECS would quietly
+# revert to the previous task definition and the stack would look healthy on an
+# image nobody shipped. EFS services must stall visibly instead.
+run "efs_mount_does_not_auto_rollback" {
+  command = plan
+
+  variables {
+    stop_before_start = true
+  }
+
+  assert {
+    condition = (aws_ecs_service.this.deployment_circuit_breaker[0].enable &&
+    !aws_ecs_service.this.deployment_circuit_breaker[0].rollback)
+    error_message = "A service holding an EFS flock must stop a failed deploy, not roll it back."
+  }
+}
+
 run "no_efs_still_rolls_start_before_stop" {
   command = plan
 
@@ -68,5 +87,10 @@ run "no_efs_still_rolls_start_before_stop" {
     condition = (aws_ecs_service.this.deployment_minimum_healthy_percent == 100 &&
     aws_ecs_service.this.deployment_maximum_percent == 200)
     error_message = "Services without an exclusive resource keep the zero-downtime rolling deploy."
+  }
+
+  assert {
+    condition     = aws_ecs_service.this.deployment_circuit_breaker[0].rollback
+    error_message = "Without an exclusive file there is no lock lease to race, so keep the automatic rollback."
   }
 }

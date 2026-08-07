@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -495,6 +496,104 @@ func TestFileStoreV1LoadsAndUpgrades(t *testing.T) {
 	if s2, err := OpenFileStore(ctx, path, kek); err == nil {
 		s2.Close()
 		t.Fatal("state edit accepted after the v2 upgrade")
+	}
+}
+
+// TestOpenFileStoreWarnsWhenMigrationOptInLeftSet: the migration opt-in has to
+// be set in the serving task's environment for the deploy that upgrades the
+// deployed v1 keystore, and dropped in the next one. Nothing forces the second
+// deploy, and refusing to start would swap the downgrade window for an outage of
+// the platform's only signer — so a store that is already at the current version
+// must at least say so on every start.
+func TestOpenFileStoreWarnsWhenMigrationOptInLeftSet(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "keys.json")
+	kek := testKEK(t)
+	s, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := newKey(jose.AlgEdDSA, 2048, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, k); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var logged bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	t.Setenv(migrateEnvVar, "1")
+	s2, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatalf("a current-version store must still open with the opt-in set: %v", err)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(logged.Bytes(), []byte(migrateEnvVar)) {
+		t.Fatalf("%s left set on an already-v%d store logged nothing: %q", migrateEnvVar, fileVersion, logged.String())
+	}
+}
+
+// TestPersistDoesNotReuseAGenerationAfterDirSyncFailure: persist renames the new
+// document into place and only then fsyncs the directory. If that fsync fails,
+// the write is reported as an error and Put/Update roll their in-memory mutation
+// back — but the document carrying generation `next` is already on disk. Leaving
+// the counter behind seals the next, *different* record set under that same
+// generation, and two documents sharing a generation re-open the record splice
+// the generation was added to prevent.
+func TestPersistDoesNotReuseAGenerationAfterDirSyncFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the fsync cannot be made to fail")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	kek := testKEK(t)
+	s, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	mkKey := func() Key {
+		t.Helper()
+		k, err := newKey(jose.AlgEdDSA, 2048, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	if err := s.Put(ctx, mkKey()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write and execute but not read: CreateTemp and Rename still work,
+	// os.Open(dir) for the fsync does not.
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if err := s.Put(ctx, mkKey()); err == nil {
+		t.Fatal("directory fsync failure was not reported to the caller")
+	}
+	orphan := readDoc(t, path).Generation
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Put(ctx, mkKey()); err != nil {
+		t.Fatal(err)
+	}
+	if got := readDoc(t, path).Generation; got == orphan {
+		t.Fatalf("generation %d reused: the orphaned document and the live one carry the same generation, "+
+			"so a record from one splices into the other with a matching AAD", got)
 	}
 }
 

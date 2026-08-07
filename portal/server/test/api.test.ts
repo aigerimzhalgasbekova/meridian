@@ -190,7 +190,7 @@ describe('password reset', () => {
       .post('/api/account/email')
       .set('Cookie', cookie)
       .set('x-csrf-token', csrf)
-      .send({ email: 'attacker@example.com' })
+      .send({ email: 'attacker@example.com', password: PASSWORD })
       .expect(202);
     const changeToken = await t.lastToken();
 
@@ -203,6 +203,25 @@ describe('password reset', () => {
     const login = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: newPassword }).expect(200);
     expect(login.body.user.email).toBe(EMAIL);
     expect(login.body.user.pendingEmail).toBeNull();
+  });
+
+  it('does not strand an unverified signup: the original verification link still works after a reset', async () => {
+    // Cancelling an attacker's queued address change was done by revoking the
+    // whole verify_email purpose, which also burned the token minted at signup
+    // — and there is no resend route, so an account that resets before opening
+    // its first verification link could never verify. Clearing pendingEmail is
+    // what cancels a change; the signup token is not a change.
+    const t = testApp();
+    await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD }).expect(202);
+    const verifyToken = await t.lastToken();
+
+    await request(t.app).post('/api/auth/forgot').send({ email: EMAIL }).expect(202);
+    const newPassword = 'brand new password';
+    await request(t.app).post('/api/auth/reset').send({ token: await t.lastToken(), password: newPassword }).expect(200);
+
+    await request(t.app).post('/api/auth/verify-email').send({ token: verifyToken }).expect(200);
+    const login = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: newPassword }).expect(200);
+    expect(login.body.user.emailVerified).toBe(true);
   });
 
   it('rejects expired tokens', async () => {
@@ -247,7 +266,7 @@ describe('email verification and change', () => {
       .post('/api/account/email')
       .set('Cookie', cookie)
       .set('x-csrf-token', csrf)
-      .send({ email: NEW })
+      .send({ email: NEW, password: PASSWORD })
       .expect(202);
 
     // still logs in with the OLD address; new address not active yet
@@ -269,7 +288,7 @@ describe('email verification and change', () => {
     const t = testApp();
     const { cookie, csrf } = await signup(t);
     const change = (email: string) =>
-      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send({ email });
+      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send({ email, password: PASSWORD });
     await change('first@example.com').expect(202);
     const firstToken = await t.lastToken();
     await change('second@example.com').expect(202);
@@ -288,7 +307,7 @@ describe('email verification and change', () => {
       .post('/api/account/email')
       .set('Cookie', cookie)
       .set('x-csrf-token', csrf)
-      .send({ email: CONTESTED })
+      .send({ email: CONTESTED, password: PASSWORD })
       .expect(202);
     const token = await t.lastToken();
     await request(t.app).post('/api/auth/signup').send({ email: CONTESTED, password: PASSWORD }).expect(202);
@@ -296,6 +315,80 @@ describe('email verification and change', () => {
     await request(t.app).post('/api/auth/verify-email').send({ token }).expect(409);
     // Still live: a 400 here would mean the token was spent on the conflict.
     await request(t.app).post('/api/auth/verify-email').send({ token }).expect(409);
+  });
+
+  it('moving the login address requires the account password, not merely a session', async () => {
+    // The address is the root of every mailed recovery path, so a cookie-only
+    // attacker who could move it reached the password in four calls: change ->
+    // verify (needs no password) -> forgot -> reset, at which point they CHOSE
+    // the password and the "a stolen cookie alone cannot enroll an
+    // authenticator" property of /totp/setup was worth nothing.
+    const t = testApp();
+    const { cookie, csrf } = await signup(t);
+    const move = (body: object) =>
+      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send(body);
+    await move({ email: 'attacker@example.com' }).expect(401);
+    await move({ email: 'attacker@example.com', password: 'not the password' }).expect(401);
+
+    const user = await t.ctx.store.users.findByEmail(EMAIL);
+    expect(user!.pendingEmail).toBeNull();
+    expect(await t.drainMail()).toHaveLength(1); // the signup verification, and nothing else
+  });
+
+  it('a confirmed address change tells the old inbox, which can put the account back', async () => {
+    // An attacker who knows the password (stuffing, phishing) passes the
+    // re-auth above. Moving the address first made every later notice — the
+    // undo_totp escape hatch included — arrive in their own inbox, while the
+    // owner's /forgot went to an address on no account: permanent lockout with
+    // no notification at any point.
+    const t = testApp();
+    const attacker = await signup(t);
+    const EVIL = 'attacker@example.com';
+    await request(t.app)
+      .post('/api/account/email')
+      .set('Cookie', attacker.cookie)
+      .set('x-csrf-token', attacker.csrf)
+      .send({ email: EVIL, password: PASSWORD })
+      .expect(202);
+    await request(t.app).post('/api/auth/verify-email').send({ token: await t.lastToken() }).expect(200);
+
+    const mails = await t.drainMail();
+    expect(mails[mails.length - 1]!.to).toBe(EMAIL); // the notice goes to the address left behind
+    const undoToken = await t.lastToken();
+
+    // The attacker now enrolls a factor, and *its* notice does land on them.
+    const setup = await request(t.app)
+      .post('/api/security/totp/setup')
+      .set('Cookie', attacker.cookie)
+      .set('x-csrf-token', attacker.csrf)
+      .send({ password: PASSWORD })
+      .expect(200);
+    await request(t.app)
+      .post('/api/security/totp/activate')
+      .set('Cookie', attacker.cookie)
+      .set('x-csrf-token', attacker.csrf)
+      .send({ code: totp(base32Decode(setup.body.secret as string), t.clock.now.getTime() / 1000) })
+      .expect(200);
+    const afterEnroll = await t.drainMail();
+    expect(afterEnroll[afterEnroll.length - 1]!.to).toBe(EVIL);
+
+    // The owner's documented remedy produces nothing: no account has that address.
+    await request(t.app).post('/api/auth/forgot').send({ email: EMAIL }).expect(202);
+    expect(await t.drainMail()).toHaveLength(afterEnroll.length);
+
+    // The link in the old inbox is the way back, and it takes the factor the
+    // mover enrolled with it.
+    const undo = await request(t.app).post('/api/auth/undo-email').send({ token: undoToken }).expect(200);
+    expect(undo.body.email).toBe(EMAIL);
+    await request(t.app).post('/api/auth/login').send({ email: EVIL, password: PASSWORD }).expect(401);
+    const back = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD }).expect(200);
+    expect(back.body.mfaPending).toBe(false);
+    expect(back.body.user.totpEnabled).toBe(false);
+    const user = await t.ctx.store.users.findByEmail(EMAIL);
+    expect(await t.ctx.store.recoveryCodes.countUnused(user!.id)).toBe(0);
+    await request(t.app).get('/api/me').set('Cookie', attacker.cookie).expect(401);
+    // single use
+    await request(t.app).post('/api/auth/undo-email').send({ token: undoToken }).expect(400);
   });
 
   it('rate-limits the email-change existence oracle', async () => {
@@ -306,7 +399,7 @@ describe('email verification and change', () => {
     const { cookie, csrf } = await signup(t);
     t.ctx.config.rateLimit = { limit: 2, windowMs: 60_000 };
     const probe = (email: string) =>
-      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send({ email });
+      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send({ email, password: PASSWORD });
     await probe('probe-a@example.com').expect(202);
     await probe('probe-b@example.com').expect(202);
     await probe('probe-c@example.com').expect(429);

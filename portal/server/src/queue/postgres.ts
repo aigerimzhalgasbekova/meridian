@@ -42,15 +42,6 @@ export function postgresQueue(pool: Pool): JobQueue {
 
     async claim(now) {
       const staleBefore = new Date(now.getTime() - STALE_CLAIM_MS);
-      // A stale claim still spends an attempt, so a handler that always outlives
-      // the window (or a worker that crash-loops on a poison payload) would be
-      // redelivered every 5 minutes forever. Park it in the dead-letter state
-      // the same way fail() would, before the claim below skips over it.
-      await pool.query(
-        `UPDATE jobs SET status = 'dead', last_error = $2
-         WHERE status = 'running' AND COALESCE(claimed_at, run_at) < $1 AND attempts >= max_attempts`,
-        [staleBefore, STALE_CLAIM_ERROR],
-      );
       // The showcase query: SKIP LOCKED means concurrent workers each grab a
       // different row, no advisory locks, no polling contention. The second
       // branch is the crash/blip reaper — a claim older than STALE_CLAIM_MS is
@@ -69,7 +60,22 @@ export function postgresQueue(pool: Pool): JobQueue {
          RETURNING *`,
         [now, staleBefore],
       );
-      return rows[0] ? toJob(rows[0]) : null;
+      if (rows[0]) return toJob(rows[0]);
+      // A stale claim still spends an attempt, so a handler that always outlives
+      // the window (or a worker that crash-loops on a poison payload) would be
+      // redelivered every 5 minutes forever. Park it in the dead-letter state
+      // the same way fail() would. Only on an idle poll: the predicate is not
+      // sargable against jobs_claim_idx, and running it ahead of every claim
+      // put a scan of every pending+running row on the hot path — N+1 of them
+      // per tick() drain. Nothing claims these rows in the meantime (the claim
+      // above excludes attempts >= max_attempts), so the only cost of waiting
+      // for a quiet poll is when the row gets its 'dead' label.
+      await pool.query(
+        `UPDATE jobs SET status = 'dead', last_error = $2
+         WHERE status = 'running' AND COALESCE(claimed_at, run_at) < $1 AND attempts >= max_attempts`,
+        [staleBefore, STALE_CLAIM_ERROR],
+      );
+      return null;
     },
 
     // claimed_at is the ownership check: `status = 'running'` alone only catches

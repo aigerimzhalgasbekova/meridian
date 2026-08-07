@@ -203,15 +203,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // beginFailed reports a flow that could not be started. A full flow table is
-// load shedding, not a bug: say "busy", not "broken".
+// no longer one of the reasons (relay evicts instead of shedding), so anything
+// reaching here is a real fault.
 func (s *Server) beginFailed(w http.ResponseWriter, p *provider.Provider, err error) {
 	s.cfg.Logger.Warn("flow could not be started", "provider", p.Config().Name, "err", err)
-	if errors.Is(err, relay.ErrTooBusy) {
-		s.render(w, http.StatusServiceUnavailable, "error.html", map[string]any{
-			"Message": "Too many sign-ins are in progress. Try again in a moment.",
-		})
-		return
-	}
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 

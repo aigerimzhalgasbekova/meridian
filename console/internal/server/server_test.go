@@ -423,18 +423,71 @@ func TestSessions(t *testing.T) {
 	}
 }
 
-// A session whose owner is gone has no realm, so it has no authorization
-// scope: refuse rather than widening the check to global, where realm-scoped
-// deny carve-outs stop applying.
+// carveOut gives sub a realm-scoped deny for the three target-addressed routes:
+// the shape that makes "allowed at global" stop implying "allowed for any
+// target", since deny > allow and a realm assignment does not cover a global
+// check.
+func carveOut(t *testing.T, s *Server, sub, realm string) {
+	t.Helper()
+	if err := s.cfg.Engine.DefineRole(rbac.Role{
+		Name:   "carve-out",
+		Denies: []rbac.Permission{"users:write", "sessions:read", "sessions:revoke"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.cfg.Engine.Assign(rbac.Assignment{Subject: sub, Role: "carve-out", Scope: rbac.Scope{Realm: realm}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A session whose owner is gone has no realm, so the check can only fall back
+// to global — safe only for a caller allowed for every target. A realm-scoped
+// caller, or a global holder with a realm deny carve-out, is refused; a caller
+// who is authorized everywhere must still be able to revoke it, because a
+// session outliving its user record is exactly the state after a user deletion.
 func TestRevokeOrphanedSession(t *testing.T) {
 	s, store := newTestServer(t)
 	store.AddSession(Session{ID: "sess-orphan", UserID: "u-gone", CreatedAt: time.Unix(1e9, 0)})
+	carveOut(t, s, "olivia", "finance")
 
-	if w := do(t, s, "olivia", "POST", "/v1/sessions/sess-orphan/revoke", "", nil); w.Code != http.StatusNotFound {
-		t.Fatalf("orphaned session: got %d, want 404: %s", w.Code, w.Body)
+	for _, sub := range []string{"alice", "olivia"} {
+		if w := do(t, s, sub, "POST", "/v1/sessions/sess-orphan/revoke", "", nil); w.Code != http.StatusForbidden {
+			t.Fatalf("%s: got %d, want 403: %s", sub, w.Code, w.Body)
+		}
+		if _, ok, _ := store.Session(context.Background(), "sess-orphan"); !ok {
+			t.Fatalf("%s revoked an orphan without being authorized for every target", sub)
+		}
 	}
-	if _, ok, _ := store.Session(context.Background(), "sess-orphan"); !ok {
-		t.Error("orphaned session was revoked without ever being checked at its owner's realm")
+
+	if w := do(t, s, "root", "POST", "/v1/sessions/sess-orphan/revoke", "", nil); w.Code != http.StatusNoContent {
+		t.Fatalf("global holder revoking an orphan: got %d, want 204: %s", w.Code, w.Body)
+	}
+	if _, ok, _ := store.Session(context.Background(), "sess-orphan"); ok {
+		t.Error("orphaned session still live after a 204")
+	}
+}
+
+// vanishingSessions models the revoke race once sessions live in
+// sessiond/Redis: the pre-authorization lookup finds the session, the revoke
+// does not. 204 plus an allowed:true event would claim a revoke that never
+// landed — the users:write defect, at its sibling call site.
+type vanishingSessions struct{ *MemStore }
+
+func (vanishingSessions) RevokeSession(context.Context, string) (bool, error) { return false, nil }
+
+func TestRevokeRaceIsNotReportedAsSuccess(t *testing.T) {
+	s, store := newTestServer(t)
+	s.cfg.Sessions = vanishingSessions{store}
+
+	if w := do(t, s, "olivia", "POST", "/v1/sessions/sess-eng/revoke", "", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("session vanished before the write: got %d, want 404: %s", w.Code, w.Body)
+	}
+	var resp struct{ Events []AuditEvent }
+	do(t, s, "root", "GET", "/v1/audit", "", &resp)
+	for _, e := range resp.Events {
+		if e.Allowed {
+			t.Errorf("allowed:true audited for a revoke that never landed: %+v", e)
+		}
 	}
 }
 
@@ -488,6 +541,32 @@ func TestTargetEnumeration(t *testing.T) {
 			t.Errorf("%s: the 403 body still discloses existence\n miss: %s hit:  %s",
 				c.miss, miss.Body, hit.Body)
 		}
+	}
+}
+
+// "Allowed at global ⇒ allowed for any target" is what buys the honest 404 on a
+// miss, and a realm-scoped deny carve-out falsifies it: the holder is allowed at
+// global and denied in one realm, so a 404 on a miss beside a 403 on a hit in
+// that realm restores the very oracle requireTarget closes.
+func TestTargetEnumerationWithRealmDeny(t *testing.T) {
+	s, _ := newTestServer(t)
+	carveOut(t, s, "olivia", "finance")
+
+	for _, c := range []struct{ method, miss, hit string }{
+		{"POST", "/v1/users/ghost/disable", "/v1/users/u-fin/disable"},
+		{"GET", "/v1/users/ghost/sessions", "/v1/users/u-fin/sessions"},
+		{"POST", "/v1/sessions/ghost/revoke", "/v1/sessions/sess-fin/revoke"},
+	} {
+		miss := do(t, s, "olivia", c.method, c.miss, "", nil)
+		hit := do(t, s, "olivia", c.method, c.hit, "", nil)
+		if miss.Code != hit.Code || miss.Body.String() != hit.Body.String() {
+			t.Errorf("%s %s: the carve-out holder can still enumerate\n miss: %d %s hit:  %d %s",
+				c.method, c.miss, miss.Code, miss.Body, hit.Code, hit.Body)
+		}
+	}
+	// The carve-out costs her nothing in the realms she is not carved out of.
+	if w := do(t, s, "olivia", "POST", "/v1/users/u-eng/disable", "", nil); w.Code != http.StatusOK {
+		t.Errorf("uncarved realm: got %d, want 200: %s", w.Code, w.Body)
 	}
 }
 

@@ -372,8 +372,43 @@ func TestListSkipsSessionsPastDeadline(t *testing.T) {
 	if len(sessions) != 0 {
 		t.Errorf("List returned %d past-deadline sessions, want 0", len(sessions))
 	}
-	if mr.Exists("sess:" + sess.ID) {
-		t.Error("List should prune the past-deadline session it refused to report")
+	// Refusing to report is the whole job: List is a read on an unvalidated
+	// clock, so it must not destroy the record. touchScript does that, on the
+	// node that actually serves the session.
+	if !mr.Exists("sess:" + sess.ID) {
+		t.Error("List destroyed a session it should only have hidden")
+	}
+}
+
+// TestListDoesNotDeleteOnClockSkew is the fleet-level version: one node running
+// fast must not be able to kill sessions that are live everywhere else, and a
+// GET must not be a destructive write.
+func TestListDoesNotDeleteOnClockSkew(t *testing.T) {
+	mr := miniredis.RunT(t)
+	good := newFakeClock()
+	cfg := Config{IdleTTL: 10 * time.Minute, AbsoluteTTL: 30 * time.Minute, CacheTTL: time.Millisecond}
+	s := testStore(t, mr, good, cfg)
+	ctx := context.Background()
+
+	tok, _ := mustCreate(t, s, "acme", "alice")
+
+	// A second node whose clock is 2h fast renders the admin listing.
+	fast := newFakeClock()
+	fast.advance(2 * time.Hour)
+	if _, err := testStore(t, mr, fast, cfg).List(ctx, "acme", "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The session is still well inside its deadline on a correct clock.
+	if _, err := s.Validate(ctx, tok); err != nil {
+		t.Fatalf("session killed by a fast node's listing: %v", err)
+	}
+	sessions, err := s.List(ctx, "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Errorf("live sessions after a skewed listing = %d, want 1", len(sessions))
 	}
 }
 
@@ -390,6 +425,29 @@ func TestCacheExpiryMeasuredFromReadTime(t *testing.T) {
 
 	if _, _, ok := c.get("id"); ok {
 		t.Error("entry filled from a 3s-old read must already be expired")
+	}
+}
+
+// TestValidateTolerantOfPartialRecord: a session hash missing realm/uid (a
+// partial restore, an operator's HDEL) must still validate — the index upkeep
+// touchScript does is best-effort, not a precondition. Concatenating a missing
+// field in Lua raises, which would turn such a record into a permanent 500.
+func TestValidateTolerantOfPartialRecord(t *testing.T) {
+	mr := miniredis.RunT(t)
+	clk := newFakeClock()
+	s := testStore(t, mr, clk, Config{CacheTTL: time.Millisecond})
+	ctx := context.Background()
+
+	tok, sess := mustCreate(t, s, "acme", "alice")
+	mr.HDel("sess:"+sess.ID, "realm")
+	mr.HDel("sess:"+sess.ID, "uid")
+
+	got, err := s.Validate(ctx, tok)
+	if err != nil {
+		t.Fatalf("Validate on a partial record: %v", err)
+	}
+	if got.ID != sess.ID {
+		t.Errorf("session id = %q, want %q", got.ID, sess.ID)
 	}
 }
 

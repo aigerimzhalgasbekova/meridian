@@ -109,11 +109,16 @@ redis.call('PEXPIRE', KEYS[1], ttl)
 -- it is a no-op on a missing key. Score is created_ms so eviction order stays
 -- by session age. ponytail: ~3 extra ops per cache miss, i.e. one per CacheTTL
 -- per token; move to a background reaper if that ever shows up in a profile.
+-- A missing hash field arrives as false, and concatenating it raises: guard
+-- like revokeScript does, so a partial record (restore, operator surgery) stays
+-- validatable instead of erroring on every touch forever.
 local f = redis.call('HMGET', KEYS[1], 'realm', 'uid', 'created_ms')
-local userkey = 'usersess:' .. f[1] .. ':' .. f[2] .. ':sessions'
-redis.call('ZADD', userkey, 'NX', tonumber(f[3]), ARGV[3])
-local want = deadline - now
-if redis.call('PTTL', userkey) < want then redis.call('PEXPIRE', userkey, want) end
+if f[1] and f[2] and f[3] then
+  local userkey = 'usersess:' .. f[1] .. ':' .. f[2] .. ':sessions'
+  redis.call('ZADD', userkey, 'NX', tonumber(f[3]), ARGV[3])
+  local want = deadline - now
+  if redis.call('PTTL', userkey) < want then redis.call('PEXPIRE', userkey, want) end
+end
 return redis.call('HGETALL', KEYS[1])
 `)
 

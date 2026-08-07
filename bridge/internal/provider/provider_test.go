@@ -2,8 +2,10 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -389,5 +391,42 @@ func TestPresets(t *testing.T) {
 	single := Entra("11111111-2222-3333-4444-555555555555", "cid", "sec")
 	if strings.Contains(single.Issuer, TenantPlaceholder) {
 		t.Fatalf("single-tenant entra must pin the issuer: %+v", single)
+	}
+}
+
+// A token endpoint behind a degraded proxy answers with an HTML error page,
+// not JSON. That body ends up in an error the server logs once per failed
+// callback, so it must not carry the full 1 MiB read limit into the log store.
+func TestExchangeErrorTruncatesUpstreamBody(t *testing.T) {
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(Metadata{
+			Issuer:                srv.URL,
+			AuthorizationEndpoint: srv.URL + "/authorize",
+			TokenEndpoint:         srv.URL + "/token",
+			JWKSURI:               srv.URL + "/jwks",
+		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte("<html><body>" + strings.Repeat("A", 1<<20) + "</body></html>"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	p, err := New(Config{Name: "fake", Issuer: srv.URL, ClientID: clientID, ClientSecret: clientSecret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Exchange(context.Background(), "code", strings.Repeat("v", 43), redirectURI)
+	if err == nil {
+		t.Fatal("a 502 from the token endpoint must be an error")
+	}
+	if len(err.Error()) > 1024 {
+		t.Fatalf("upstream body leaked into the error: %d bytes", len(err.Error()))
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Fatalf("error lost the diagnostic status: %q", err.Error())
 	}
 }

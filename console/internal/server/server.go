@@ -26,8 +26,8 @@
 // trace — a denied admin sees exactly why. The exception is the three routes
 // addressed by a target id (user disable/enable, user sessions, session
 // revoke): their denial names neither scope nor decision, because the scope is
-// the target's realm and would leak whether the target exists (requireTarget).
-// Role definitions are global
+// the target's realm and would leak whether the target exists (requireTarget,
+// requireAnyTarget). Role definitions are global
 // objects, so writing them demands global scope (a realm-admin cannot mint
 // roles). Assignment writes are checked at the scope being granted, which
 // is what confines a realm-admin to their realm.
@@ -255,8 +255,9 @@ func (s *Server) requireAudited(w http.ResponseWriter, r *http.Request, perm rba
 
 // requireTarget gates the three routes addressed by a target id whose realm is
 // only knowable after a store lookup (users/{id}/disable|enable,
-// users/{id}/sessions, sessions/{id}/revoke). Their miss branch checks at
-// global while a hit checks at the target's realm, so a denial envelope that
+// users/{id}/sessions, sessions/{id}/revoke) once the target resolved to a
+// realm. Their miss branch checks at global (requireAnyTarget) while a hit
+// checks at the target's realm, so a denial envelope that
 // names the scope — in the message or in the attached decision — is exactly the
 // cross-realm existence oracle the bare 404 was. Both branches emit one fixed
 // body instead, byte-identical for a miss and a cross-realm hit.
@@ -268,11 +269,56 @@ func (s *Server) requireTarget(w http.ResponseWriter, r *http.Request, perm rbac
 	if s.cfg.Engine.Check(subject(r), perm, scope).Allowed {
 		return true
 	}
+	s.denyTarget(w, r, perm, scope, action, target)
+	return false
+}
+
+// requireAnyTarget gates the branches where the target does not resolve to a
+// realm (it does not exist, or a session's owner is gone), so there is nothing
+// to check against but global scope. The honest answer those branches give
+// rests on "this caller could have operated on any target, so a miss tells them
+// nothing new" — and an allow at global does not establish that on its own:
+// deny > allow and a realm assignment does not cover a global check
+// (Scope.covers), so a caller holding perm globally plus a realm-scoped deny
+// carve-out is allowed at global and denied in that realm. They would get the
+// honest answer on a miss and the fixed 403 on a hit in the carved-out realm —
+// exactly the oracle requireTarget exists to close. Require the allow to
+// survive every realm the caller holds an assignment in; otherwise they get the
+// same target-blind 403 as everyone else.
+//
+// ponytail: one Check per realm assignment of the caller, like requireAnywhere.
+// Memoize per (subject, perm) if a subject ever holds enough assignments to
+// notice.
+func (s *Server) requireAnyTarget(w http.ResponseWriter, r *http.Request, perm rbac.Permission, action, target string) bool {
+	if s.allowedForAnyTarget(subject(r), perm) {
+		return true
+	}
+	s.denyTarget(w, r, perm, rbac.Global, action, target)
+	return false
+}
+
+// allowedForAnyTarget reports whether sub holds perm no matter which realm the
+// target turns out to be in: allowed at global, and not carved out by a
+// realm-scoped deny in any realm sub holds an assignment in.
+func (s *Server) allowedForAnyTarget(sub string, perm rbac.Permission) bool {
+	if !s.cfg.Engine.Check(sub, perm, rbac.Global).Allowed {
+		return false
+	}
+	for _, a := range s.cfg.Engine.Assignments(sub) {
+		if !a.Scope.IsGlobal() && !s.cfg.Engine.Check(sub, perm, a.Scope).Allowed {
+			return false
+		}
+	}
+	return true
+}
+
+// denyTarget writes the fixed target-blind denial shared by both target gates.
+// action == "" skips the audit — a read is not a mutation.
+func (s *Server) denyTarget(w http.ResponseWriter, r *http.Request, perm rbac.Permission, scope rbac.Scope, action, target string) {
 	if action != "" {
 		s.audit(r, action, target, scope, false, "")
 	}
 	writeError(w, http.StatusForbidden, "forbidden", string(perm)+" denied for this target")
-	return false
 }
 
 // --- logging / headers middleware ---

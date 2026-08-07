@@ -272,10 +272,10 @@ func (s *Server) setUserDisabled(disabled bool) http.HandlerFunc {
 		if !ok {
 			// The realm-derived scope forces a lookup before the check, so a
 			// bare 404 would be a cross-realm existence oracle. Answer 404
-			// only to a caller authorized at global scope — they could have
-			// operated on any target, so the miss tells them nothing new.
-			// Everyone else gets the target-blind 403, and the probe is audited.
-			if !s.requireTarget(w, r, "users:write", rbac.Global, action, id) {
+			// only to a caller authorized for *any* target — the miss tells
+			// them nothing they could not already have learned. Everyone else
+			// gets the target-blind 403, and the probe is audited.
+			if !s.requireAnyTarget(w, r, "users:write", action, id) {
 				return
 			}
 			writeError(w, http.StatusNotFound, "not_found", "user not found")
@@ -315,7 +315,7 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		// Same existence-oracle guard as setUserDisabled.
-		if !s.requireTarget(w, r, "sessions:read", rbac.Global, "", "") {
+		if !s.requireAnyTarget(w, r, "sessions:read", "", "") {
 			return
 		}
 		writeError(w, http.StatusNotFound, "not_found", "user not found")
@@ -344,35 +344,42 @@ func (s *Server) revokeSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		// Same existence-oracle guard as setUserDisabled.
-		if !s.requireTarget(w, r, "sessions:revoke", rbac.Global, "session.revoke", id) {
+		if !s.requireAnyTarget(w, r, "sessions:revoke", "session.revoke", id) {
 			return
 		}
 		writeError(w, http.StatusNotFound, "not_found", "session not found")
 		return
 	}
-	// Scope is the session owner's realm. Never fall back to global on an
-	// unresolvable owner: global is the strictest scope for allows but the
-	// weakest for denies — a realm-scoped deny carve-out does not cover a
-	// global query, so widening the scope would revoke what the realm check
-	// refuses. Refuse instead, like every sibling handler.
 	u, uok, err := s.cfg.Users.User(r.Context(), sess.UserID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "user store unavailable")
 		return
 	}
+	// Scope is the session owner's realm. A session outliving its owner is the
+	// ordinary state right after a user deletion — exactly when an operator
+	// most needs the revoke — but it has no realm, so the check can only fall
+	// back to global. Global is the strictest scope for allows and the weakest
+	// for denies: a realm-scoped deny carve-out does not cover a global query,
+	// so only a caller allowed for every target may be checked there.
+	scope := rbac.Scope{Realm: u.Realm}
 	if !uok {
-		if !s.requireTarget(w, r, "sessions:revoke", rbac.Global, "session.revoke", id) {
+		scope = rbac.Global
+		if !s.requireAnyTarget(w, r, "sessions:revoke", "session.revoke", id) {
 			return
 		}
-		writeError(w, http.StatusNotFound, "not_found", "session owner not found")
+	} else if !s.requireTarget(w, r, "sessions:revoke", scope, "session.revoke", id) {
 		return
 	}
-	scope := rbac.Scope{Realm: u.Realm}
-	if !s.requireTarget(w, r, "sessions:revoke", scope, "session.revoke", id) {
-		return
-	}
-	if _, err := s.cfg.Sessions.RevokeSession(r.Context(), id); err != nil {
+	revoked, err := s.cfg.Sessions.RevokeSession(r.Context(), id)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "session backend unavailable")
+		return
+	}
+	// The session can vanish between the lookup above and this write — an
+	// ordinary race once sessions live in sessiond/Redis. Nothing changed, so
+	// there is no success to audit.
+	if !revoked {
+		writeError(w, http.StatusNotFound, "not_found", "session not found")
 		return
 	}
 	s.audit(r, "session.revoke", id, scope, true, "")

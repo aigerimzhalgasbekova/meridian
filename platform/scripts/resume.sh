@@ -4,10 +4,6 @@
 set -euo pipefail
 CLUSTER=meridian-dev
 SERVICES=(idp keysmith sessiond sentinel bridge portal console)
-# Same discovery as pause.sh — the set follows terraform, not this script.
-read -r -a DOWN_ALARMS <<<"$(aws cloudwatch describe-alarms --alarm-name-prefix "$CLUSTER-" \
-  --query 'MetricAlarms[?ends_with(AlarmName, `-no-healthy-hosts`)].AlarmName' --output text)"
-[ ${#DOWN_ALARMS[@]} -gt 0 ] || { echo "no $CLUSTER-*-no-healthy-hosts alarms found; is observability applied?" >&2; exit 1; }
 
 aws rds start-db-instance --db-instance-identifier meridian-dev-postgres --query 'DBInstance.DBInstanceStatus' --output text || true
 echo "waiting for RDS to become available (~3-5 min)..."
@@ -25,6 +21,23 @@ done
 # precisely when those alarms need to be back on.
 echo "waiting for services to stabilise before re-arming down alarms..."
 aws ecs wait services-stable --cluster "$CLUSTER" --services "${SERVICES[@]}" || true
+
+# Discovery happens HERE, not at the top: bringing a paused stack back must
+# never be blocked by a CloudWatch read. Same discovery as pause.sh — the set
+# follows terraform, not this script — and the same status capture, so an
+# expired token is not reported as "no alarms exist".
+if ! found=$(aws cloudwatch describe-alarms --alarm-name-prefix "$CLUSTER-" \
+  --query 'MetricAlarms[?ends_with(AlarmName, `-no-healthy-hosts`)].AlarmName' --output text 2>&1); then
+  echo "stack is UP but describe-alarms failed (credentials? IAM?): $found" >&2
+  echo "down alarms are still silenced — re-run resume.sh once the API works." >&2
+  exit 1
+fi
+read -r -a DOWN_ALARMS <<<"$found"
+[ ${#DOWN_ALARMS[@]} -gt 0 ] || {
+  echo "stack is UP but no $CLUSTER-*-no-healthy-hosts alarms found; is observability applied?" >&2
+  exit 1
+}
+
 aws cloudwatch enable-alarm-actions --alarm-names "${DOWN_ALARMS[@]}"
 
 # CloudWatch invokes an alarm action only on a state TRANSITION. After a pause

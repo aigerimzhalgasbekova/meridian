@@ -113,32 +113,23 @@ func TestConsumeRequiresBrowserBinding(t *testing.T) {
 	}
 }
 
-// /login/{provider} is unauthenticated: a flood must be shed, not absorbed.
-func TestFlowTableIsCapped(t *testing.T) {
+// /login/{provider} is unauthenticated: a flood must be bounded in memory, and
+// it must not cost everyone else their login. A table filled with live flows
+// still admits the next one — by evicting, not by refusing.
+func TestFullFlowTableEvictsInsteadOfRefusing(t *testing.T) {
 	m := testManager(t, nil)
 	for i := 0; i < maxFlows; i++ {
 		m.flows[randomToken()] = Flow{Expires: time.Now().Add(TTL)}
 	}
-	if _, _, err := m.Begin("google", ModeLogin, "", ""); !errors.Is(err, ErrTooBusy) {
-		t.Fatalf("full flow table accepted another flow: %v", err)
+	f, state, err := m.Begin("google", ModeLogin, "", "")
+	if err != nil {
+		t.Fatalf("full flow table refused a legitimate login: %v", err)
 	}
-	// Expire the whole backlog. Capacity must NOT come back yet: the sweep is
-	// throttled, which is what stops each request costing O(live flows) under
-	// the manager's mutex.
-	m.mu.Lock()
-	for id, f := range m.flows {
-		f.Expires = time.Now().Add(-time.Hour)
-		m.flows[id] = f
+	if len(m.flows) != maxFlows {
+		t.Fatalf("table size = %d, want the cap %d", len(m.flows), maxFlows)
 	}
-	m.mu.Unlock()
-	if _, _, err := m.Begin("google", ModeLogin, "", ""); !errors.Is(err, ErrTooBusy) {
-		t.Fatalf("sweep ran before it was due: %v", err)
-	}
-	m.mu.Lock()
-	m.lastSweep = time.Now().Add(-sweepInterval)
-	m.mu.Unlock()
-	if _, _, err := m.Begin("google", ModeLogin, "", ""); err != nil {
-		t.Fatalf("due sweep did not free capacity: %v", err)
+	if got, err := m.Consume(state, "google", f.Binding); err != nil || got.ID != f.ID {
+		t.Fatalf("the admitted flow must be usable: %v", err)
 	}
 }
 

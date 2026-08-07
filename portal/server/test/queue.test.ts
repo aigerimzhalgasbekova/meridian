@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import type { Pool } from 'pg';
 import { memoryQueue } from '../src/queue/memory.js';
+import { postgresQueue } from '../src/queue/postgres.js';
 import { backoffMs, STALE_CLAIM_MS } from '../src/queue/types.js';
 import { Worker } from '../src/queue/worker.js';
 import { runQueueContract } from './contract/queue.js';
@@ -17,6 +19,39 @@ describe('backoffMs', () => {
 // contract is what holds it to that. postgres runs the same suite in pg.test.ts.
 describe('memory queue', () => {
   runQueueContract(() => memoryQueue());
+});
+
+describe('postgres queue polling cost', () => {
+  it('only issues the dead-letter sweep when the claim found nothing', async () => {
+    // The sweep's `COALESCE(claimed_at, run_at) < $1` is not sargable against
+    // jobs_claim_idx, so running it ahead of every claim put a scan of every
+    // pending+running row on the hot path: one per poll interval forever, and
+    // N+1 of them inside a tick() that drains N jobs.
+    const statements: string[] = [];
+    let claimResult: Record<string, unknown>[] = [];
+    const isSweep = (s: string): boolean => s.includes("SET status = 'dead'");
+    const pool = {
+      query: async (text: string) => {
+        statements.push(text);
+        return { rows: isSweep(text) ? [] : claimResult };
+      },
+    };
+    const q = postgresQueue(pool as unknown as Pool);
+    const now = new Date();
+
+    claimResult = [{
+      id: 'j1', type: 't', payload: {}, status: 'running', attempts: 1, max_attempts: 5,
+      run_at: now, claimed_at: now, last_error: null, created_at: now,
+    }];
+    expect((await q.claim(now))?.id).toBe('j1');
+    expect(statements.filter(isSweep)).toHaveLength(0);
+
+    // Idle poll: nothing was claimable, so the sweep gets its turn and a
+    // stale-but-exhausted row still reaches the dead-letter state.
+    claimResult = [];
+    expect(await q.claim(now)).toBeNull();
+    expect(statements.filter(isSweep)).toHaveLength(1);
+  });
 });
 
 describe('memory queue claim semantics', () => {

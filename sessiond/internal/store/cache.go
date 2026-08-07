@@ -52,10 +52,15 @@ func (c *cache) get(id string) (sess Session, negative, ok bool) {
 	return e.sess, e.negative, true
 }
 
-// put caches a validation result. readAt is when the underlying Redis read
-// happened, not when this call is made: staleness is measured from the truth
-// the entry reflects, so a slow round trip cannot push the bound past ttl. An
-// entry filled after a stall longer than ttl is simply born expired.
+// put caches a validation result. readAt is when the caller ISSUED the Redis
+// read, not when this call is made: staleness is measured from the oldest
+// moment the entry could reflect, so a slow round trip cannot push the bound
+// past ttl. An entry filled after a round trip longer than ttl is simply born
+// expired.
+// ponytail: so the cache goes cold exactly when Redis RTT reaches CacheTTL —
+// by construction, since no cached answer can then still be within the ttl
+// staleness bound. Honouring the bound wins over shedding load; the operator
+// lever is raising SESSIOND_CACHE_TTL, which widens the bound explicitly.
 func (c *cache) put(id string, sess Session, readAt int64) {
 	c.set(id, cacheEntry{sess: sess, expires: readAt + c.ttl})
 }

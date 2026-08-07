@@ -10,8 +10,15 @@ CLUSTER=meridian-dev
 # Silence just those; every other alarm stays armed. resume.sh re-arms them.
 # Discovered, not hardcoded: an ALB service added to envs/dev later would
 # otherwise page through every pause with nothing pointing at the omission.
-read -r -a DOWN_ALARMS <<<"$(aws cloudwatch describe-alarms --alarm-name-prefix "$CLUSTER-" \
-  --query 'MetricAlarms[?ends_with(AlarmName, `-no-healthy-hosts`)].AlarmName' --output text)"
+# A command substitution inside a here-string throws its exit status away, so
+# capture first: an expired token or a missing cloudwatch:DescribeAlarms grant
+# must not be reported as "no alarms exist".
+if ! found=$(aws cloudwatch describe-alarms --alarm-name-prefix "$CLUSTER-" \
+  --query 'MetricAlarms[?ends_with(AlarmName, `-no-healthy-hosts`)].AlarmName' --output text 2>&1); then
+  echo "describe-alarms failed (credentials? IAM?): $found" >&2
+  exit 1
+fi
+read -r -a DOWN_ALARMS <<<"$found"
 [ ${#DOWN_ALARMS[@]} -gt 0 ] || { echo "no $CLUSTER-*-no-healthy-hosts alarms found; is observability applied?" >&2; exit 1; }
 
 aws cloudwatch disable-alarm-actions --alarm-names "${DOWN_ALARMS[@]}"

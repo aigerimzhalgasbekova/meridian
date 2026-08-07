@@ -223,10 +223,11 @@ func (s *Store) Validate(ctx context.Context, token string) (Session, error) {
 		}
 		return sess, nil
 	}
-	// readAt is when Redis answered, not when the entry is filled: the cache
-	// entry describes truth as of readAt, so its lifetime must be measured
-	// from there. Otherwise a slow round trip widens the staleness bound to
-	// CacheTTL + RTT, and the documented "at most CacheTTL" stops being true.
+	// readAt is when the read was ISSUED, not when the entry is filled: the
+	// cache entry describes truth no fresher than readAt, so its lifetime is
+	// measured from there. Otherwise a slow round trip widens the staleness
+	// bound to CacheTTL + RTT, and the documented "at most CacheTTL" stops
+	// being true.
 	readAt := s.cfg.Now().UnixMilli()
 	res, err := touchScript.Run(ctx, s.rdb, []string{sessKey(id)},
 		readAt, s.cfg.IdleTTL.Milliseconds(), id).Result()
@@ -353,9 +354,12 @@ func (s *Store) List(ctx context.Context, realm, userID string) ([]Session, erro
 			// Past its absolute cap despite a live TTL (clock skew, restored
 			// snapshot). touchScript refuses this session, so List — the
 			// surface an operator reads before deciding what to revoke — must
-			// not report it as live either.
-			_ = s.rdb.ZRem(ctx, uk, id).Err()
-			_ = s.rdb.Del(ctx, sessKey(id)).Err()
+			// not report it as live either. Reporting only: List is a read, and
+			// `now` is this node's unvalidated clock. A node running fast would
+			// otherwise destroy sessions that are still perfectly valid
+			// everywhere else, fleet-wide, on a page refresh — and without the
+			// revocation broadcast that RevokeID sends. Deletion is left to
+			// touchScript, which runs on the node actually serving the session.
 			continue
 		}
 		sessions = append(sessions, sess)

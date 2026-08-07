@@ -431,8 +431,16 @@ func (p *Provider) Exchange(ctx context.Context, code, codeVerifier, redirectURI
 			return err
 		}
 		if resp.StatusCode != http.StatusOK {
+			// The body goes into an error that gets logged. A real IdP sends a
+			// few bytes of JSON; a proxy or captive portal in front of a dead
+			// token endpoint sends an HTML page, and maxBody is 1 MiB — so keep
+			// only enough to diagnose, per failed callback.
+			body := strings.TrimSpace(string(raw))
+			if len(body) > 512 {
+				body = strings.ToValidUTF8(body[:512], "") + "…"
+			}
 			return fmt.Errorf("provider %s: token exchange: %s: %s",
-				p.cfg.Name, resp.Status, strings.TrimSpace(string(raw)))
+				p.cfg.Name, resp.Status, body)
 		}
 		var out struct {
 			IDToken string `json:"id_token"`

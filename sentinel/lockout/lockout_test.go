@@ -210,25 +210,59 @@ func TestSharedEgressSurvivesSustainedTraffic(t *testing.T) {
 		}
 	}
 
-	// Escalation decays with the window too: a key that keeps seeing traffic
-	// (so it is never swept as stale) but goes a full window without locking
-	// starts over at BaseLock, instead of resuming yesterday's exponent.
+	// Escalation decays with the window too — on the IP dimension, the only
+	// one the window governs: an IP that keeps seeing traffic (so it is never
+	// swept as stale) but goes a full window without locking starts over at
+	// BaseLock, instead of resuming yesterday's exponent. Every failure below
+	// uses a fresh account so only the IP counter is under test.
 	c2 := newClock()
-	tr2 := New(testPolicy, c2.now) // Threshold 3, BaseLock 1m, FailWindow 1h
-	failN(tr2, "alice", "1.1.1.1", testPolicy.Threshold)
-	if d := tr2.Check("alice", "1.1.1.1"); d.RetryAfter != time.Minute {
-		t.Fatalf("first lock = %v, want 1m", d.RetryAfter)
+	tr2 := New(testPolicy, c2.now) // IPThreshold 3, BaseLock 1m, FailWindow 1h
+	n := 0
+	failIP := func() { n++; tr2.Fail(fmt.Sprintf("acct-%d", n), "1.1.1.1") }
+
+	for i := 0; i < testPolicy.IPThreshold; i++ {
+		failIP()
+	}
+	if d := tr2.Check("bystander", "1.1.1.1"); d.Dimension != IP || d.RetryAfter != time.Minute {
+		t.Fatalf("first IP lock = %+v, want IP for 1m", d)
 	}
 	for i := 0; i < 4; i++ { // 2h of one failure per 30m: sub-threshold, never stale
 		c2.advance(30 * time.Minute)
-		tr2.Fail("alice", "1.1.1.1")
-		if d := tr2.Check("alice", "1.1.1.1"); d.Locked {
-			t.Fatalf("sub-threshold trickle locked the account: %+v", d)
+		failIP()
+		if d := tr2.Check("bystander", "1.1.1.1"); d.Locked {
+			t.Fatalf("sub-threshold trickle locked the IP: %+v", d)
 		}
 	}
-	failN(tr2, "alice", "1.1.1.1", testPolicy.Threshold)
-	if d := tr2.Check("alice", "1.1.1.1"); !d.Locked || d.RetryAfter != testPolicy.BaseLock {
-		t.Fatalf("escalation did not decay after a quiet window: %+v", d)
+	for i := 0; i < testPolicy.IPThreshold; i++ {
+		failIP()
+	}
+	if d := tr2.Check("bystander", "1.1.1.1"); !d.Locked || d.RetryAfter != testPolicy.BaseLock {
+		t.Fatalf("IP escalation did not decay after a quiet window: %+v", d)
+	}
+}
+
+// The account dimension exists to catch a distributed attacker guessing ONE
+// victim's password from many IPs (package doc). Windowing the account counter
+// hands that attacker a free bypass: pace guesses so no single FailWindow ever
+// accumulates Threshold failures — 3/h against the shipped defaults — and the
+// account never locks, while the constant traffic keeps the entry fresh so
+// nothing sweeps it either. Neither of the other brakes applies: Success never
+// fires (the attacker never guesses right) and the rate limiters are per-minute.
+// A sustained sub-threshold-per-window trickle must still lock the account.
+func TestSlowDistributedGuessingLocksAccount(t *testing.T) {
+	c := newClock()
+	tr := New(testPolicy, c.now) // Threshold 3, FailWindow 1h
+
+	// One guess every 40m from a fresh IP: never Threshold inside a window,
+	// never idle for a whole one.
+	for i := 0; i < testPolicy.Threshold; i++ {
+		if i > 0 {
+			c.advance(40 * time.Minute)
+		}
+		tr.Fail("victim", fmt.Sprintf("203.0.113.%d", i))
+	}
+	if d := tr.Check("victim", "203.0.113.250"); !d.Locked || d.Dimension != Account {
+		t.Fatalf("slow distributed guessing never locked the account: %+v", d)
 	}
 }
 

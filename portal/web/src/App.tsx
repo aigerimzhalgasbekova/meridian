@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from 'react';
 import { fetchMe, type Me } from './api';
-import { Forgot, Login, Reset, Signup, TotpChallenge, UndoTotp, VerifyEmail } from './auth';
+import { Forgot, Login, Reset, Signup, TotpChallenge, UndoEmail, UndoTotp, VerifyEmail } from './auth';
 import { Profile, Security } from './account';
 
 // ponytail: 20-line history-API router instead of react-router.
@@ -60,6 +60,7 @@ export default function App() {
   // Before the mfaPending branch: this link is what an owner locked out by a
   // hostile enrollment clicks, and they cannot pass the step-up by definition.
   if (path === '/undo-totp') page = <UndoTotp />;
+  else if (path === '/undo-email') page = <UndoEmail />;
   else if (me?.mfaPending) page = <TotpChallenge />;
   else if (path === '/signup') page = authed ? <Profile /> : <Signup />;
   else if (path === '/forgot') page = <Forgot />;

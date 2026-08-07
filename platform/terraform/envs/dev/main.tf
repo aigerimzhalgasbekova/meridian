@@ -289,6 +289,19 @@ module "keysmith" {
   env = {
     KEYSMITH_ADDR       = ":8081"
     KEYSMITH_STORE_PATH = "/data/keys.json"
+
+    # The keystore already on the EFS access point is a version 1 document, and
+    # v1 leaves the key lifecycle metadata outside the AEAD, so keysmithd now
+    # refuses to load it without this opt-in. Without the variable the task exits
+    # before binding, and stop_before_start below means the healthy task is gone
+    # first: keysmith is the platform's only signer, so that is a total token and
+    # JWKS outage, not a rolling-deploy failure.
+    #
+    # REMOVE THIS IN THE NEXT DEPLOY. The first start rewrites /data/keys.json at
+    # v2 and every later start logs a warning while the variable is still set —
+    # it holds the downgrade window open, in which a retained pre-upgrade copy of
+    # the file can be replayed with forged lifecycle state.
+    KEYSMITH_KEYSTORE_MIGRATE_V1 = "1"
   }
   secrets = {
     KEYSMITH_MASTER_KEY    = "${local.ssm}/keysmith/KEYSMITH_MASTER_KEY"
@@ -451,13 +464,17 @@ module "bridge" {
   env = {
     BRIDGE_ADDR     = ":8080"
     BRIDGE_BASE_URL = "https://sso.${var.domain}"
-    # Relying applications, "id=https://host/callback" comma-separated. Without
-    # at least one, /login/{provider}?app=X is a silent 400 for every X and
-    # assertion delivery — the whole point of bridge — is unreachable in the
-    # deployed stack. Placeholder host: point it at a real relying app when one
-    # exists. bridged validates this at STARTUP, so a typo here is a
-    # crash-loop, not a request-time 400 — review the plan before applying.
-    BRIDGE_APPS = "demo-app=https://app.example.com/sso/callback"
+    # BRIDGE_APPS ("id=https://host/callback,…") is deliberately UNSET here.
+    # Registering an app makes /login/{provider}?app=id reachable, and
+    # deliverAssertion redirects the browser to that callback with the signed
+    # assertion — subject, email, email_verified, name — in the QUERY STRING.
+    # A placeholder host is therefore not inert: it ships a real user's
+    # identity to whoever operates it, in their access log and every
+    # intermediary's. example.com is IANA-operated and resolves, so it is the
+    # worst possible choice. Unset, every ?app= is a 400 and nothing leaks.
+    # Add this in the same change that brings up the first real relying app,
+    # pointed at a host this account owns. bridged validates it at STARTUP, so
+    # a typo is a crash-loop, not a request-time 400 — review the plan first.
   }
   secrets = {
     BRIDGE_HMAC_KEY             = "${local.ssm}/bridge/BRIDGE_HMAC_KEY"

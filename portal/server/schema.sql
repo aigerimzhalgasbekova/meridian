@@ -25,19 +25,20 @@ CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions (user_id);
 CREATE TABLE IF NOT EXISTS one_time_tokens (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    purpose    TEXT NOT NULL CHECK (purpose IN ('password_reset', 'verify_email', 'undo_totp')),
+    purpose    TEXT NOT NULL CHECK (purpose IN ('password_reset', 'verify_email', 'undo_totp', 'undo_email')),
     token_hash TEXT NOT NULL UNIQUE,    -- SHA-256; raw tokens never stored
-    payload    TEXT,                    -- verify_email: the address being verified
+    payload    TEXT,                    -- verify_email: the address being verified; undo_email: the address to restore
     expires_at TIMESTAMPTZ NOT NULL,
     used_at    TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ott_user_purpose_idx ON one_time_tokens (user_id, purpose) WHERE used_at IS NULL;
 -- Existing installs keep the CHECK the CREATE TABLE above gave them, which
--- predates 'undo_totp' and would reject every one of those inserts. Widen it.
+-- predates 'undo_totp'/'undo_email' and would reject every one of those
+-- inserts. Widen it; re-running is a no-op.
 ALTER TABLE one_time_tokens DROP CONSTRAINT IF EXISTS one_time_tokens_purpose_check;
 ALTER TABLE one_time_tokens ADD CONSTRAINT one_time_tokens_purpose_check
-    CHECK (purpose IN ('password_reset', 'verify_email', 'undo_totp'));
+    CHECK (purpose IN ('password_reset', 'verify_email', 'undo_totp', 'undo_email'));
 
 CREATE TABLE IF NOT EXISTS recovery_codes (
     user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -123,6 +124,15 @@ func OpenFileStore(ctx context.Context, path string, kek KEK) (*FileStore, error
 		return nil, fmt.Errorf("keystore: %s is a version %d document whose lifecycle metadata is unauthenticated; "+
 			"start once with %s=1 to upgrade it to v%d, then remove the variable",
 			path, doc.Version, migrateEnvVar, fileVersion)
+	}
+	if doc.Version == fileVersion && os.Getenv(migrateEnvVar) == "1" {
+		// The migration deploy has to set the variable (terraform does), and the
+		// deploy after it has to drop it. Forgetting is silent otherwise: the
+		// downgrade window just stays open. Refusing to start would trade the
+		// window for an outage, so it alarms instead.
+		slog.Warn("keysmith keystore migration opt-in is still enabled; remove it",
+			"var", migrateEnvVar, "path", path, "version", doc.Version,
+			"risk", "a retained pre-upgrade copy of this file can be replayed with forged lifecycle state")
 	}
 	s.gen = doc.Generation
 	for _, rec := range doc.Keys {
@@ -282,6 +292,13 @@ func (s *FileStore) persist(ctx context.Context) error {
 	if err := os.Rename(tmp.Name(), s.path); err != nil {
 		return err
 	}
+	// A document carrying `next` now exists on disk, so the counter advances here
+	// and not after the fsync below: if the fsync fails the caller rolls its
+	// in-memory mutation back and the next write would otherwise seal a
+	// *different* record set under the same generation. Two documents sharing a
+	// generation is exactly the splice the generation exists to prevent — a gap
+	// in the sequence is harmless, reuse is not.
+	s.gen = next
 	// The file's contents are fsynced above; the directory entry that points at
 	// them is not, and that is the half that decides whether the rename is
 	// visible after a crash. Without this, Put/Update report a key durable that
@@ -294,14 +311,7 @@ func (s *FileStore) persist(ctx context.Context) error {
 		d.Close()
 		return err
 	}
-	if err := d.Close(); err != nil {
-		return err
-	}
-	// Only now is the new generation the one on disk; a failed persist must not
-	// advance it, or the next write would seal records under a generation the
-	// document never carried.
-	s.gen = next
-	return nil
+	return d.Close()
 }
 
 func (s *FileStore) Put(ctx context.Context, k Key) error {

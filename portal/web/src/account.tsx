@@ -7,16 +7,20 @@ export function Profile() {
   const [email, setEmail] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  // The login address is the root of every mailed recovery path, so moving it
+  // re-authenticates with the password — a stolen cookie alone must not.
+  const [password, setPassword] = useState('');
 
   if (!me) return null;
 
   const changeEmail = (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    api('POST', '/api/account/email', { email })
+    api('POST', '/api/account/email', { email, password })
       .then(async () => {
-        setNotice(`Verification sent to ${email}. Your current address stays active until it is confirmed.`);
+        setNotice(`Verification sent to ${email}. Your current address stays active until it is confirmed, and is told when it is.`);
         setEmail('');
+        setPassword('');
         setMe(await fetchMe());
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
@@ -46,6 +50,16 @@ export function Profile() {
         {error && <p className="error">{error}</p>}
         {notice && <p className="notice">{notice}</p>}
         <label>New address <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
+        <label>
+          Confirm your password
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+            autoComplete="current-password"
+          />
+        </label>
         <button>Send verification</button>
       </form>
       <hr />

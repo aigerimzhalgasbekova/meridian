@@ -53,8 +53,11 @@ with signer services (idp), verifiers (every other service), and operators.
   generation in an SSM parameter, or the KMS encryption context once the KMS
   KEK lands, and a refusal to open below the anchored value. **Deployment
   requirement:** upgrading an existing version 1 keystore takes one start with
-  `KEYSMITH_KEYSTORE_MIGRATE_V1=1` in the task environment; remove the variable
-  afterwards, or the downgrade path stays open.
+  `KEYSMITH_KEYSTORE_MIGRATE_V1=1` in the task environment — the dev env sets it
+  (`platform/terraform/envs/dev/main.tf`, keysmith `env`) for the deploy that
+  ships v2. Remove it in the next deploy or the downgrade path stays open;
+  keysmithd logs a warning on every start while it is set on an already-v2
+  store, since refusing to start would trade the window for a signing outage.
 - **Single-writer file store.** No coordination for multi-node keysmith. The
   store now refuses to open if another process holds the lock, so the failure
   is loud instead of silent key loss — but it is a *startup* failure, and

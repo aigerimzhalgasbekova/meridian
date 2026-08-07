@@ -67,9 +67,11 @@ deliberate: the control plane is the first consumer of its own product.
 
 Every mutation attempt — allowed or denied — lands in the audit trail (`GET /v1/audit`),
 and `allowed: true` means the change actually landed: the denial is recorded at the
-gate, the success only after the store confirms the mutation. The one attempt that
-appends nothing is an authorized probe at a target that does not exist — nothing
-happened, and that caller could already have acted on any target.
+gate, the success only after the store confirms the mutation. The gap is the
+authorized attempt that then fails — an unknown role in an assignment (400), a
+built-in role deletion (409), a probe at a target that does not exist (404),
+a target that vanishes before the write (404). Nothing happened, so nothing is
+appended; the trail records outcomes, not intents.
 
 ## API
 

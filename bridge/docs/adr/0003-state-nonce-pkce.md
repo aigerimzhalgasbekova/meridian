@@ -63,11 +63,14 @@ everything from it:
   bytes. That log line is the only place replay, tamper, expiry and hijack are
   distinguishable, so it is a required part of the design, not decoration.
 - Expired flows are swept opportunistically on `Begin` — no background
-  goroutine to leak — but at most once every 30s, and the table is capped
-  (`maxFlows`, then `ErrTooBusy` → 503). `/login/{provider}` is
-  unauthenticated: sweeping the whole map on every call makes each request
-  O(live flows) under one mutex, which turns an anonymous flood into quadratic
-  work, and an uncapped map turns it into unbounded memory.
+  goroutine to leak — but at most once every 30s, and the table is capped at
+  `maxFlows`. `/login/{provider}` is unauthenticated: sweeping the whole map on
+  every call makes each request O(live flows) under one mutex, which turns an
+  anonymous flood into quadratic work, and an uncapped map turns it into
+  unbounded memory. A full table evicts a random existing flow rather than
+  refusing the new one: refusing lets anyone buy a `maxFlows`-long global login
+  outage for the price of `maxFlows` plain GETs, whereas under eviction the
+  flood overwhelmingly evicts its own flows and everyone else keeps signing in.
 
 ## Alternatives considered
 
