@@ -26,9 +26,10 @@ locally against its JWKS (everyone else).
    beats importing a general-purpose library here.
 
 3. **Envelope encryption with a KMS-shaped seam.** Per-key DEKs under a
-   wrap/unwrap KEK interface; GCM AAD binds ciphertexts to key identity, so a
-   record-shuffling attacker produces integrity failures, not key confusion.
-   See [ADR 0002](docs/adr/0002-envelope-encryption.md).
+   wrap/unwrap KEK interface; GCM AAD binds ciphertexts to key identity *and
+   lifecycle position*, so neither a record-shuffling attacker nor one editing
+   the plaintext state field gets key confusion or a resurrected retired key —
+   they get integrity failures. See [ADR 0002](docs/adr/0002-envelope-encryption.md).
 
 ## Layout
 
@@ -50,7 +51,8 @@ cmd/keysmithd/  the daemon
 | `POST /v1/verify` | signer token | Convenience verification (coarse failure reasons) |
 | `GET /v1/keys` | admin token | Key metadata (never private material) |
 | `POST /v1/keys/generate` | admin token | Create a pending key |
-| `POST /v1/keys/{id}/promote` | admin token | Promote (dwell-gated; `force` for emergencies) |
+| `POST /v1/keys/{id}/promote` | admin token | Promote (dwell-gated; `force` for an urgent scheduled rotation) |
+| `POST /v1/keys/{id}/revoke` | admin token | Compromise response: unpublish now and promote a successor; `reason` required and audited |
 
 ## Run it
 

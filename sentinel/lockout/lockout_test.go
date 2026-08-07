@@ -27,11 +27,14 @@ func (c *clock) advance(d time.Duration) {
 }
 
 var testPolicy = Policy{
-	Threshold:  3,
-	BaseLock:   time.Minute,
-	AccountCap: 4 * time.Minute,
-	IPCap:      time.Hour,
-	FailWindow: time.Hour,
+	Threshold: 3,
+	// Same as Threshold so the two-dimension tests below stay readable; the
+	// production default is 10x Threshold (see Policy.IPThreshold).
+	IPThreshold: 3,
+	BaseLock:    time.Minute,
+	AccountCap:  4 * time.Minute,
+	IPCap:       time.Hour,
+	FailWindow:  time.Hour,
 }
 
 func failN(t *Tracker, account, ip string, n int) {
@@ -145,6 +148,87 @@ func TestSuccessResetsOnlyWhenUnlocked(t *testing.T) {
 	d := tr.Check("alice", "1.1.1.1")
 	if !d.Locked || d.RetryAfter != time.Minute {
 		t.Fatalf("escalation not reset by success: %+v", d)
+	}
+}
+
+// A sprayer used to reset their own IP counter by logging into an account
+// they control: Success deleted the whole IP entry, so the IP dimension —
+// the one ADR 0002 added to catch "one host, many accounts" — never reached
+// its threshold no matter how many victims were walked.
+func TestIPDimensionSurvivesInterleavedSuccess(t *testing.T) {
+	c := newClock()
+	tr := New(testPolicy, c.now)
+
+	for i := 0; i < 10; i++ {
+		tr.Fail(fmt.Sprintf("victim-%d", i), "10.0.0.1")
+		tr.Success("attacker-own-account", "10.0.0.1")
+	}
+	if d := tr.Check("someone-else", "10.0.0.1"); !d.Locked || d.Dimension != IP {
+		t.Fatalf("sprayed IP not locked after interleaved successes: %+v", d)
+	}
+}
+
+// The flip side: an office NAT where real users occasionally fumble a
+// password must not lock its whole egress. The IP threshold is 10x the
+// account one for exactly this reason.
+func TestSharedEgressDoesNotSelfLock(t *testing.T) {
+	c := newClock()
+	policy := Policy{Threshold: 5} // IPThreshold defaults to 50
+	tr := New(policy, c.now)
+
+	// 40 users, one fumbled password each, each followed by a success.
+	for i := 0; i < 40; i++ {
+		acct := fmt.Sprintf("employee-%d", i)
+		tr.Fail(acct, "198.51.100.7")
+		tr.Success(acct, "198.51.100.7")
+	}
+	if d := tr.Check("employee-41", "198.51.100.7"); d.Locked {
+		t.Fatalf("shared egress locked itself out on normal traffic: %+v", d)
+	}
+}
+
+// The IP counter is never cleared by a success, so it stays bounded only if
+// the counting window actually rolls. Keying the reset off `touched` — which
+// every failure refreshes — makes it monotonic instead: an office NAT that
+// fumbles 40 passwords an hour crosses IPThreshold (50) partway through the
+// second hour and, since lockLevel never decays either, escalates to a 24h
+// lock and stays there. Sustained sub-threshold traffic must never lock.
+func TestSharedEgressSurvivesSustainedTraffic(t *testing.T) {
+	c := newClock()
+	tr := New(Policy{Threshold: 5}, c.now) // IPThreshold 50, FailWindow 1h
+	const perHour = 40                     // below IPThreshold, sustained forever
+
+	for hour := 0; hour < 72; hour++ {
+		for i := 0; i < perHour; i++ {
+			acct := fmt.Sprintf("employee-%d", i)
+			tr.Fail(acct, "198.51.100.7")
+			tr.Success(acct, "198.51.100.7")
+			c.advance(time.Hour / perHour)
+			if d := tr.Check("employee-0", "198.51.100.7"); d.Locked {
+				t.Fatalf("shared egress locked itself out at hour %d: %+v", hour, d)
+			}
+		}
+	}
+
+	// Escalation decays with the window too: a key that keeps seeing traffic
+	// (so it is never swept as stale) but goes a full window without locking
+	// starts over at BaseLock, instead of resuming yesterday's exponent.
+	c2 := newClock()
+	tr2 := New(testPolicy, c2.now) // Threshold 3, BaseLock 1m, FailWindow 1h
+	failN(tr2, "alice", "1.1.1.1", testPolicy.Threshold)
+	if d := tr2.Check("alice", "1.1.1.1"); d.RetryAfter != time.Minute {
+		t.Fatalf("first lock = %v, want 1m", d.RetryAfter)
+	}
+	for i := 0; i < 4; i++ { // 2h of one failure per 30m: sub-threshold, never stale
+		c2.advance(30 * time.Minute)
+		tr2.Fail("alice", "1.1.1.1")
+		if d := tr2.Check("alice", "1.1.1.1"); d.Locked {
+			t.Fatalf("sub-threshold trickle locked the account: %+v", d)
+		}
+	}
+	failN(tr2, "alice", "1.1.1.1", testPolicy.Threshold)
+	if d := tr2.Check("alice", "1.1.1.1"); !d.Locked || d.RetryAfter != testPolicy.BaseLock {
+		t.Fatalf("escalation did not decay after a quiet window: %+v", d)
 	}
 }
 

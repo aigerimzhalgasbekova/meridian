@@ -247,6 +247,23 @@ resource "aws_ecs_service" "this" {
   deployment_minimum_healthy_percent = var.stop_before_start ? 0 : 100
   deployment_maximum_percent         = var.stop_before_start ? 100 : 200
 
+  # stop_before_start deliberately removes the "old task keeps serving" safety
+  # net, so a bad image is a hard outage that ECS retries forever. The breaker
+  # puts an automatic rollback back in its place. On the 100/200 path it costs
+  # nothing and still shortens a failed deploy. Requires the default ECS
+  # deployment controller, which is what this module uses.
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  # idp migrates its schema before it can answer /healthz, and the target group
+  # marks a target unhealthy ~45s after registration (15s x 3). Without a grace
+  # period a slow migration — a cold RDS after resume.sh, a lock wait — gets the
+  # task killed mid-migration and the replacement starts the same one over.
+  # Only valid on load-balanced services; ECS rejects it otherwise.
+  health_check_grace_period_seconds = var.alb == null ? null : 120
+
   network_configuration {
     subnets          = var.subnet_ids
     security_groups  = [aws_security_group.this.id]
@@ -268,7 +285,20 @@ resource "aws_ecs_service" "this" {
 
   lifecycle {
     # CI deploys new task definition revisions; don't fight it on apply.
-    ignore_changes = [task_definition]
+    # desired_count is runtime-owned too: autoscaling writes it continuously,
+    # and scripts/pause.sh sets it to 0 — without this, the next apply silently
+    # un-pauses the stack (services resume against a stopped RDS and bill).
+    ignore_changes = [task_definition, desired_count]
+
+    # An EFS-mounted task holds an exclusive file (keysmith flocks its
+    # keystore, sentinel its audit chain). On the default 100/200 deploy the
+    # replacement starts while the old task still holds the lock: a
+    # crash-looping deploy at best, a lost write at worst. Fail the plan
+    # rather than let a new EFS service be added without the pairing.
+    precondition {
+      condition     = var.efs == null || var.stop_before_start
+      error_message = "A service mounting EFS holds an exclusive file and must set stop_before_start = true."
+    }
   }
 }
 
@@ -280,6 +310,11 @@ resource "aws_appautoscaling_target" "this" {
   scalable_dimension = "ecs:service:DesiredCount"
   min_capacity       = var.min_count
   max_capacity       = var.max_count
+
+  lifecycle {
+    # scripts/pause.sh drops the floor to 0; an apply must not raise it back.
+    ignore_changes = [min_capacity]
+  }
 }
 
 resource "aws_appautoscaling_policy" "cpu" {

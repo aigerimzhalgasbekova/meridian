@@ -27,6 +27,12 @@ services need no instrumentation:
 - **Dashboard** `meridian-dev`: per exposed service p99 `TargetResponseTime` +
   5xx count; per service ECS CPU.
 - **Alarms → SNS** (email subscription optional):
+  - `HealthyHostCount` < 1 for 3 min (per exposed service) — the down-detector.
+    Every other alarm below watches a metric that only exists while a task is
+    registered and treats missing data as OK, so a service at zero tasks would
+    otherwise be silent. This is the one alarm with
+    `treat_missing_data = "breaching"`, which is why `scripts/pause.sh`
+    disables just these for the duration of a pause and `resume.sh` re-arms them.
   - 5xx from targets ≥ 10 / 5 min (per exposed service)
   - `UnHealthyHostCount` ≥ 1 for 3 min
   - p99 latency > 1.5 s over 2×5 min

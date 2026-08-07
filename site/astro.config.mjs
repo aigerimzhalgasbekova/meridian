@@ -1,15 +1,12 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 
-// Deploy targets:
-//  - S3 + CloudFront (pending AWS credentials): leave `base` unset, `site` is
-//    the CloudFront/custom domain.
-//  - GitHub Pages (works today): if publishing to
-//    https://aikazzh.github.io/portfolio/, set base: '/portfolio' and
-//    site: 'https://aikazzh.github.io'. All internal links use
-//    import.meta.env.BASE_URL so they survive a base-path change.
+// Deployed to S3 + CloudFront under the apex domain — see
+// platform/terraform/envs/dev/site.tf (`aliases = [var.domain, "www.…"]`).
+// `site` is the canonical origin: keep it in sync with that domain, because a
+// sitemap or <link rel="canonical"> added later reads it. All internal links
+// use import.meta.env.BASE_URL, so a subpath deploy only needs `base` set.
 export default defineConfig({
-  site: 'https://aikazzh.github.io',
-  // base: '/portfolio',
+  site: 'https://iammeridian.cc',
   output: 'static',
 });

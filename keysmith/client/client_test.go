@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -242,6 +243,113 @@ func TestUnknownKidRefreshIsThrottled(t *testing.T) {
 	_, _ = f.client.Verify(ctx, forged, jose.Expect{})
 	if got := f.jwksHits.Load() - before; got != 2 {
 		t.Errorf("fetches after the window: %d, want 2 — the throttle must not wedge rotation", got)
+	}
+}
+
+// TestUnknownKidRefreshBound pins the *cost* of the throttle, which the
+// amplification test above does not: an unknown kid arriving inside the window
+// is refused a refresh whatever kid claimed the slot, so a legitimate token
+// signed by a brand-new key is rejected for up to unknownKidInterval after an
+// emergency (forced) rotation. That bound is the documented trade-off; this
+// test exists so nobody widens it by accident.
+func TestUnknownKidRefreshBound(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	warm, err := f.client.Sign(ctx, SignRequest{Claims: jose.Claims{Subject: "a"}, TTLSeconds: 3000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.client.Verify(ctx, warm, jose.Expect{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// An attacker burns the refresh slot with a kid that will never exist…
+	junk := forgeUnknownKid(t, warm)
+	if _, err := f.client.Verify(ctx, junk, jose.Expect{}); err == nil {
+		t.Fatal("a token with an unknown kid must not verify")
+	}
+	// …and only then does the emergency rotation happen.
+	k, err := f.manager.Generate(ctx, jose.AlgEdDSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.manager.Promote(ctx, k.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := f.client.Sign(ctx, SignRequest{Claims: jose.Claims{Subject: "b"}, TTLSeconds: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.client.Verify(ctx, fresh, jose.Expect{}); !errors.Is(err, jose.ErrUnknownKey) {
+		t.Fatalf("inside the window the new key is not yet learned: got %v", err)
+	}
+
+	// One interval later it resolves, even with the attacker still firing.
+	f.clock.Advance(unknownKidInterval)
+	if _, err := f.client.Verify(ctx, junk, jose.Expect{}); err == nil {
+		t.Fatal("junk token verified")
+	}
+	f.clock.Advance(unknownKidInterval)
+	if _, err := f.client.Verify(ctx, fresh, jose.Expect{}); err != nil {
+		t.Fatalf("post-rotation token still rejected %v after the rotation: %v", 2*unknownKidInterval, err)
+	}
+}
+
+func TestClientReportsStaleKeys(t *testing.T) {
+	// Serving stale keys is deliberate; serving them silently is not —
+	// unpublication is the only revocation there is, so an operator needs a
+	// signal and an age to alert on.
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	f := newFixture(t)
+	ctx := context.Background()
+	token, err := f.client.Sign(ctx, SignRequest{Claims: jose.Claims{Subject: "a"}, TTLSeconds: 3600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.client.Verify(ctx, token, jose.Expect{}); err != nil {
+		t.Fatal(err)
+	}
+	if age := f.client.KeysAge(); age != 0 {
+		t.Errorf("KeysAge right after a fetch = %v, want 0", age)
+	}
+
+	f.clock.Advance(50 * time.Minute)
+	f.client.baseURL = "http://127.0.0.1:1" // keysmith is unreachable
+	for range 3 {
+		if _, err := f.client.Verify(ctx, token, jose.Expect{}); err != nil {
+			t.Fatalf("stale-if-error failed: %v", err)
+		}
+	}
+	if age := f.client.KeysAge(); age != 50*time.Minute {
+		t.Errorf("KeysAge = %v, want 50m", age)
+	}
+	if n := strings.Count(logs.String(), "serving stale JWKS"); n != 1 {
+		t.Errorf("%d stale warnings for 3 stale verifies, want exactly 1", n)
+	}
+}
+
+func TestParseMaxAge(t *testing.T) {
+	cases := []struct {
+		header string
+		want   time.Duration
+	}{
+		{"public, max-age=300", 5 * time.Minute},
+		// An explicit zero means revalidate every time, not "no opinion".
+		{"public, max-age=0", 0},
+		// A year from a rewriting intermediary must not pin the cache past
+		// the pending dwell.
+		{"public, max-age=31536000", maxJWKSMaxAge},
+		{"no-cache", time.Minute},
+		{"max-age=banana", time.Minute},
+	}
+	for _, tc := range cases {
+		if got := parseMaxAge(tc.header, time.Minute); got != tc.want {
+			t.Errorf("parseMaxAge(%q) = %v, want %v", tc.header, got, tc.want)
+		}
 	}
 }
 

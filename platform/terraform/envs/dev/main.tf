@@ -94,7 +94,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
     status = "Enabled"
     filter {}
     expiration {
-      days = 90
+      # Access-log records carry the full request line, and portal mails
+      # single-use reset/verify tokens as query parameters — so this bucket is
+      # credential-adjacent (see THREAT_MODEL asset 6). Two weeks is enough for
+      # forensics on a dev stack and bounds the window. The root fix is
+      # portal-side (POST or URL fragment instead of a query parameter).
+      days = 14
     }
   }
 }
@@ -297,6 +302,13 @@ module "keysmith" {
     container_path  = "/data"
   }
 
+  # keysmithd flocks <store>.lock for the process lifetime, so the replacement
+  # task cannot boot while the old one is running: the default 100/200 rolling
+  # deploy would crash-loop every release. (The flock is only cross-host if the
+  # mount forwards locks — Fargate-managed EFS mounts do; no mount option here
+  # sets local_lock, and efs_volume_configuration above exposes none.)
+  stop_before_start = true
+
   # The keystore file assumes a single writer.
   # ponytail: pin to one task; multi-writer needs a shared-store keysmith backend.
   desired_count = 1
@@ -329,8 +341,11 @@ module "idp" {
     # = "append", so the last X-Forwarded-For hop cannot be forged.
     IDP_TRUST_PROXY = "1"
     # Demo deployment: provision the demo realm/users/clients idempotently on
-    # boot so the public instance has something to show. Drop for a real IdP.
-    IDP_SEED_DEMO = "1"
+    # boot so the public instance has something to show. The credentials are
+    # published (scripts/live-smoke.sh), so this is a demonstration surface —
+    # it routes through the profile flag like every other dev/prod difference
+    # rather than being a standalone knob someone must remember to flip.
+    IDP_SEED_DEMO = local.is_prod ? "0" : "1"
   }
   secrets = {
     # IDP_KEYSMITH_TOKEN must be one of keysmith's KEYSMITH_SIGNER_TOKENS.
@@ -436,6 +451,13 @@ module "bridge" {
   env = {
     BRIDGE_ADDR     = ":8080"
     BRIDGE_BASE_URL = "https://sso.${var.domain}"
+    # Relying applications, "id=https://host/callback" comma-separated. Without
+    # at least one, /login/{provider}?app=X is a silent 400 for every X and
+    # assertion delivery — the whole point of bridge — is unreachable in the
+    # deployed stack. Placeholder host: point it at a real relying app when one
+    # exists. bridged validates this at STARTUP, so a typo here is a
+    # crash-loop, not a request-time 400 — review the plan before applying.
+    BRIDGE_APPS = "demo-app=https://app.example.com/sso/callback"
   }
   secrets = {
     BRIDGE_HMAC_KEY             = "${local.ssm}/bridge/BRIDGE_HMAC_KEY"

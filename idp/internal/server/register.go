@@ -42,8 +42,12 @@ type registrationRequest struct {
 }
 
 // registrationScopes is the allowlist a dynamically registered client may be
-// granted; it matches the default assigned when none are requested.
-var registrationScopes = oauth.Scopes{oauth.ScopeOpenID, oauth.ScopeProfile, oauth.ScopeEmail}
+// granted. offline_access is in the allowlist but NOT in the default below, so
+// a client must ask for it — without it the refresh_token grant this endpoint
+// advertises by default could never actually be exercised.
+var registrationScopes = oauth.Scopes{
+	oauth.ScopeOpenID, oauth.ScopeProfile, oauth.ScopeEmail, oauth.ScopeOfflineAccess,
+}
 
 var allowedGrantTypes = map[string]bool{
 	"authorization_code": true,

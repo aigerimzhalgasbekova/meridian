@@ -175,6 +175,12 @@ func TestSignValidation(t *testing.T) {
 		{"client-supplied exp", map[string]any{
 			"claims": map[string]any{"sub": "x", "exp": 9999999999}, "ttl_seconds": 60,
 		}, http.StatusBadRequest},
+		// nbf is the third registered temporal claim and equally a lie about
+		// when the token is usable: a client-chosen nbf lands after the
+		// server-set exp, minting a credential that is never valid.
+		{"client-supplied nbf", map[string]any{
+			"claims": map[string]any{"sub": "x", "nbf": 9999999999}, "ttl_seconds": 60,
+		}, http.StatusBadRequest},
 		{"unsupported alg", map[string]any{
 			"claims": map[string]any{"sub": "x"}, "ttl_seconds": 60, "alg": "HS256",
 		}, http.StatusBadRequest},
@@ -312,5 +318,86 @@ func TestServiceConfigCrossValidation(t *testing.T) {
 	// JWKS cache longer than half the dwell defeats pre-publication.
 	if _, err := New(manager, ksCfg, Config{JWKSMaxAge: 6 * time.Minute}); err == nil {
 		t.Error("JWKSMaxAge > PendingDwell/2 accepted")
+	}
+	// The default algorithm must be one the manager actually maintains a key
+	// for, or /healthz and every default-alg sign 503 forever after a clean
+	// boot. keysmithd never sets DefaultAlg, so EdDSA vs KEYSMITH_ALGS=ES256
+	// is one environment variable away.
+	esCfg := ksCfg
+	esCfg.Algorithms = []jose.Algorithm{jose.AlgES256}
+	esManager, err := keystore.NewManager(keystore.NewMemoryStore(), esCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(esManager, esCfg, Config{}); err == nil {
+		t.Error("DefaultAlg outside the keystore algorithms accepted")
+	}
+
+	// The invariants are checked against the manager's own config, not a
+	// value the caller passes alongside it — otherwise the "proof by
+	// construction" has a free variable.
+	lie := ksCfg
+	lie.RetireAfter = 24 * time.Hour
+	if _, err := New(manager, lie, Config{MaxTokenTTL: 2 * time.Hour}); err == nil {
+		t.Error("MaxTokenTTL validated against a caller-supplied config the manager does not hold")
+	}
+}
+
+func TestAdminRevoke(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	compromised, err := f.manager.SigningKey(ctx, jose.AlgEdDSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := jose.Sign([]byte(`{"sub":"root"}`), compromised)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A reason is mandatory: it is the audit record of why a key was killed.
+	resp, _ := f.do(t, "POST", "/v1/keys/"+compromised.ID+"/revoke", adminToken, map[string]any{})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("revoke without a reason: %d, want 400", resp.StatusCode)
+	}
+	resp, raw := f.do(t, "POST", "/v1/keys/"+compromised.ID+"/revoke", adminToken,
+		map[string]any{"reason": "private key leaked"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke: %d: %s", resp.StatusCode, raw)
+	}
+
+	// The key is gone from the JWKS now, not RetireAfter from now.
+	_, raw = f.do(t, "GET", "/.well-known/jwks.json", "", nil)
+	if strings.Contains(string(raw), compromised.ID) {
+		t.Error("revoked key still published in the JWKS")
+	}
+	// And tokens it signed no longer verify.
+	_, raw = f.do(t, "POST", "/v1/verify", signerToken, map[string]any{"token": token})
+	var verified struct {
+		Valid bool `json:"valid"`
+	}
+	if err := json.Unmarshal(raw, &verified); err != nil {
+		t.Fatal(err)
+	}
+	if verified.Valid {
+		t.Error("a token signed by the revoked key still verifies")
+	}
+	// Containment, not an outage: signing still works.
+	resp, raw = f.do(t, "POST", "/v1/sign", signerToken, signBody(map[string]any{"sub": "x"}, 60))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sign after revoke: %d: %s", resp.StatusCode, raw)
+	}
+
+	resp, _ = f.do(t, "POST", "/v1/keys/"+compromised.ID+"/revoke", adminToken, map[string]any{"reason": "again"})
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("double revoke: %d, want 409", resp.StatusCode)
+	}
+	resp, _ = f.do(t, "POST", "/v1/keys/ghost/revoke", adminToken, map[string]any{"reason": "x"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("ghost revoke: %d, want 404", resp.StatusCode)
+	}
+	resp, _ = f.do(t, "POST", "/v1/keys/"+compromised.ID+"/revoke", signerToken, map[string]any{"reason": "x"})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("revoke with a signer token: %d, want 401", resp.StatusCode)
 	}
 }

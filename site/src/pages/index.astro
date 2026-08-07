@@ -3,10 +3,15 @@ import { getCollection } from 'astro:content';
 import Base from '../layouts/Base.astro';
 import ArchDiagram from '../components/ArchDiagram.astro';
 import ProjectCard from '../components/ProjectCard.astro';
-import { GITHUB_REPO } from '../config';
+import { GITHUB_REPO, demoUrls } from '../config';
 
 const projects = (await getCollection('projects')).sort((a, b) => a.data.order - b.data.order);
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+// The callout is derived from demoUrls so filling those in stays the only edit
+// (site/README.md's "no other edits" contract) instead of leaving stale prose.
+const liveDemos = Object.entries(demoUrls)
+  .filter(([, url]) => url)
+  .map(([name]) => name);
 ---
 
 <Base title="Meridian — an IAM platform built as 7 interlocking projects">
@@ -45,11 +50,22 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
         ))
       }
     </ul>
-    <p class="callout pending" style="margin-top: 1.5rem;">
-      <strong>Live demos are pending an AWS account.</strong> Everything is built deploy-ready (each service runs
-      locally with <code>make run-dev</code> / <code>npm run dev</code>); demo links activate when credentials
-      arrive. Until then, each card links to the code, README, and threat model — the parts a reviewer actually
-      reads first.
+    <p class:list={['callout', { pending: liveDemos.length === 0 }]} style="margin-top: 1.5rem;">
+      {
+        liveDemos.length > 0 ? (
+          <Fragment>
+            <strong>Live demos are up</strong> for {liveDemos.join(', ')}. The rest have no public endpoint by
+            design — they are reachable only inside the VPC, which is itself part of the story.
+          </Fragment>
+        ) : (
+          <Fragment>
+            <strong>Live demos are pending an AWS account.</strong> Everything is built deploy-ready (each service
+            runs locally with <code>make run-dev</code> / <code>npm run dev</code>); demo links activate when
+            credentials arrive.
+          </Fragment>
+        )
+      }
+      {' '}Each card also links to the code, README, and threat model — the parts a reviewer actually reads first.
     </p>
   </section>
 </Base>

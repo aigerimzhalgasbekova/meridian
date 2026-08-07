@@ -27,7 +27,8 @@ AWS-0164
 AWS-0095
 
 # ALB is internet-facing. That is the point — it fronts the public IdP, SSO,
-# portal, and console. WAFv2 and drop-invalid-header-fields are attached.
+# portal, and console. `drop_invalid_header_fields` is always on; WAFv2
+# attaches in the prod profile only (`count = local.cheap ? 0 : 1`).
 AWS-0053
 
 # S3 buckets (ALB access logs, site) use SSE-S3 (AES256) rather than a customer

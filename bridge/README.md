@@ -15,8 +15,11 @@ skipped issuer checks, unbound nonces, email-based account matching. With one:
 
 - **One integration point.** Apps receive a short-lived signed assertion with
   normalized claims (`sub` = stable bridge identity, `email`, `name`, `idp`,
-  `amr`) at their exact registered callback. Adding an upstream provider is a
-  bridge config change; no app changes.
+  `amr`) at their exact registered callback. Register them with
+  `BRIDGE_APPS=id=https://app.example.com/callback,…` (malformed or non-https
+  entries fail startup, not the first `?app=` request) and verify against
+  `GET /.well-known/jwks.json`. Adding an upstream provider is a bridge config
+  change; no app changes.
 - **One identity across providers.** JIT provisioning creates a local identity
   on first login; explicit linking ties multiple upstream accounts to it.
   Matching is by `(provider, subject)` — never by email
@@ -65,7 +68,10 @@ Details of the state/nonce/PKCE design:
   list, refusing to start without one. Covered by `TestEntraTenantedIssuer`.
 - **No account takeover via email reuse.** Login matching is
   `(provider, subject)` only. Same email from a second provider yields a
-  *separate* identity plus a visible linking offer — never an auto-merge.
+  *separate* identity and a visible collision notice — never an auto-merge.
+  (Linking is the pre-emptive remedy, available until that second provider is
+  first used to sign in; after that the pair is spoken for and nothing merges
+  it.)
 - **Linking requires fresh auth to both sides.** The current session's last
   upstream authentication must be recent (5 min), and the provider being
   linked is authenticated within the link flow itself. A stolen long-lived
@@ -110,9 +116,13 @@ local Ed25519 key, production plugs in a keysmith-backed signer (the shape of
 make run-dev    # BRIDGE_DEV_MODE=1: built-in fake upstreams, no accounts needed
 ```
 
-Open http://127.0.0.1:8083 — sign in via the built-in upstream, try the second
-upstream to see the email-collision handling, link the two, and hit
-`/?app=demo` to watch an assertion get delivered.
+Open http://127.0.0.1:8083 — sign in via the built-in upstream, then **link
+the second upstream from the account page** (linking must happen before the
+second provider is ever used to sign in; once it has its own identity, the
+`(provider, subject)` pair is spoken for and linking 409s by design — see
+[ADR 0001](docs/adr/0001-never-match-by-email.md)). Sign in via the second
+upstream from a fresh browser profile to see the email-collision handling
+instead. Then hit `/?app=demo` to watch an assertion get delivered.
 
 ```
 make test       # go test ./... -race

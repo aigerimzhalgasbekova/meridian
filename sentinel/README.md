@@ -80,6 +80,13 @@ a log with its tail lopped off is a valid prefix of a valid chain, so the walk
 alone reports it intact. A missing sidecar fails closed, because deleting it
 is exactly what an attacker who truncated the log would do.
 
+The sidecar catches truncation only **down to the last anchor**. Records after
+it are unvouched: they can be deleted, and fabricated records appended in their
+place, and both verifiers still report OK. Both tools (and
+`GET /v1/audit/verify`, as `unvouched_records`) print the size of that window —
+normally under `AnchorEvery` records. Closing it needs the external notary in
+[ADR 0003](docs/adr/0003-hash-chained-audit.md).
+
 ```sh
 python3 tools/compliance/verify_chain.py audit.jsonl   # exit 0 = intact
 python3 tools/compliance/report.py audit.jsonl [out.md]

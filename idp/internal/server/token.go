@@ -130,20 +130,28 @@ func (s *Server) grantAuthorizationCode(r *http.Request, realm storage.Realm, cl
 	if code == "" {
 		return nil, oauth.E(oauth.ErrInvalidRequest, "code is required")
 	}
-	ac, err := s.cfg.Store.AuthCodes().Consume(ctx, secrets.Hash(code), s.now())
-	switch {
-	case errors.Is(err, storage.ErrConsumed):
-		// Replay: revoke everything the first redemption issued (RFC 9700).
+	codeHash := secrets.Hash(code)
+	// Replay: revoke everything the first redemption issued (RFC 9700 §4.5.3).
+	replay := func(ac storage.AuthCode) *oauth.Error {
 		if ac.IssuedFamilyID != "" {
 			_ = s.cfg.Store.RefreshTokens().RevokeFamily(ctx, realm.Name, ac.IssuedFamilyID)
 		}
 		s.cfg.Logger.Warn("authorization code replay detected",
 			"realm", realm.Name, "client_id", ac.ClientID)
-		return nil, oauth.E(oauth.ErrInvalidGrant, "code already redeemed")
-	case err != nil:
+		return oauth.E(oauth.ErrInvalidGrant, "code already redeemed")
+	}
+
+	// Read without consuming: everything below up to Consume is either a
+	// rejection or a retryable remote call, so the code must stay spendable
+	// until the last possible moment (see the ordering note below).
+	ac, err := s.cfg.Store.AuthCodes().Get(ctx, realm.Name, codeHash)
+	if err != nil {
 		return nil, oauth.E(oauth.ErrInvalidGrant, "invalid or expired code")
 	}
-	if ac.ClientID != client.ClientID || ac.RealmName != realm.Name {
+	if ac.Used {
+		return nil, replay(ac)
+	}
+	if ac.ClientID != client.ClientID {
 		return nil, oauth.E(oauth.ErrInvalidGrant, "code was not issued to this client")
 	}
 	// redirect_uri must match the authorization request (§4.1.3) — but it is
@@ -174,11 +182,34 @@ func (s *Server) grantAuthorizationCode(r *http.Request, realm storage.Realm, cl
 		return nil, oauth.E(oauth.ErrInvalidGrant, "user unavailable")
 	}
 
-	return s.issueUserTokens(ctx, realm, client, user, ac.Scopes, ac.AuthTime, ac.Nonce, ac.CodeHash)
+	// Sign BEFORE consuming, for the same reason grantRefreshToken commits its
+	// rotation last: signing is a remote keysmith call, and a transient failure
+	// must leave the code redeemable so the client can retry — otherwise a
+	// keysmith blip sends the user back through the whole browser flow, and the
+	// retry is logged as a replay that revokes a family it never issued.
+	resp, oerr := s.signUserTokens(ctx, realm, client, user, ac.Scopes, ac.AuthTime, ac.Nonce)
+	if oerr != nil {
+		return nil, oerr
+	}
+	// Consume is the single atomic single-use point; the refresh family is only
+	// persisted after it, so a caller that loses the race leaves nothing behind.
+	ac, err = s.cfg.Store.AuthCodes().Consume(ctx, realm.Name, codeHash, s.now())
+	switch {
+	case errors.Is(err, storage.ErrConsumed):
+		return nil, replay(ac)
+	case err != nil:
+		return nil, oauth.E(oauth.ErrInvalidGrant, "invalid or expired code")
+	}
+	if oerr := s.attachRefreshToken(ctx, realm, client, user, ac.Scopes, ac.AuthTime, ac.Nonce, codeHash, resp); oerr != nil {
+		return nil, oerr
+	}
+	return resp, nil
 }
 
-// issueUserTokens mints the access/ID/refresh token set for a user grant.
-func (s *Server) issueUserTokens(ctx context.Context, realm storage.Realm, client storage.Client, user storage.User, scopes oauth.Scopes, authTime time.Time, nonce, codeHash string) (*tokenResponse, *oauth.Error) {
+// signUserTokens mints and signs the access token, plus the ID token for an
+// openid grant. Both are remote keysmith calls, so callers do this before their
+// irreversible single-use step.
+func (s *Server) signUserTokens(ctx context.Context, realm storage.Realm, client storage.Client, user storage.User, scopes oauth.Scopes, authTime time.Time, nonce string) (*tokenResponse, *oauth.Error) {
 	access, err := s.issuer.AccessToken(ctx, token.AccessTokenInput{
 		Realm: realm, ClientID: client.ClientID, UserID: user.ID,
 		Scopes: scopes, AuthTime: authTime,
@@ -204,18 +235,31 @@ func (s *Server) issueUserTokens(ctx context.Context, realm storage.Realm, clien
 		}
 		resp.IDToken = idt
 	}
-	if scopes.Has(oauth.ScopeOfflineAccess) {
-		plaintext, rt := token.NewRefreshToken(realm, client.ClientID, user.ID, scopes, authTime, nonce, s.now())
-		if err := s.cfg.Store.RefreshTokens().Create(ctx, rt); err != nil {
-			return nil, oauth.E(oauth.ErrServerError, "")
-		}
-		if codeHash != "" {
-			// Link code → family for replay revocation.
-			_ = s.cfg.Store.AuthCodes().MarkFamily(ctx, codeHash, rt.FamilyID)
-		}
-		resp.RefreshToken = plaintext
-	}
 	return resp, nil
+}
+
+// attachRefreshToken persists a fresh refresh-token family on resp when the
+// grant carries offline_access. codeHash, when non-empty, links the issuing
+// authorization code to the family so a replay can revoke it.
+func (s *Server) attachRefreshToken(ctx context.Context, realm storage.Realm, client storage.Client, user storage.User, scopes oauth.Scopes, authTime time.Time, nonce, codeHash string, resp *tokenResponse) *oauth.Error {
+	if !scopes.Has(oauth.ScopeOfflineAccess) {
+		return nil
+	}
+	plaintext, rt := token.NewRefreshToken(realm, client.ClientID, user.ID, scopes, authTime, nonce, s.now())
+	if err := s.cfg.Store.RefreshTokens().Create(ctx, rt); err != nil {
+		return oauth.E(oauth.ErrServerError, "")
+	}
+	if codeHash != "" {
+		// Link code → family for replay revocation. Not atomic with Create, so
+		// a failure here silently degrades that containment — log it rather
+		// than letting a security control fail without a trace.
+		if err := s.cfg.Store.AuthCodes().MarkFamily(ctx, realm.Name, codeHash, rt.FamilyID); err != nil {
+			s.cfg.Logger.Warn("code-family link failed; replay revocation degraded",
+				"realm", realm.Name, "client_id", client.ClientID, "family", rt.FamilyID, "err", err)
+		}
+	}
+	resp.RefreshToken = plaintext
+	return nil
 }
 
 func (s *Server) grantRefreshToken(r *http.Request, realm storage.Realm, client storage.Client) (*tokenResponse, *oauth.Error) {

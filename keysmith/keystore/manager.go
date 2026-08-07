@@ -46,7 +46,7 @@ type Config struct {
 // Event records a key lifecycle operation.
 type Event struct {
 	Time   time.Time         `json:"time"`
-	Op     string            `json:"op"` // generated | promoted | demoted | retired
+	Op     string            `json:"op"` // generated | promoted | demoted | retired | revoked
 	KeyID  string            `json:"key_id"`
 	Alg    jose.Algorithm    `json:"alg"`
 	Detail map[string]string `json:"detail,omitempty"`
@@ -57,6 +57,7 @@ var (
 	ErrNoActiveKey     = errors.New("keystore: no active key for algorithm")
 	ErrNotPending      = errors.New("keystore: key is not pending")
 	ErrDwellNotElapsed = errors.New("keystore: pending dwell has not elapsed")
+	ErrAlreadyRetired  = errors.New("keystore: key is already retired")
 )
 
 // Manager drives the key lifecycle over a Store. All mutations are serialized;
@@ -177,6 +178,7 @@ func (m *Manager) promoteLocked(ctx context.Context, id string, force bool) erro
 	if !force && hasActive && now.Sub(k.CreatedAt) < m.cfg.PendingDwell {
 		return fmt.Errorf("%w: %s remaining", ErrDwellNotElapsed, m.cfg.PendingDwell-now.Sub(k.CreatedAt))
 	}
+	prev := active
 	if hasActive {
 		active.State = StateRetiring
 		active.RetiringAt = now
@@ -188,11 +190,83 @@ func (m *Manager) promoteLocked(ctx context.Context, id string, force bool) erro
 	k.State = StateActive
 	k.PromotedAt = now
 	if err := m.store.Update(ctx, k); err != nil {
+		// The demotion already committed durably. Leaving it would strand the
+		// algorithm with no active key — every sign 503s — until the next Tick
+		// force-promotes, and that recovery bypasses the pending dwell. There
+		// is no transaction across the two writes, so compensate by hand.
+		if hasActive {
+			if rerr := m.store.Update(ctx, prev); rerr != nil {
+				m.emit("demote_rollback_failed", prev, map[string]string{"err": rerr.Error()})
+			}
+		}
 		return err
 	}
 	m.emit("promoted", k, nil)
 	return nil
 }
+
+// Revoke immediately unpublishes a key and, if it was the active signer,
+// promotes a successor in the same call.
+//
+// This is the containment for a confirmed private-key compromise, which the
+// ordinary lifecycle cannot express: demotion leaves the key published for
+// RetireAfter so that tokens it already signed keep verifying, but an attacker
+// holding the private half mints *new* tokens, so that window is their runway,
+// not a safety margin. Revocation drops the key from the JWKS now and accepts
+// that genuine in-flight tokens signed by it stop verifying.
+func (m *Manager) Revoke(ctx context.Context, id, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, err := m.store.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if k.State == StateRetired {
+		return fmt.Errorf("%w: %q", ErrAlreadyRetired, id)
+	}
+	wasActive := k.State == StateActive
+	now := m.cfg.Now()
+	if k.RetiringAt.IsZero() {
+		k.RetiringAt = now
+	}
+	k.State, k.RetiredAt = StateRetired, now
+	if err := m.store.Update(ctx, k); err != nil {
+		return err
+	}
+	m.emit("revoked", k, map[string]string{"reason": reason})
+	if !wasActive {
+		return nil
+	}
+	// Revoking the signer would otherwise hand the operator an outage instead
+	// of a containment. Prefer the newest pending key (verifier caches have
+	// already warmed on it); generate one only if there is none. Forced,
+	// because a compromise cannot wait out the dwell.
+	keys, err := m.store.List(ctx)
+	if err != nil {
+		return err
+	}
+	var successor *Key
+	for i := range keys {
+		if keys[i].Alg == k.Alg && keys[i].State == StatePending &&
+			(successor == nil || keys[i].CreatedAt.After(successor.CreatedAt)) {
+			successor = &keys[i]
+		}
+	}
+	if successor == nil {
+		fresh, err := m.generateLocked(ctx, k.Alg)
+		if err != nil {
+			return err
+		}
+		successor = &fresh
+	}
+	return m.promoteLocked(ctx, successor.ID, true)
+}
+
+// Config returns the configuration this manager actually holds, post-defaults.
+// Callers that must enforce invariants against it (service.New) read it here
+// rather than trusting a Config value passed alongside the manager, which can
+// silently disagree.
+func (m *Manager) Config() Config { return m.cfg }
 
 func (m *Manager) activeLocked(ctx context.Context, alg jose.Algorithm) (Key, error) {
 	keys, err := m.store.List(ctx)

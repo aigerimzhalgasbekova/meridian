@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,12 +33,13 @@ type Client struct {
 	httpc       *http.Client
 	now         func() time.Time
 
-	mu        sync.RWMutex
-	keys      *jose.KeySet
-	rawJWKS   []byte
-	etag      string
-	fetchedAt time.Time
-	maxAge    time.Duration
+	mu          sync.RWMutex
+	keys        *jose.KeySet
+	rawJWKS     []byte
+	etag        string
+	fetchedAt   time.Time
+	maxAge      time.Duration
+	staleLogged bool // one warning per outage, not one per verify
 
 	flightMu sync.Mutex
 	flight   *flight   // in-progress refresh, if any
@@ -221,11 +223,40 @@ func (c *Client) keySet(ctx context.Context) (*jose.KeySet, error) {
 	newSet, err := c.refreshOnce(ctx)
 	if err != nil {
 		if set != nil {
+			c.logStale(err)
 			return set, nil // stale beats broken
 		}
 		return nil, err
 	}
 	return newSet, nil
+}
+
+// logStale warns once per outage that the key set has stopped refreshing.
+// Serving stale keys is deliberate (an unreachable key server must not take
+// down every verifier), but doing it *silently* is not: dropping a key out of
+// the JWKS is the only revocation this system has, so a verifier that cannot
+// reach keysmith has silently lost its revocation coverage, and an operator
+// watching an outage would otherwise see nothing but successful verifications.
+func (c *Client) logStale(cause error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.staleLogged {
+		return
+	}
+	c.staleLogged = true
+	slog.Warn("keysmith: serving stale JWKS", "age", c.now().Sub(c.fetchedAt), "err", cause)
+}
+
+// KeysAge reports how long ago the cached JWKS was last fetched successfully,
+// so services can alert on a verifier drifting past its revocation horizon.
+// Zero if no fetch has ever succeeded.
+func (c *Client) KeysAge() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.fetchedAt.IsZero() {
+		return 0
+	}
+	return c.now().Sub(c.fetchedAt)
 }
 
 func (c *Client) forceRefresh(ctx context.Context) (*jose.KeySet, error) {
@@ -250,6 +281,7 @@ func (c *Client) forceRefresh(ctx context.Context) (*jose.KeySet, error) {
 	switch resp.StatusCode {
 	case http.StatusNotModified:
 		c.fetchedAt = c.now()
+		c.staleLogged = false
 		c.maxAge = parseMaxAge(resp.Header.Get("Cache-Control"), c.maxAge)
 		if c.keys == nil {
 			return nil, ErrNoKeys
@@ -268,6 +300,7 @@ func (c *Client) forceRefresh(ctx context.Context) (*jose.KeySet, error) {
 		c.rawJWKS = raw
 		c.etag = resp.Header.Get("ETag")
 		c.fetchedAt = c.now()
+		c.staleLogged = false
 		c.maxAge = parseMaxAge(resp.Header.Get("Cache-Control"), 5*time.Minute)
 		return set, nil
 	default:
@@ -289,12 +322,22 @@ func (c *Client) RawJWKS(ctx context.Context) ([]byte, error) {
 	return c.rawJWKS, nil
 }
 
+// maxJWKSMaxAge caps how long this client will cache a key set whatever the
+// response asserts. The server computes JWKSMaxAge <= PendingDwell/2 so that
+// verifier caches provably refresh before a pending key starts signing; the
+// client is the other half of that invariant and must not honour a header
+// (or an intermediary rewriting one) that pins it past the dwell.
+const maxJWKSMaxAge = 15 * time.Minute
+
 func parseMaxAge(cacheControl string, fallback time.Duration) time.Duration {
 	for part := range strings.SplitSeq(cacheControl, ",") {
 		part = strings.TrimSpace(part)
 		if v, ok := strings.CutPrefix(part, "max-age="); ok {
-			if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-				return time.Duration(secs) * time.Second
+			// secs >= 0: an explicit max-age=0 means "always revalidate", not
+			// "no opinion" — treating a directive as if it were absent and
+			// substituting the 5-minute fallback is the one unambiguous bug.
+			if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+				return min(time.Duration(secs)*time.Second, maxJWKSMaxAge)
 			}
 		}
 	}

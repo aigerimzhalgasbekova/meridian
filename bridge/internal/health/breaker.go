@@ -100,12 +100,29 @@ func (b *Breaker) Record(err error) {
 	}
 }
 
+// errPanic is the outcome recorded for a guarded call that panicked.
+var errPanic = errors.New("health: guarded call panicked")
+
 // Do runs fn under the breaker: rejected immediately when open, outcome
 // recorded otherwise.
+//
+// A panicking fn must still be recorded, and as a *failure*: Allow latches
+// probing = true when it admits the half-open probe and only Record clears
+// it, so an unrecorded panic wedges the breaker rejecting every caller
+// forever — net/http recovers per connection, so nothing restarts the process
+// to unwedge it. (Note the recover form is load-bearing: `defer b.Record(err)`
+// on a named return would record err == nil during a panic and *close* the
+// breaker, which is strictly worse.)
 func (b *Breaker) Do(fn func() error) error {
 	if err := b.Allow(); err != nil {
 		return err
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			b.Record(errPanic)
+			panic(r)
+		}
+	}()
 	err := fn()
 	b.Record(err)
 	return err

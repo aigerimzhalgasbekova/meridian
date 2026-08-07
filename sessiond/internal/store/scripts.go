@@ -63,17 +63,23 @@ local ttl = tonumber(ARGV[2])
 if deadline - now < ttl then ttl = deadline - now end
 redis.call('PEXPIRE', key, ttl)
 
--- Index the session; deadlines grow with creation time, so this session's
--- deadline is an upper bound on the whole index's useful life.
+-- Index the session. The index must outlive every session it holds, so only
+-- ever extend its TTL — never shorten it. A node configured with a smaller
+-- AbsoluteTTL (rolling deploy, security tightening) would otherwise expire the
+-- index out from under a longer-lived sibling, making that session invisible
+-- to revoke-all, List and the cap. PTTL is -1 (persistent, i.e. the first ZADD
+-- above) or -2 (missing); both compare below any positive want, so the TTL is
+-- still established on a fresh key.
 redis.call('ZADD', KEYS[1], now, ARGV[6])
-redis.call('PEXPIRE', KEYS[1], deadline - now)
+local want = deadline - now
+if redis.call('PTTL', KEYS[1]) < want then redis.call('PEXPIRE', KEYS[1], want) end
 return evicted
 `)
 
 // touchScript validates and renews a session in one atomic step.
 //
 //	KEYS[1] = session hash
-//	ARGV    = now_ms, idle_ttl_ms
+//	ARGV    = now_ms, idle_ttl_ms, id
 //
 // Returns the full session hash (flat field/value array) on success, or an
 // empty array if the session is missing or past its absolute deadline. The
@@ -92,6 +98,22 @@ redis.call('HSET', KEYS[1], 'seen_ms', ARGV[1])
 local ttl = tonumber(ARGV[2])
 if deadline - now < ttl then ttl = deadline - now end
 redis.call('PEXPIRE', KEYS[1], ttl)
+
+-- Hold the user index open for at least as long as this session. The index
+-- TTL is frozen at create time, but the PEXPIRE above restretches the session
+-- key from the *caller's* clock: a node whose clock trails Redis at touch time
+-- relative to create time (backward NTP step, drifting VM) pushes the key past
+-- the index, and the orphaned session then survives revoke-all and is invisible
+-- to List and the cap. Same extend-only rule as createScript. The ZADD NX also
+-- re-indexes a session already orphaned that way, which PEXPIRE alone cannot —
+-- it is a no-op on a missing key. Score is created_ms so eviction order stays
+-- by session age. ponytail: ~3 extra ops per cache miss, i.e. one per CacheTTL
+-- per token; move to a background reaper if that ever shows up in a profile.
+local f = redis.call('HMGET', KEYS[1], 'realm', 'uid', 'created_ms')
+local userkey = 'usersess:' .. f[1] .. ':' .. f[2] .. ':sessions'
+redis.call('ZADD', userkey, 'NX', tonumber(f[3]), ARGV[3])
+local want = deadline - now
+if redis.call('PTTL', userkey) < want then redis.call('PEXPIRE', userkey, want) end
 return redis.call('HGETALL', KEYS[1])
 `)
 
@@ -126,6 +148,12 @@ redis.call('PEXPIRE', KEYS[2], ttl)
 -- Keep the original creation time as the score so eviction order is by
 -- session age, not rotation time.
 redis.call('ZADD', userkey, tonumber(created), ARGV[4])
+-- Rotating a user's only session empties the ZSET, which Redis deletes along
+-- with its TTL; the ZADD above then recreates it with no expiry at all. Same
+-- extend-only rule as createScript: reinstate the TTL, never shorten a
+-- longer-lived sibling's.
+local want = deadline - now
+if redis.call('PTTL', userkey) < want then redis.call('PEXPIRE', userkey, want) end
 return redis.call('HGETALL', KEYS[2])
 `)
 

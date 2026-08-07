@@ -191,6 +191,39 @@ func TestVerifyYoungLog(t *testing.T) {
 	}
 }
 
+// An invalid UTF-8 byte used to write a record that could never be verified
+// again: encoding/json escapes it as � at hash time but decodes that
+// escape back to a raw 3-byte U+FFFD on read, so the recomputed hash differed
+// and the whole log reported BROKEN — silently, and indistinguishably from an
+// attack. hashRecord must be stable across the store's own round-trip.
+func TestInvalidUTF8StillVerifies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	s, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	l, err := New(s, Options{Now: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := string([]byte{0xff, 0xfe})
+	if _, err := l.Append(Event{
+		Type:    "auth.failure",
+		Actor:   "alice" + bad,
+		Action:  "login",
+		Details: map[string]string{"path" + bad: "/tmp/" + bad},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if res := l.VerifyAll(); !res.OK {
+		t.Fatalf("log broken by its own write at seq %d: %s", res.BrokenSeq, res.Reason)
+	}
+	if res := Verify(mustRecords(t, l)); !res.OK {
+		t.Fatalf("re-read chain broken at seq %d: %s", res.BrokenSeq, res.Reason)
+	}
+}
+
 func TestFileStoreResume(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	now := fixedClock()
@@ -508,6 +541,40 @@ func TestVerifyAllCatchesTruncation(t *testing.T) {
 	}
 	if !strings.Contains(res.Reason, "anchor") {
 		t.Errorf("reason %q does not point at the anchor cross-check", res.Reason)
+	}
+}
+
+// Only the last anchor is cross-checked, so records past it are unvouched:
+// they can be deleted, and fabricated records appended in their place, and
+// VerifyAll still reports OK. It must at least say how big that window is —
+// a silent blind spot reads as "the whole file is proven".
+func TestVerifyAllReportsUnvouchedTail(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	s, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	sidecar, err := os.OpenFile(path+".anchors", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sidecar.Close()
+	l, err := New(s, Options{
+		Now: fixedClock(), AnchorEvery: 3, AnchorSink: sidecar,
+		AnchorSource: func() (io.ReadCloser, error) { return os.Open(path + ".anchors") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendN(t, l, 5) // 8 records; the last sidecar anchor vouches for seq 6
+	res := l.VerifyAll()
+	if !res.OK {
+		t.Fatalf("intact chain rejected: %+v", res)
+	}
+	if res.UnvouchedRecords != 2 {
+		t.Fatalf("UnvouchedRecords = %d, want 2 (seq 7 and 8 are past the last anchor)", res.UnvouchedRecords)
 	}
 }
 

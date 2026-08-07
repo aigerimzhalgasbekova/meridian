@@ -1,0 +1,20 @@
+---
+import Base from '../layouts/Base.astro';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<Base title="Not found — Meridian" description="That page does not exist on the Meridian portfolio site.">
+  <div class="prose">
+    <h1>404 — not found</h1>
+    <p>
+      That page does not exist. Pages here move when a guide chapter or project is renamed; the two entry points
+      below always work.
+    </p>
+    <p>
+      <a href={`${base}/`}><strong>Home</strong></a>
+      &nbsp;·&nbsp;
+      <a href={`${base}/guide/`}>The engineering guide</a>
+    </p>
+  </div>
+</Base>

@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
@@ -277,6 +278,55 @@ func TestPKCE(t *testing.T) {
 			t.Fatalf("%d: %v", status, body)
 		}
 	})
+}
+
+func TestCodeGrantSurvivesSigningOutage(t *testing.T) {
+	// Symmetric to TestRefreshTokenRotation/"signing failure leaves the token
+	// un-rotated": consuming the code before the remote signing call turned a
+	// keysmith blip into a forced trip back through the whole browser flow, and
+	// logged the client's retry as a replay.
+	e := newEnv(t)
+	code := e.obtainCode(nil)
+
+	e.signer.fail.Store(true)
+	status, body := e.tokenRequest("web-app", webAppSecret, url.Values{
+		"grant_type":   {"authorization_code"},
+		"code":         {code},
+		"redirect_uri": {"https://app.example/callback"},
+	})
+	if status != http.StatusInternalServerError || str(body, "error") != "server_error" {
+		t.Fatalf("signing outage: got %d %v, want 500 server_error", status, body)
+	}
+
+	// Keysmith recovers; the SAME code must still be redeemable.
+	e.signer.fail.Store(false)
+	tokens := e.exchangeCode(code)
+	if str(tokens, "access_token") == "" || str(tokens, "refresh_token") == "" {
+		t.Fatalf("retry after outage produced no tokens: %v", tokens)
+	}
+	// And it is still single-use afterwards.
+	if status, body = e.tokenRequest("web-app", webAppSecret, url.Values{
+		"grant_type": {"authorization_code"}, "code": {code},
+		"redirect_uri": {"https://app.example/callback"},
+	}); status != http.StatusBadRequest || str(body, "error") != "invalid_grant" {
+		t.Fatalf("code is no longer single-use: %d %v", status, body)
+	}
+}
+
+func TestAccessTokenAudienceCarriesTheRealm(t *testing.T) {
+	// All realms share one keysmith key set, so a realm-agnostic aud would let a
+	// resource server doing the conventional signature+aud+scope check accept
+	// another tenant's token.
+	e := newEnv(t)
+	tokens := e.exchangeCode(e.obtainCode(nil))
+	var claims map[string]any
+	if err := json.Unmarshal([]byte(jwtPayload(t, str(tokens, "access_token"))), &claims); err != nil {
+		t.Fatal(err)
+	}
+	want := e.idp.URL + "/realms/test"
+	if claims["aud"] != want {
+		t.Errorf("aud = %v, want %q", claims["aud"], want)
+	}
 }
 
 func pkceS256(verifier string) string {

@@ -269,10 +269,127 @@ func TestRotate(t *testing.T) {
 	if len(sessions) != 1 || sessions[0].ID != newSess.ID {
 		t.Errorf("index after rotate: %+v", sessions)
 	}
+	// Rotating a user's only session empties the ZSET, so Redis deletes it —
+	// TTL and all — and the re-ADD must not leave an immortal key behind.
+	if ttl := mr.TTL("usersess:acme:alice:sessions"); ttl <= 0 {
+		t.Errorf("index TTL after rotate = %v, want > 0 (leaked persistent key)", ttl)
+	}
 
 	// Rotating a dead token fails closed.
 	if _, _, err := s.Rotate(ctx, oldTok, "", ""); !errors.Is(err, ErrNotFound) {
 		t.Errorf("rotate dead token: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestIndexOutlivesLongerLivedSessions pins the invariant the whole index
+// rests on: `usersess:...` must never expire before the longest-lived session
+// it holds. Lowering SESSIOND_ABSOLUTE_TTL (a routine security tightening, and
+// transiently the state of any rolling deploy) used to rewrite the index TTL
+// downwards, orphaning live sessions from revoke-all, List and the cap.
+func TestIndexOutlivesLongerLivedSessions(t *testing.T) {
+	mr := miniredis.RunT(t)
+	clk := newFakeClock()
+	ctx := context.Background()
+	const indexKey = "usersess:acme:alice:sessions"
+
+	long := testStore(t, mr, clk, Config{AbsoluteTTL: 12 * time.Hour, CacheTTL: time.Millisecond})
+	tok1, _ := mustCreate(t, long, "acme", "alice")
+	clk.tick(mr, time.Minute)
+
+	// A node that has picked up a reduced AbsoluteTTL creates a second session.
+	short := testStore(t, mr, clk, Config{AbsoluteTTL: time.Hour, CacheTTL: time.Millisecond})
+	mustCreate(t, short, "acme", "alice")
+	if ttl := mr.TTL(indexKey); ttl < 11*time.Hour {
+		t.Fatalf("index TTL = %v, want ≥ the 12h session's remaining life", ttl)
+	}
+
+	// Well past the short node's TTL, with session 1 kept active the way a
+	// real user would keep it alive.
+	for i := 0; i < 5; i++ {
+		clk.tick(mr, 20*time.Minute)
+		if _, err := long.Validate(ctx, tok1); err != nil {
+			t.Fatalf("session 1 at t=%dm: %v", 20*(i+1), err)
+		}
+	}
+
+	if _, err := long.RevokeUser(ctx, "acme", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := long.Validate(ctx, tok1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("session survived revoke-all: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestIndexSurvivesBackwardClockStep is the same invariant reached without any
+// config change: touch restretches the session key from the node's clock, so a
+// node whose clock steps backward (NTP correction, drifting VM) keeps the key
+// alive past an index TTL that was frozen in Redis-real time at create. The
+// orphaned session used to survive revoke-all silently.
+func TestIndexSurvivesBackwardClockStep(t *testing.T) {
+	mr := miniredis.RunT(t)
+	clk := newFakeClock()
+	s := testStore(t, mr, clk, Config{AbsoluteTTL: 2 * time.Hour, CacheTTL: time.Millisecond})
+	ctx := context.Background()
+
+	tok, _ := mustCreate(t, s, "acme", "alice")
+	clk.advance(-time.Hour) // NTP steps this node's clock back an hour
+
+	// Two hours of real time pass while the user keeps the session active.
+	for i := 0; i < 6; i++ {
+		clk.tick(mr, 20*time.Minute)
+		if _, err := s.Validate(ctx, tok); err != nil {
+			t.Fatalf("session at t=%dm: %v", 20*(i+1), err)
+		}
+	}
+
+	n, err := s.RevokeUser(ctx, "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("RevokeUser revoked %d, want 1 (session orphaned from its index)", n)
+	}
+	if _, err := s.Validate(ctx, tok); !errors.Is(err, ErrNotFound) {
+		t.Errorf("session survived revoke-all: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestListSkipsSessionsPastDeadline is TestDeadlineCheckedEvenIfTTLStale for
+// the admin listing surface: List must agree with Validate about what is live.
+func TestListSkipsSessionsPastDeadline(t *testing.T) {
+	mr := miniredis.RunT(t)
+	clk := newFakeClock()
+	s := testStore(t, mr, clk, Config{IdleTTL: 10 * time.Minute, AbsoluteTTL: 30 * time.Minute, CacheTTL: time.Millisecond})
+	ctx := context.Background()
+
+	_, sess := mustCreate(t, s, "acme", "alice")
+	clk.advance(31 * time.Minute) // clock moves, TTLs do not
+
+	sessions, err := s.List(ctx, "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 0 {
+		t.Errorf("List returned %d past-deadline sessions, want 0", len(sessions))
+	}
+	if mr.Exists("sess:" + sess.ID) {
+		t.Error("List should prune the past-deadline session it refused to report")
+	}
+}
+
+// TestCacheExpiryMeasuredFromReadTime pins the documented bound: an entry may
+// outlive the Redis read it describes by CacheTTL, not by CacheTTL plus
+// however long the round trip took.
+func TestCacheExpiryMeasuredFromReadTime(t *testing.T) {
+	clk := newFakeClock()
+	c := newCache(2*time.Second, clk.Now)
+
+	readAt := clk.Now().UnixMilli()
+	clk.advance(3 * time.Second) // a degraded Redis: the reply lands 3s late
+	c.put("id", Session{ID: "id"}, readAt)
+
+	if _, _, ok := c.get("id"); ok {
+		t.Error("entry filled from a 3s-old read must already be expired")
 	}
 }
 

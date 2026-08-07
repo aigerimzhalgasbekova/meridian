@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/aikazzh/portfolio/bridge/internal/fakeidp"
 	"github.com/aikazzh/portfolio/bridge/internal/health"
 	"github.com/aikazzh/portfolio/bridge/internal/provider"
+	"github.com/aikazzh/portfolio/bridge/internal/relay"
 	"github.com/aikazzh/portfolio/keysmith/jose"
 )
 
@@ -32,6 +34,20 @@ func (c *clock) advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
+// syncBuf collects the server's log output. The server logs from its own
+// goroutines, so reads and writes need the lock.
+type syncBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+func (s *syncBuf) String() string { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
 // env is a fully wired bridge with two fake upstreams.
 type env struct {
 	srv    *httptest.Server
@@ -40,6 +56,7 @@ type env struct {
 	store  *directory.MemStore
 	verKey jose.VerificationKey
 	clock  *clock
+	logs   *syncBuf
 }
 
 func newEnv(t *testing.T) *env {
@@ -73,11 +90,13 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(nil) // reserve the port to learn BaseURL first
+	logs := &syncBuf{}
 	s, err := New(Config{
 		BaseURL:     srv.URL,
 		HMACKey:     []byte(strings.Repeat("k", 32)),
 		Apps:        map[string]App{"demo": {Name: "Demo", CallbackURL: "http://app.example/cb"}},
 		InsecureDev: true,
+		Logger:      slog.New(slog.NewTextHandler(logs, nil)),
 		Now:         ck.now,
 	}, reg, store, signer)
 	if err != nil {
@@ -85,7 +104,7 @@ func newEnv(t *testing.T) *env {
 	}
 	srv.Config.Handler = s
 	t.Cleanup(srv.Close)
-	return &env{srv: srv, alpha: alpha, beta: beta, store: store, verKey: verKey, clock: ck}
+	return &env{srv: srv, alpha: alpha, beta: beta, store: store, verKey: verKey, clock: ck, logs: logs}
 }
 
 // client returns an HTTP client with a cookie jar that follows redirects
@@ -185,22 +204,86 @@ func TestAssertionDelivery(t *testing.T) {
 	}
 }
 
+// manualClient is a client with a cookie jar that stops at every redirect, so
+// a test can drive login → authorize → callback hop by hop while still
+// carrying the flow-binding and session cookies a real browser would.
+func (e *env) manualClient(t *testing.T) *http.Client {
+	t.Helper()
+	c := e.client(t)
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return c
+}
+
 func TestStateReplayRejected(t *testing.T) {
 	e := newEnv(t)
-	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
+	c := e.manualClient(t)
 
-	resp, _ := get(t, noRedirect, e.srv.URL+"/login/alpha")
-	resp, _ = get(t, noRedirect, resp.Header.Get("Location")) // upstream authorize
+	resp, _ := get(t, c, e.srv.URL+"/login/alpha")
+	resp, _ = get(t, c, resp.Header.Get("Location")) // upstream authorize
 	callbackURL := resp.Header.Get("Location")
 
-	if resp, _ := get(t, noRedirect, callbackURL); resp.StatusCode != http.StatusFound {
+	if resp, _ := get(t, c, callbackURL); resp.StatusCode != http.StatusFound {
 		t.Fatalf("first callback should succeed, got %d", resp.StatusCode)
 	}
-	resp, body := get(t, noRedirect, callbackURL)
+	resp, body := get(t, c, callbackURL)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("replayed callback accepted: %d %s", resp.StatusCode, body)
+	}
+}
+
+// Login CSRF: an attacker starts a login, authenticates upstream as
+// themselves, and delivers the resulting callback URL to a victim. Without a
+// browser binding every check in Consume passes — the state is genuine,
+// unexpired and unused — and the victim's browser is issued a session for the
+// attacker's identity.
+func TestLoginCallbackBoundToBrowser(t *testing.T) {
+	e := newEnv(t)
+	attacker := e.manualClient(t)
+
+	resp, _ := get(t, attacker, e.srv.URL+"/login/alpha")
+	resp, _ = get(t, attacker, resp.Header.Get("Location"))
+	callbackURL := resp.Header.Get("Location")
+
+	victim := e.manualClient(t) // never visited /login: holds no binding cookie
+	resp, body := get(t, victim, callbackURL)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("callback accepted from a browser that never started the flow: %d %s", resp.StatusCode, body)
+	}
+	if len(resp.Cookies()) > 0 && resp.Cookies()[0].Name == sessionCookie && resp.Cookies()[0].Value != "" {
+		t.Fatal("a session was issued to the victim's browser")
+	}
+}
+
+// Hostile linking: the link authorize URL carries state through the upstream's
+// URL bar, history and Referer (ADR 0003 assumes that leak). Whoever obtains
+// it must not be able to drive the flow with their own upstream account and
+// have the link written onto the victim's identity.
+func TestLinkFlowBoundToBrowser(t *testing.T) {
+	e := newEnv(t)
+	victim := e.manualClient(t)
+
+	// Victim signs in via alpha (following redirects manually to the end).
+	resp, _ := get(t, victim, e.srv.URL+"/login/alpha")
+	resp, _ = get(t, victim, resp.Header.Get("Location"))
+	if resp, _ := get(t, victim, resp.Header.Get("Location")); resp.StatusCode != http.StatusFound {
+		t.Fatalf("victim login: %d", resp.StatusCode)
+	}
+	// Victim starts a link flow; the authorize URL leaks.
+	resp, err := victim.Post(e.srv.URL+"/link/beta", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	authorizeURL := resp.Header.Get("Location")
+
+	attacker := e.manualClient(t) // no session cookie, no binding cookie
+	resp, _ = get(t, attacker, authorizeURL)
+	resp, body := get(t, attacker, resp.Header.Get("Location"))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("leaked link URL completed by a third party: %d %s", resp.StatusCode, body)
+	}
+	if links := mustLinks(t, e); len(links) != 1 {
+		t.Fatalf("a link was written by a party that started nothing: %+v", links)
 	}
 }
 
@@ -209,6 +292,66 @@ func TestTamperedStateRejected(t *testing.T) {
 	resp, _ := get(t, e.client(t), e.srv.URL+"/callback/alpha?state=forged.sig&code=x")
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("forged state accepted: %d", resp.StatusCode)
+	}
+}
+
+// The user-facing message is deliberately uniform across replay, tamper,
+// expiry and hijack (ADR 0003), so the log line is the *only* place those are
+// distinguishable — and the only record that an attack was attempted at all.
+// It must carry the typed error and never the state, code or token bytes.
+func TestCallbackRejectionsAreLogged(t *testing.T) {
+	e := newEnv(t)
+	get(t, e.client(t), e.srv.URL+"/callback/alpha?state=forged.sig&code=secret-code")
+
+	logs := e.logs.String()
+	if !strings.Contains(logs, "callback state rejected") || !strings.Contains(logs, relay.ErrBadState.Error()) {
+		t.Fatalf("forged state left no usable audit trail:\n%s", logs)
+	}
+	if strings.Contains(logs, "secret-code") || strings.Contains(logs, "forged.sig") {
+		t.Fatalf("credential material logged:\n%s", logs)
+	}
+
+	// A valid state whose code the token endpoint refuses: the exchange failure
+	// funnels through upstreamError, the one path that used to stay silent.
+	c := e.client(t)
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if strings.HasPrefix(req.URL.Path, "/callback/") {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+	resp, _ := get(t, c, e.srv.URL+"/login/alpha")
+	callback := resp.Header.Get("Location")
+	if callback == "" {
+		t.Fatalf("expected a redirect to the callback, got %d", resp.StatusCode)
+	}
+	e.alpha.SetFailing(true)
+	c.CheckRedirect = nil
+	if resp, _ = get(t, c, callback); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("failed exchange should be a 502, got %d", resp.StatusCode)
+	}
+	if logs := e.logs.String(); !strings.Contains(logs, "upstream call failed") {
+		t.Fatalf("failed code exchange left no audit trail:\n%s", logs)
+	}
+}
+
+// Provisioning and linking are the events an operator needs to answer "was
+// this identity linked by its owner?" after the fact.
+func TestIdentityLifecycleIsLogged(t *testing.T) {
+	e := newEnv(t)
+	c := e.client(t)
+	get(t, c, e.srv.URL+"/login/alpha")
+	resp, err := c.Post(e.srv.URL+"/link/beta", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	logs := e.logs.String()
+	for _, want := range []string{"identity provisioned", "provider linked", "sub-b"} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("no %q in the audit trail:\n%s", want, logs)
+		}
 	}
 }
 

@@ -229,6 +229,71 @@ func TestDeviceFlow(t *testing.T) {
 		}
 	})
 
+	t.Run("auth_time is the login time, not the poll time", func(t *testing.T) {
+		// auth_time is what an RP enforces its own max_age / step-up policy on.
+		// The device grant is the odd one out: nothing carried the approving
+		// session's AuthenticatedAt to redemption, so it asserted the poll
+		// instant and overstated freshness by up to the full 8h session TTL.
+		e := newEnv(t)
+		// Sign in first, then let hours pass before the device flow starts.
+		loginAt := e.clock.Now()
+		resp, body := e.get("/realms/test/device")
+		resp, body = e.login(body, "alice", testUserPassword)
+		if resp.StatusCode != http.StatusSeeOther {
+			t.Fatalf("login: %d %s", resp.StatusCode, firstLine(body))
+		}
+		e.clock.Advance(2 * time.Hour)
+
+		grant := startDeviceFlow(t, e)
+		approveDevice(t, e, str(grant, "user_code"), "allow")
+		e.clock.Advance(6 * time.Second)
+		status, tokens := e.pollDevice(t, str(grant, "device_code"))
+		if status != http.StatusOK {
+			t.Fatalf("poll: %d %v", status, tokens)
+		}
+		var claims map[string]any
+		if err := json.Unmarshal([]byte(jwtPayload(t, str(tokens, "id_token"))), &claims); err != nil {
+			t.Fatal(err)
+		}
+		at, ok := claims["auth_time"].(float64)
+		if !ok {
+			t.Fatalf("no auth_time claim: %v", claims)
+		}
+		if int64(at) != loginAt.Unix() {
+			t.Errorf("auth_time = %d, want %d (the login, not the poll)", int64(at), loginAt.Unix())
+		}
+	})
+
+	t.Run("user code guessing is rate limited", func(t *testing.T) {
+		// RFC 8628 §5.1, and storage.DeviceCode's own doc comment, promise a
+		// rate limit at verification — there was none.
+		e := newEnv(t)
+		resp, body := e.get("/realms/test/device")
+		resp, body = e.login(body, "alice", testUserPassword)
+		if resp.StatusCode != http.StatusSeeOther {
+			t.Fatalf("login: %d", resp.StatusCode)
+		}
+		_, body = e.get(resp.Header.Get("Location"))
+		csrf := csrfRe.FindStringSubmatch(body)[1]
+		guess := func() string {
+			_, out := e.postForm("/realms/test/device", url.Values{
+				"csrf_token": {csrf},
+				"user_code":  {"ZZZZ-ZZZZ"},
+				"decision":   {"allow"},
+			})
+			return out
+		}
+		// guardMaxUser (10) failures fill the window.
+		for i := range 10 {
+			if out := guess(); !strings.Contains(out, "Unknown code") {
+				t.Fatalf("guess %d: %s", i, firstLine(out))
+			}
+		}
+		if out := guess(); !strings.Contains(out, "Too many attempts") {
+			t.Errorf("user codes can be ground at full rate: %s", firstLine(out))
+		}
+	})
+
 	t.Run("wrong client cannot redeem", func(t *testing.T) {
 		e := newEnv(t)
 		grant := startDeviceFlow(t, e)

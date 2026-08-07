@@ -7,6 +7,12 @@
 //	KEYSMITH_MASTER_KEY      base64 (std) 32-byte KEK master key. REQUIRED unless
 //	                         KEYSMITH_DEV_MODE=1, which generates an ephemeral
 //	                         in-memory store (keys lost on exit — dev only).
+//	KEYSMITH_KEYSTORE_MIGRATE_V1
+//	                         set to 1 for ONE start to upgrade a version 1
+//	                         keystore (lifecycle metadata outside the AEAD) to
+//	                         v2, then remove it — while set, a pre-upgrade copy
+//	                         of the file can be replayed with forged lifecycle
+//	                         state.
 //	KEYSMITH_SIGNER_TOKENS   comma-separated bearer tokens for the sign API
 //	KEYSMITH_ADMIN_TOKENS    comma-separated bearer tokens for the admin API
 //	KEYSMITH_ALGS            comma-separated algorithms (default EdDSA,RS256)
@@ -125,6 +131,7 @@ func run(logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		defer fs.Close() // releases the single-writer lock
 		store = fs
 	}
 
@@ -149,9 +156,12 @@ func run(logger *slog.Logger) error {
 	srv, err := service.New(manager, ksCfg, service.Config{
 		SignerTokens: splitList(os.Getenv("KEYSMITH_SIGNER_TOKENS")),
 		AdminTokens:  splitList(os.Getenv("KEYSMITH_ADMIN_TOKENS")),
-		MaxTokenTTL:  maxTokenTTL,
-		JWKSMaxAge:   jwksMaxAge,
-		Logger:       logger,
+		// Taken from KEYSMITH_ALGS rather than defaulted, so the service's
+		// default algorithm cannot disagree with the keystore's list.
+		DefaultAlg:  algs[0],
+		MaxTokenTTL: maxTokenTTL,
+		JWKSMaxAge:  jwksMaxAge,
+		Logger:      logger,
 	})
 	if err != nil {
 		return err

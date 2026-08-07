@@ -28,7 +28,13 @@ export interface Session {
   expiresAt: Date;
 }
 
-export type TokenPurpose = 'password_reset' | 'verify_email';
+/**
+ * `undo_totp` is mailed to the account address the moment a second factor is
+ * activated: redeeming it clears the factor. It is the only escape from a
+ * hostile enrollment by someone who knows the password — reset does not clear
+ * TOTP, and /security/totp/disable needs a session that already stepped up.
+ */
+export type TokenPurpose = 'password_reset' | 'verify_email' | 'undo_totp';
 
 export interface OneTimeToken {
   id: string;

@@ -113,7 +113,7 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	}
 	claims, err := s.cfg.Keysmith.Verify(r.Context(), raw, jose.Expect{
 		Issuer:   s.issuer.IssuerURL(realm.Name),
-		Audience: "meridian",
+		Audience: s.issuer.IssuerURL(realm.Name),
 		Now:      s.cfg.Now,
 		Leeway:   30 * time.Second,
 	})
@@ -179,7 +179,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	// Try as a JWT access token first.
 	if claims, err := s.cfg.Keysmith.Verify(r.Context(), presented, jose.Expect{
 		Issuer:   s.issuer.IssuerURL(realm.Name),
-		Audience: "meridian",
+		Audience: s.issuer.IssuerURL(realm.Name),
 		Now:      s.cfg.Now,
 		Leeway:   30 * time.Second,
 	}); err == nil {
@@ -261,7 +261,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	// A structurally valid JWT from our issuer is an access token we cannot
 	// revoke — say so honestly rather than returning a misleading 200.
 	if _, err := s.cfg.Keysmith.Verify(r.Context(), presented, jose.Expect{
-		Issuer: s.issuer.IssuerURL(realm.Name), Audience: "meridian",
+		Issuer: s.issuer.IssuerURL(realm.Name), Audience: s.issuer.IssuerURL(realm.Name),
 		Now: s.cfg.Now, Leeway: 30 * time.Second,
 	}); err == nil {
 		oauth.WriteTokenError(w, oauth.E(oauth.ErrUnsupportedTokenType,

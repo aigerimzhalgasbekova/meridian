@@ -9,23 +9,44 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aikazzh/portfolio/keysmith/jose"
 )
 
+// fileVersion is the document format this store writes. v1 bound only the key
+// ID and algorithm into the AEAD; v2 additionally binds the lifecycle state,
+// the timestamps and the document generation.
+//
+// A v1 document loads only under migrateEnvVar, and is rewritten as v2 on open.
+// Accepting it unconditionally would leave a permanent forgery primitive: in a
+// v1 record the lifecycle fields are unauthenticated, so one retained copy of a
+// pre-upgrade file lets a KEK-less attacker put a retired key back in the active
+// slot — and the upgrade would then re-seal that forged state as a valid v2
+// record. Gating it on an operator action gives the downgrade window a start and
+// an end.
+const (
+	fileVersion   = 2
+	migrateEnvVar = "KEYSMITH_KEYSTORE_MIGRATE_V1"
+)
+
 // FileStore persists keys to a single JSON file with private key material
 // envelope-encrypted. Writes are atomic (temp file + rename) and fsynced.
-// Suitable for single-writer deployments; multi-node deployments should back
-// keysmith with a database store and run one rotation leader.
+// Single-writer by construction: an advisory lock is held for the store's
+// lifetime, so a second process fails to start rather than silently replaying
+// its stale whole-document snapshot over the first one's writes.
 type FileStore struct {
 	path string
 	kek  KEK
+	lock *os.File
 
 	mu    sync.RWMutex
 	keys  map[string]Key
 	order []string
+	gen   int // document generation of the last successful persist
 }
 
 type fileRecord struct {
@@ -44,45 +65,133 @@ type fileRecord struct {
 }
 
 type fileDoc struct {
-	Version int          `json:"version"`
-	Keys    []fileRecord `json:"keys"`
+	Version int `json:"version"`
+	// Generation increments on every persist and is bound into each record's
+	// AAD, so a record sealed by an earlier write cannot be spliced into a later
+	// document. Without it every record verifies on its own merits forever, and
+	// an attacker who kept the record for key K from while K was active can
+	// paste it over K's retired successor with no KEK.
+	//
+	// ponytail: the counter travels with the file, so a whole-file rollback
+	// still passes. Anchor it outside the keystore (SSM parameter, or the KMS
+	// encryption context once the KMS KEK lands) and refuse a document below the
+	// anchored generation if rollback enters the threat model.
+	Generation int          `json:"generation"`
+	Keys       []fileRecord `json:"keys"`
 }
 
-// OpenFileStore loads (or initializes) the store at path.
+// OpenFileStore loads (or initializes) the store at path. The returned store
+// holds an exclusive advisory lock until Close.
 func OpenFileStore(ctx context.Context, path string, kek KEK) (*FileStore, error) {
 	s := &FileStore{path: path, kek: kek, keys: make(map[string]Key)}
+	// The lock lives beside the keystore rather than on it: persist() renames a
+	// new file over the path, so a lock held on the keystore's own descriptor
+	// would guard an unlinked inode while a second process locked the new one.
+	// ponytail: flock is advisory and unix-only, which suits this deployment;
+	// a database store with a rotation leader is the multi-node upgrade path.
+	lockPath := path + ".lock"
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("keystore: open lock %s: %w", lockPath, err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("keystore: another keysmith holds the keystore %s: %w", path, err)
+	}
+	s.lock = lock
+
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
 	}
 	if err != nil {
+		s.Close()
 		return nil, fmt.Errorf("keystore: read %s: %w", path, err)
 	}
 	var doc fileDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
+		s.Close()
 		return nil, fmt.Errorf("keystore: parse %s: %w", path, err)
 	}
+	if doc.Version < 1 || doc.Version > fileVersion {
+		s.Close()
+		return nil, fmt.Errorf("keystore: %s has document version %d, this build understands 1..%d",
+			path, doc.Version, fileVersion)
+	}
+	if doc.Version < fileVersion && os.Getenv(migrateEnvVar) != "1" {
+		s.Close()
+		return nil, fmt.Errorf("keystore: %s is a version %d document whose lifecycle metadata is unauthenticated; "+
+			"start once with %s=1 to upgrade it to v%d, then remove the variable",
+			path, doc.Version, migrateEnvVar, fileVersion)
+	}
+	s.gen = doc.Generation
 	for _, rec := range doc.Keys {
-		k, err := s.decode(ctx, rec)
+		k, err := s.decode(ctx, rec, doc.Version, doc.Generation)
 		if err != nil {
+			s.Close()
 			return nil, fmt.Errorf("keystore: key %q: %w", rec.ID, err)
+		}
+		// Put guards duplicates on write; the load path must establish the same
+		// len(order) == len(keys) invariant, or List returns the key twice and
+		// every VerificationSet call fails on a duplicate kid, permanently.
+		if _, dup := s.keys[k.ID]; dup {
+			s.Close()
+			return nil, fmt.Errorf("keystore: duplicate key %q in %s: %w", k.ID, path, ErrDuplicate)
 		}
 		s.keys[k.ID] = k
 		s.order = append(s.order, k.ID)
 	}
+	if doc.Version < fileVersion && len(s.order) > 0 {
+		// Rewrite once at the current version so the lifecycle metadata comes
+		// under the AEAD; after this the old, forgeable form is gone.
+		if err := s.persist(ctx); err != nil {
+			s.Close()
+			return nil, fmt.Errorf("keystore: upgrade %s to v%d: %w", path, fileVersion, err)
+		}
+	}
 	return s, nil
 }
 
+// Close releases the keystore lock.
+func (s *FileStore) Close() error {
+	if s.lock == nil {
+		return nil
+	}
+	err := s.lock.Close() // releases the flock with the descriptor
+	s.lock = nil
+	return err
+}
+
+// aad binds a record's ciphertext to its identity. v1 covered only the key ID
+// and algorithm, leaving state and timestamps as unauthenticated plaintext: a
+// file-write attacker with no KEK could flip a retired key back to active and
+// resurrect it as the signer, or backdate created_at past the pending dwell.
 func aad(id string, alg jose.Algorithm) []byte {
 	return []byte("keysmith:key:" + id + ":" + string(alg))
 }
 
-func (s *FileStore) encode(ctx context.Context, k Key) (fileRecord, error) {
+// aadV2 additionally binds the lifecycle position and the document generation
+// the record was written in, so editing any of it — or replaying an authentic
+// record from an earlier generation — turns the record into an AEAD failure
+// instead of a silent state change.
+func aadV2(rec fileRecord, gen int) []byte {
+	ts := func(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+	return []byte("keysmith:key:v2:" + rec.ID + ":" + rec.Alg + ":" + rec.State + ":" +
+		ts(rec.CreatedAt) + ":" + ts(rec.PromotedAt) + ":" + ts(rec.RetiringAt) + ":" + ts(rec.RetiredAt) +
+		":gen:" + strconv.Itoa(gen))
+}
+
+func (s *FileStore) encode(ctx context.Context, k Key, gen int) (fileRecord, error) {
 	pkcs8, err := x509.MarshalPKCS8PrivateKey(k.Private)
 	if err != nil {
 		return fileRecord{}, fmt.Errorf("marshal private key: %w", err)
 	}
-	ct, wrapped, err := envelopeSeal(ctx, s.kek, pkcs8, aad(k.ID, k.Alg))
+	rec := fileRecord{
+		ID: k.ID, Alg: string(k.Alg), State: string(k.State),
+		CreatedAt: k.CreatedAt, PromotedAt: k.PromotedAt,
+		RetiringAt: k.RetiringAt, RetiredAt: k.RetiredAt,
+	}
+	ct, wrapped, err := envelopeSeal(ctx, s.kek, pkcs8, aadV2(rec, gen))
 	if err != nil {
 		return fileRecord{}, err
 	}
@@ -90,19 +199,19 @@ func (s *FileStore) encode(ctx context.Context, k Key) (fileRecord, error) {
 	if err != nil {
 		return fileRecord{}, err
 	}
-	return fileRecord{
-		ID: k.ID, Alg: string(k.Alg), State: string(k.State),
-		CreatedAt: k.CreatedAt, PromotedAt: k.PromotedAt,
-		RetiringAt: k.RetiringAt, RetiredAt: k.RetiredAt,
-		KEKID: s.kek.ID(), WrappedDEK: wrapped, PrivateCT: ct, PublicJWK: pubJWK,
-	}, nil
+	rec.KEKID, rec.WrappedDEK, rec.PrivateCT, rec.PublicJWK = s.kek.ID(), wrapped, ct, pubJWK
+	return rec, nil
 }
 
-func (s *FileStore) decode(ctx context.Context, rec fileRecord) (Key, error) {
+func (s *FileStore) decode(ctx context.Context, rec fileRecord, version, gen int) (Key, error) {
 	if rec.KEKID != s.kek.ID() {
 		return Key{}, fmt.Errorf("%w: record has %q, store has %q", ErrKEKMismatch, rec.KEKID, s.kek.ID())
 	}
-	pkcs8, err := envelopeOpen(ctx, s.kek, rec.PrivateCT, rec.WrappedDEK, aad(rec.ID, jose.Algorithm(rec.Alg)))
+	recAAD := aadV2(rec, gen)
+	if version < 2 {
+		recAAD = aad(rec.ID, jose.Algorithm(rec.Alg))
+	}
+	pkcs8, err := envelopeOpen(ctx, s.kek, rec.PrivateCT, rec.WrappedDEK, recAAD)
 	if err != nil {
 		return Key{}, err
 	}
@@ -136,9 +245,10 @@ func (s *FileStore) decode(ctx context.Context, rec fileRecord) (Key, error) {
 
 // persist writes the whole store atomically. Caller must hold s.mu.
 func (s *FileStore) persist(ctx context.Context) error {
-	doc := fileDoc{Version: 1}
+	next := s.gen + 1
+	doc := fileDoc{Version: fileVersion, Generation: next}
 	for _, id := range s.order {
-		rec, err := s.encode(ctx, s.keys[id])
+		rec, err := s.encode(ctx, s.keys[id], next)
 		if err != nil {
 			return err
 		}
@@ -169,7 +279,29 @@ func (s *FileStore) persist(ctx context.Context) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.path)
+	if err := os.Rename(tmp.Name(), s.path); err != nil {
+		return err
+	}
+	// The file's contents are fsynced above; the directory entry that points at
+	// them is not, and that is the half that decides whether the rename is
+	// visible after a crash. Without this, Put/Update report a key durable that
+	// a power loss can still take back.
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	if err := d.Close(); err != nil {
+		return err
+	}
+	// Only now is the new generation the one on disk; a failed persist must not
+	// advance it, or the next write would seal records under a generation the
+	// document never carried.
+	s.gen = next
+	return nil
 }
 
 func (s *FileStore) Put(ctx context.Context, k Key) error {

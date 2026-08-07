@@ -25,7 +25,7 @@ CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions (user_id);
 CREATE TABLE IF NOT EXISTS one_time_tokens (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    purpose    TEXT NOT NULL CHECK (purpose IN ('password_reset', 'verify_email')),
+    purpose    TEXT NOT NULL CHECK (purpose IN ('password_reset', 'verify_email', 'undo_totp')),
     token_hash TEXT NOT NULL UNIQUE,    -- SHA-256; raw tokens never stored
     payload    TEXT,                    -- verify_email: the address being verified
     expires_at TIMESTAMPTZ NOT NULL,
@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS one_time_tokens (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ott_user_purpose_idx ON one_time_tokens (user_id, purpose) WHERE used_at IS NULL;
+-- Existing installs keep the CHECK the CREATE TABLE above gave them, which
+-- predates 'undo_totp' and would reject every one of those inserts. Widen it.
+ALTER TABLE one_time_tokens DROP CONSTRAINT IF EXISTS one_time_tokens_purpose_check;
+ALTER TABLE one_time_tokens ADD CONSTRAINT one_time_tokens_purpose_check
+    CHECK (purpose IN ('password_reset', 'verify_email', 'undo_totp'));
 
 CREATE TABLE IF NOT EXISTS recovery_codes (
     user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -50,10 +55,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     attempts     INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 5,
     run_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claimed_at   TIMESTAMPTZ,            -- when the current claim was taken; a stale one is reapable
     last_error   TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS jobs_claim_idx ON jobs (run_at, created_at) WHERE status = 'pending';
+-- Existing installs: CREATE TABLE IF NOT EXISTS above is a no-op for them.
+-- Rows already 'running' keep claimed_at NULL; claim() COALESCEs to run_at so
+-- they are reaped rather than stranded.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+-- Must cover both claim() branches: pending-and-due, and running-but-stale.
+-- A pending-only partial index cannot serve the OR, so the planner would fall
+-- back to a seq scan for *both*. Dropped and recreated because IF NOT EXISTS
+-- would silently keep the old predicate on an existing install.
+DROP INDEX IF EXISTS jobs_claim_idx;
+CREATE INDEX jobs_claim_idx ON jobs (run_at, created_at) WHERE status IN ('pending', 'running');
 
 -- Emails are stored normalized (see normalizeEmail in src/app.ts): the column
 -- is plain case-sensitive TEXT, so a row written before that was enforced is

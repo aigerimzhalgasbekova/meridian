@@ -1,6 +1,7 @@
 package jose
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -9,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"strings"
 	"testing"
 )
@@ -264,6 +266,62 @@ func TestKnownAttackPatterns(t *testing.T) {
 			if _, _, err := Verify(tok, resolver, allowed); !errors.Is(err, ErrMalformed) {
 				t.Errorf("token %q: want ErrMalformed, got %v", tok, err)
 			}
+		}
+	})
+
+	t.Run("prohibited header nulled to a zero value", func(t *testing.T) {
+		// A struct-level check passes on `"crit":null`, `"crit":[]` and on a
+		// duplicate member whose last occurrence is null — the member is
+		// physically present in the signed header and silently ignored.
+		for _, rawHdr := range []string{
+			`{"alg":"EdDSA","kid":"ed-1","crit":null}`,
+			`{"alg":"EdDSA","kid":"ed-1","crit":[]}`,
+			`{"alg":"EdDSA","kid":"ed-1","crit":["b64"],"crit":null}`,
+			`{"alg":"EdDSA","kid":"ed-1","x5c":null}`,
+			`{"alg":"EdDSA","kid":"ed-1","jku":""}`,
+			`{"alg":"EdDSA","kid":"ed-1","jwk":null}`,
+		} {
+			// Sign it for real: the header is covered by the signature, so an
+			// unsigned forgery would fail for the wrong reason.
+			signingInput := b64.EncodeToString([]byte(rawHdr)) + "." + b64.EncodeToString(payload)
+			sig := ed25519.Sign(skEd.Private.(ed25519.PrivateKey), []byte(signingInput))
+			tok := signingInput + "." + b64.EncodeToString(sig)
+			if _, _, err := Verify(tok, resolver, allowed); !errors.Is(err, ErrHeaderRejected) {
+				t.Errorf("header %s: want ErrHeaderRejected, got %v", rawHdr, err)
+			}
+		}
+	})
+
+	t.Run("non-canonical base64 signature", func(t *testing.T) {
+		// A 64-byte Ed25519 signature leaves 4 unused bits in the final base64
+		// quantum, so a non-strict decoder accepts 16 distinct encodings of the
+		// same signature: one token, many token strings.
+		parts := strings.Split(genuine, ".")
+		alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+		last := parts[2][len(parts[2])-1]
+		for _, c := range []byte(alphabet) {
+			if c == last {
+				continue
+			}
+			alt := parts[2][:len(parts[2])-1] + string(c)
+			raw, err := base64.RawURLEncoding.DecodeString(alt) // non-strict, on purpose
+			if err != nil || !bytes.Equal(raw, mustB64(t, parts[2])) {
+				continue // a genuinely different signature, not an alias
+			}
+			if _, _, err := Verify(parts[0]+"."+parts[1]+"."+alt, resolver, allowed); err == nil {
+				t.Errorf("alternate encoding %q of the same signature verified", alt)
+			}
+		}
+	})
+
+	t.Run("RSA modulus above the ceiling", func(t *testing.T) {
+		// A hostile upstream JWKS can publish an oversized modulus; each
+		// verification against it burns superlinear CPU on a serving goroutine.
+		huge := new(big.Int).Lsh(big.NewInt(1), MaxRSABits+1)
+		vk := VerificationKey{ID: "big", Alg: AlgRS256, Public: &rsa.PublicKey{N: huge, E: 65537}}
+		tok := forgeToken(t, map[string]any{"alg": "RS256", "kid": "big"}, payload, []byte("sig"))
+		if _, _, err := Verify(tok, resolverFor(t, vk), allowed); err == nil {
+			t.Error("oversized RSA modulus accepted")
 		}
 	})
 

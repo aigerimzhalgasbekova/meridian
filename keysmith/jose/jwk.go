@@ -40,11 +40,19 @@ type JWKS struct {
 // PublicJWK encodes a verification key as a public JWK.
 func PublicJWK(key VerificationKey) (JWK, error) {
 	jwk := JWK{Kid: key.ID, Use: "sig", Alg: string(key.Alg)}
+	// The declared alg must match the concrete key type, or this encoder emits
+	// a JWK its own PublicKey decoder refuses (e.g. kty=OKP with alg=RS256).
 	switch pub := key.Public.(type) {
 	case ed25519.PublicKey:
+		if key.Alg != AlgEdDSA {
+			return JWK{}, fmt.Errorf("%w: Ed25519 key with alg %q", ErrAlgMismatch, key.Alg)
+		}
 		jwk.Kty, jwk.Crv = "OKP", "Ed25519"
 		jwk.X = b64.EncodeToString(pub)
 	case *ecdsa.PublicKey:
+		if key.Alg != AlgES256 {
+			return JWK{}, fmt.Errorf("%w: EC key with alg %q", ErrAlgMismatch, key.Alg)
+		}
 		if pub.Curve.Params().Name != "P-256" {
 			return JWK{}, fmt.Errorf("jose: unsupported curve %q", pub.Curve.Params().Name)
 		}
@@ -54,8 +62,11 @@ func PublicJWK(key VerificationKey) (JWK, error) {
 		buf2 := make([]byte, 32)
 		jwk.Y = b64.EncodeToString(pub.Y.FillBytes(buf2))
 	case *rsa.PublicKey:
-		if pub.N.BitLen() < MinRSABits {
-			return JWK{}, fmt.Errorf("jose: RSA key is %d bits, minimum is %d", pub.N.BitLen(), MinRSABits)
+		if key.Alg != AlgRS256 {
+			return JWK{}, fmt.Errorf("%w: RSA key with alg %q", ErrAlgMismatch, key.Alg)
+		}
+		if err := checkRSABits(pub.N.BitLen()); err != nil {
+			return JWK{}, err
 		}
 		jwk.Kty = "RSA"
 		jwk.N = b64.EncodeToString(pub.N.Bytes())
@@ -111,8 +122,8 @@ func (j JWK) PublicKey() (VerificationKey, error) {
 			return VerificationKey{}, errors.New("jose: invalid RSA parameters")
 		}
 		n := new(big.Int).SetBytes(nb)
-		if n.BitLen() < MinRSABits {
-			return VerificationKey{}, fmt.Errorf("jose: RSA key is %d bits, minimum is %d", n.BitLen(), MinRSABits)
+		if err := checkRSABits(n.BitLen()); err != nil {
+			return VerificationKey{}, err
 		}
 		e := new(big.Int).SetBytes(eb)
 		if !e.IsInt64() || e.Int64() < 3 || e.Int64() > 1<<31-1 {
@@ -145,19 +156,35 @@ func NewKeySet(keys ...VerificationKey) (*KeySet, error) {
 	return &KeySet{byID: byID}, nil
 }
 
-// ParseJWKS decodes a JWKS document into a KeySet, rejecting any invalid key.
+// ParseJWKS decodes a JWKS document into a KeySet, skipping keys this profile
+// cannot use and failing only if that leaves nothing.
+//
+// All-or-nothing is right for a single key and wrong for a key *set*: a set is
+// heterogeneous by nature (RFC 7517 makes `alg` optional, and providers mix
+// algorithms), and this parser is fed JWKS documents from federated identity
+// providers we neither control nor constrain. One unusable key must not take
+// the usable ones down with it — an unusable key is still never accepted.
 func ParseJWKS(doc []byte) (*KeySet, error) {
 	var set JWKS
 	if err := json.Unmarshal(doc, &set); err != nil {
 		return nil, fmt.Errorf("jose: parse JWKS: %w", err)
 	}
 	keys := make([]VerificationKey, 0, len(set.Keys))
+	var rejected int
+	var firstErr error
 	for _, j := range set.Keys {
 		k, err := j.PublicKey()
 		if err != nil {
-			return nil, fmt.Errorf("jose: JWKS key %q: %w", j.Kid, err)
+			rejected++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("jose: JWKS key %q: %w", j.Kid, err)
+			}
+			continue
 		}
 		keys = append(keys, k)
+	}
+	if len(keys) == 0 && rejected > 0 {
+		return nil, fmt.Errorf("jose: parse JWKS: no usable keys (%d rejected): %w", rejected, firstErr)
 	}
 	return NewKeySet(keys...)
 }

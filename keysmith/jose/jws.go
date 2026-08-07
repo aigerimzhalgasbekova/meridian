@@ -15,10 +15,31 @@ import (
 	"strings"
 )
 
-var b64 = base64.RawURLEncoding
+// Strict: the decoder must reject non-canonical encodings. Without it the
+// unused trailing bits of a final base64 quantum are ignored, so a 64-byte
+// Ed25519 signature has 16 distinct encodings that all decode to the same
+// bytes — i.e. a token's identity as a string diverges from its identity as a
+// credential, and any consumer keying a replay cache or denylist on the raw
+// token string is bypassed by re-encoding one character.
+var b64 = base64.RawURLEncoding.Strict()
 
 // MinRSABits is the smallest RSA modulus this package will sign or verify with.
 const MinRSABits = 2048
+
+// MaxRSABits is the largest RSA modulus this package will verify with.
+// Modular exponentiation cost grows superlinearly in the modulus size, so an
+// unbounded modulus in a JWKS we do not control (a federated IdP's) is remote
+// CPU exhaustion: 8192 bits verifies in under 2ms, 65536 takes 60ms.
+const MaxRSABits = 8192
+
+// checkRSABits bounds an RSA modulus on both sides. Every RSA path in this
+// package routes through it so the two bounds cannot drift apart.
+func checkRSABits(bits int) error {
+	if bits < MinRSABits || bits > MaxRSABits {
+		return fmt.Errorf("jose: RSA key is %d bits, must be between %d and %d", bits, MinRSABits, MaxRSABits)
+	}
+	return nil
+}
 
 // Header is the JOSE protected header. Fields beyond alg/kid/typ exist only so
 // their presence can be detected and rejected: this package never dereferences
@@ -34,6 +55,10 @@ type Header struct {
 	X5u  string          `json:"x5u,omitempty"`
 	X5c  []string        `json:"x5c,omitempty"`
 }
+
+// prohibitedHeaders are rejected whenever the member is present, whatever its
+// value. Keep in sync with the Header fields above.
+var prohibitedHeaders = []string{"crit", "jwk", "jku", "x5u", "x5c"}
 
 // SigningKey couples a private key with its algorithm and key ID.
 type SigningKey struct {
@@ -121,8 +146,8 @@ func sign(key SigningKey, signingInput []byte) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("jose: RS256 requires an RSA private key, got %T", key.Private)
 		}
-		if priv.N.BitLen() < MinRSABits {
-			return nil, fmt.Errorf("jose: RSA key is %d bits, minimum is %d", priv.N.BitLen(), MinRSABits)
+		if err := checkRSABits(priv.N.BitLen()); err != nil {
+			return nil, err
 		}
 		digest := sha256.Sum256(signingInput)
 		sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, digest[:])
@@ -153,14 +178,24 @@ func Verify(token string, resolver KeyResolver, allowed []Algorithm) ([]byte, He
 	if err != nil {
 		return nil, zero, fmt.Errorf("%w: header segment: %v", ErrMalformed, err)
 	}
+	// Prohibited members are rejected on *presence in the raw JSON*, not on the
+	// decoded struct: `"crit":null`, `"crit":[]` or a duplicate member whose
+	// last occurrence is null all decode to a zero value, so a struct check
+	// silently ignores a crit header the profile promises to hard-reject.
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(rawHeader, &members); err != nil {
+		return nil, zero, fmt.Errorf("%w: header not valid for this profile: %v", ErrHeaderRejected, err)
+	}
+	for _, name := range prohibitedHeaders {
+		if _, present := members[name]; present {
+			return nil, zero, fmt.Errorf("%w: %q is not accepted", ErrHeaderRejected, name)
+		}
+	}
 	var hdr Header
 	dec := json.NewDecoder(strings.NewReader(string(rawHeader)))
 	dec.DisallowUnknownFields() // unknown header params are rejected, not ignored
 	if err := dec.Decode(&hdr); err != nil {
 		return nil, zero, fmt.Errorf("%w: header not valid for this profile: %v", ErrHeaderRejected, err)
-	}
-	if len(hdr.Crit) > 0 || hdr.Jwk != nil || hdr.Jku != "" || hdr.X5u != "" || len(hdr.X5c) > 0 {
-		return nil, zero, fmt.Errorf("%w: crit/jwk/jku/x5u/x5c are not accepted", ErrHeaderRejected)
 	}
 	if !algAllowed(hdr.Alg, allowed) {
 		return nil, zero, fmt.Errorf("%w: %q", ErrAlgNotAllowed, string(hdr.Alg))
@@ -235,8 +270,8 @@ func verify(key VerificationKey, signingInput, sig []byte) error {
 		if !ok {
 			return fmt.Errorf("jose: RS256 requires an RSA public key, got %T", key.Public)
 		}
-		if pub.N.BitLen() < MinRSABits {
-			return fmt.Errorf("jose: RSA key is %d bits, minimum is %d", pub.N.BitLen(), MinRSABits)
+		if err := checkRSABits(pub.N.BitLen()); err != nil {
+			return err
 		}
 		digest := sha256.Sum256(signingInput)
 		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], sig); err != nil {

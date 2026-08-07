@@ -21,8 +21,3 @@ export const demoUrls: Record<string, string | null> = {
   portal: 'https://portal.iammeridian.cc/',
   console: 'https://console.iammeridian.cc/',
 };
-
-export const AUTHOR = {
-  name: 'aikazzh',
-  github: 'https://github.com/aigerimzhalgasbekova',
-};

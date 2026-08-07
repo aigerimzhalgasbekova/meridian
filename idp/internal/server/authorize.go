@@ -269,6 +269,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.writePageError(w, http.StatusInternalServerError, "Error", "Could not establish a session.")
 		return
 	}
+	// The session we just created satisfies any max_age, so drop it from the
+	// return URL. Left in, the freshness check at /authorize re-runs against a
+	// session created moments ago — and with the legal max_age=0 the strict
+	// `elapsed > 0` comparison is never satisfiable, looping the login form
+	// forever with no error and no log signal.
+	q := returnTo.Query()
+	q.Del("max_age")
+	returnTo.RawQuery = q.Encode()
 	http.Redirect(w, r, stripPrompt(returnTo, "login"), http.StatusSeeOther)
 }
 

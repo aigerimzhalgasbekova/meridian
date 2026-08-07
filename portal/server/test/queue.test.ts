@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { memoryQueue } from '../src/queue/memory.js';
-import { backoffMs } from '../src/queue/types.js';
+import { backoffMs, STALE_CLAIM_MS } from '../src/queue/types.js';
 import { Worker } from '../src/queue/worker.js';
 import { runQueueContract } from './contract/queue.js';
 
@@ -132,19 +132,43 @@ describe('worker retry / dead-letter', () => {
     expect(new Set(seen).size).toBe(20);
     expect(await q.listByStatus('done')).toHaveLength(20);
   });
+  it('a failed complete() is not treated as a handler failure, and the job self-heals', async () => {
+    // complete() rejecting (pg pool timeout, RDS failover) inside the handler's
+    // try was caught and routed into fail(), which reschedules a job whose
+    // side effect already happened — a second email. And with nothing
+    // reclaiming a stranded 'running' row while the process stays up, the
+    // alternative was losing the job until a restart.
+    const q = memoryQueue();
+    const clock = new Date('2026-01-01T00:00:00Z');
+    const errors: unknown[] = [];
+    let runs = 0;
+    const failing = { ...q, complete: async () => { throw new Error('pg pool timeout'); } };
+    const worker = new Worker(
+      failing as typeof q,
+      { work: async () => { runs++; } },
+      { now: () => clock, onError: (_j, e) => void errors.push(e) },
+    );
+    const job = await q.enqueue('work', {}, { runAt: clock });
+
+    await expect(worker.tick()).rejects.toThrow('pg pool timeout');
+    expect(errors).toHaveLength(0); // bookkeeping failure, not a handler failure
+    expect((await q.get(job.id))?.status).toBe('running');
+    expect(await q.claim(clock)).toBeNull(); // still held, not double-run immediately
+
+    const later = new Date(clock.getTime() + STALE_CLAIM_MS + 1000);
+    expect((await q.claim(later))?.id).toBe(job.id); // reaped without a restart
+    expect(runs).toBe(1);
+  });
+
   it('survives a database that is not up yet instead of crash-looping', async () => {
-    // recover() rejecting on a cold boot (or a tick rejecting mid-run) used to
-    // be an unhandled rejection, which under Node's default
-    // --unhandled-rejections=throw kills the process. index.ts calls start()
-    // unconditionally, so that turns a transient blip into a crash-loop.
+    // A tick rejecting mid-run used to be an unhandled rejection, which under
+    // Node's default --unhandled-rejections=throw kills the process. index.ts
+    // calls start() unconditionally, so that turns a transient blip into a
+    // crash-loop.
     const q = memoryQueue();
     let up = false;
     const failing = {
       ...q,
-      recover: async () => {
-        if (!up) throw new Error('ECONNREFUSED');
-        return q.recover();
-      },
       claim: async (now: Date) => {
         if (!up) throw new Error('ECONNREFUSED');
         return q.claim(now);

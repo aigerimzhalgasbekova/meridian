@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -52,6 +53,10 @@ type Config struct {
 	Apps map[string]App
 	// InsecureDev drops the Secure cookie flag for plain-HTTP dev mode.
 	InsecureDev bool
+	// Logger receives the security audit trail: every callback rejection with
+	// its concrete typed error, and every identity provisioned or linked.
+	// nil = slog.Default().
+	Logger *slog.Logger
 	// Now is injectable for tests (nil = time.Now).
 	Now func() time.Time
 }
@@ -78,6 +83,9 @@ func New(cfg Config, reg *provider.Registry, dir directory.Store, signer Signer)
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
 	rm, err := relay.NewManager(cfg.HMACKey, cfg.Now)
 	if err != nil {
@@ -136,8 +144,9 @@ func (s *Server) render(w http.ResponseWriter, status int, name string, data any
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := templates.ExecuteTemplate(w, name, data); err != nil {
-		// Headers are gone; log-worthy in a real deployment.
-		_ = err
+		// Headers are already on the wire, so the response cannot be salvaged;
+		// all that is left is to say so.
+		s.cfg.Logger.Error("template render failed", "template", name, "err", err)
 	}
 }
 
@@ -181,7 +190,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	flow, state, err := s.relay.Begin(p.Config().Name, relay.ModeLogin, appID, "")
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		s.beginFailed(w, p, err)
 		return
 	}
 	authURL, err := p.AuthorizeURL(r.Context(), state, flow.Nonce, relay.Challenge(flow.Verifier), s.redirectURI(p.Config().Name))
@@ -189,7 +198,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.upstreamError(w, p, err)
 		return
 	}
+	s.setFlowCookie(w, p.Config().Name, flow.Binding)
 	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+// beginFailed reports a flow that could not be started. A full flow table is
+// load shedding, not a bug: say "busy", not "broken".
+func (s *Server) beginFailed(w http.ResponseWriter, p *provider.Provider, err error) {
+	s.cfg.Logger.Warn("flow could not be started", "provider", p.Config().Name, "err", err)
+	if errors.Is(err, relay.ErrTooBusy) {
+		s.render(w, http.StatusServiceUnavailable, "error.html", map[string]any{
+			"Message": "Too many sign-ins are in progress. Try again in a moment.",
+		})
+		return
+	}
+	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
 // handleLink begins a link flow: attach another provider to the signed-in
@@ -220,7 +243,7 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 	}
 	flow, state, err := s.relay.Begin(p.Config().Name, relay.ModeLink, "", sess.ID)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		s.beginFailed(w, p, err)
 		return
 	}
 	authURL, err := p.AuthorizeURL(r.Context(), state, flow.Nonce, relay.Challenge(flow.Verifier), s.redirectURI(p.Config().Name))
@@ -228,6 +251,7 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 		s.upstreamError(w, p, err)
 		return
 	}
+	s.setFlowCookie(w, p.Config().Name, flow.Binding)
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
@@ -240,17 +264,26 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	pname := p.Config().Name
+	// The flow is single-use whatever happens next, so the binding cookie is
+	// spent on every exit path from here on.
+	s.clearFlowCookie(w, pname)
 	q := r.URL.Query()
 	if e := q.Get("error"); e != "" {
+		s.cfg.Logger.Warn("upstream reported an error at the callback",
+			"provider", pname, "error", e, "remote", r.RemoteAddr)
 		s.render(w, http.StatusBadGateway, "error.html", map[string]any{
 			"Message": "The identity provider reported an error: " + e,
 		})
 		return
 	}
-	flow, err := s.relay.Consume(q.Get("state"), p.Config().Name)
+	flow, err := s.relay.Consume(q.Get("state"), pname, flowBinding(r))
 	if err != nil {
-		// Deliberately uniform: replay, tamper and expiry all read the same
-		// to the caller.
+		// Deliberately uniform to the caller: replay, tamper, expiry and a
+		// callback presented by the wrong browser all read the same. The
+		// distinct error goes to the log, which is where it is useful.
+		s.cfg.Logger.Warn("callback state rejected",
+			"provider", pname, "err", err, "remote", r.RemoteAddr)
 		s.render(w, http.StatusBadRequest, "error.html", map[string]any{
 			"Message": "This sign-in link is invalid or has already been used. Start again.",
 		})
@@ -258,6 +291,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	code := q.Get("code")
 	if code == "" {
+		s.cfg.Logger.Warn("callback without an authorization code", "provider", pname, "remote", r.RemoteAddr)
 		s.render(w, http.StatusBadRequest, "error.html", map[string]any{"Message": "Missing authorization code."})
 		return
 	}
@@ -268,6 +302,8 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	claims, err := p.VerifyIDToken(r.Context(), rawToken, flow.Nonce)
 	if err != nil {
+		s.cfg.Logger.Warn("ID token failed verification",
+			"provider", pname, "err", err, "remote", r.RemoteAddr)
 		s.render(w, http.StatusUnauthorized, "error.html", map[string]any{
 			"Message": "The identity token failed verification.",
 		})
@@ -299,8 +335,13 @@ func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, flow relay.
 	ident, err := s.dir.IdentityByLink(link.Provider, link.Subject)
 	if errors.Is(err, directory.ErrNotFound) {
 		ident, err = s.dir.CreateIdentity(email, name, link)
+		if err == nil {
+			s.cfg.Logger.Info("identity provisioned",
+				"identity", ident.ID, "provider", link.Provider, "subject", link.Subject)
+		}
 	}
 	if err != nil {
+		s.cfg.Logger.Error("identity resolution failed", "provider", link.Provider, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -315,12 +356,18 @@ func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, flow relay.
 }
 
 // finishLink attaches the freshly authenticated upstream account to the
-// identity of the session that initiated the link flow. The session must
-// still exist and its own upstream authentication must still be fresh: fresh
-// auth to *both* sides, not one.
+// identity of the session that initiated the link flow. The browser
+// completing the flow must *be* the session that started it — not merely hold
+// a callback for it — and that session's own upstream authentication must
+// still be fresh: fresh auth to *both* sides, not one.
 func (s *Server) finishLink(w http.ResponseWriter, r *http.Request, flow relay.Flow, link directory.Link) {
-	sess, ok := s.sessions.get(flow.SessionID)
-	if !ok || s.cfg.Now().Sub(sess.AuthTime) > linkFreshness {
+	// currentSession resolves the requesting browser's own cookie and already
+	// enforces session expiry, so comparing its ID to the flow's covers both
+	// "session still alive" and "same party that started the link".
+	sess, ok := s.currentSession(r)
+	if !ok || sess.ID != flow.SessionID || s.cfg.Now().Sub(sess.AuthTime) > linkFreshness {
+		s.cfg.Logger.Warn("link callback rejected",
+			"provider", link.Provider, "session_matched", ok && sess.ID == flow.SessionID, "remote", r.RemoteAddr)
 		s.render(w, http.StatusForbidden, "error.html", map[string]any{
 			"Message": "Your session expired during linking. Sign in again and retry.",
 		})
@@ -331,9 +378,13 @@ func (s *Server) finishLink(w http.ResponseWriter, r *http.Request, flow relay.F
 		if errors.Is(err, directory.ErrAlreadyLinked) {
 			msg = "That account is already linked to an identity. Bridge never merges identities automatically — see the account page."
 		}
+		s.cfg.Logger.Warn("link refused",
+			"identity", sess.IdentityID, "provider", link.Provider, "err", err)
 		s.render(w, http.StatusConflict, "error.html", map[string]any{"Message": msg})
 		return
 	}
+	s.cfg.Logger.Info("provider linked",
+		"identity", sess.IdentityID, "provider", link.Provider, "subject", link.Subject)
 	s.sessions.refresh(sess.ID, link.Provider)
 	http.Redirect(w, r, "/account", http.StatusFound)
 }
@@ -472,6 +523,10 @@ func (s *Server) renderUnavailable(w http.ResponseWriter, p *provider.Provider) 
 // upstreamError maps an upstream failure mid-flow: breaker-open gets the
 // fail-fast page, anything else a generic upstream error.
 func (s *Server) upstreamError(w http.ResponseWriter, p *provider.Provider, err error) {
+	// The last silent rejection path: a failed code exchange (stolen or injected
+	// code, PKCE mismatch, dead token endpoint) and every breaker-open refusal
+	// land here. Provider errors carry no code, token or state bytes.
+	s.cfg.Logger.Warn("upstream call failed", "provider", p.Config().Name, "err", err)
 	if errors.Is(err, health.ErrOpen) {
 		s.renderUnavailable(w, p)
 		return

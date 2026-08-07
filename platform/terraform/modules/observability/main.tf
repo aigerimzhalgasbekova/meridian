@@ -107,6 +107,46 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
   ok_actions    = [aws_sns_topic.alarms.arn]
 }
 
+# The other alarms all watch metrics that only exist while a task is
+# registered, and treat missing data as OK — so a service at zero tasks goes
+# completely quiet. HealthyHostCount is the one signal that stays meaningful
+# there, and it is the only alarm that must treat missing data as breaching.
+# scripts/pause.sh disables/re-enables just these while the stack is parked.
+# ponytail: covers ALB-fronted services only. The internal three (keysmith,
+# sessiond, sentinel) would need ECS/ContainerInsights RunningTaskCount, which
+# the cheap profile does not publish — add it when Insights is on in prod, or
+# an EventBridge rule on ECS task state change if it is needed in dev.
+resource "aws_cloudwatch_metric_alarm" "no_healthy_hosts" {
+  for_each = local.alb_services
+
+  alarm_name          = "${var.name}-${each.key}-no-healthy-hosts"
+  alarm_description   = "${each.key}: zero healthy targets (service is down)"
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "HealthyHostCount"
+  statistic           = "Minimum"
+  period              = 60
+  evaluation_periods  = 3
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    LoadBalancer = var.alb_arn_suffix
+    TargetGroup  = each.value.target_group_arn_suffix
+  }
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+
+  lifecycle {
+    # pause.sh disables the actions out-of-band; actions_enabled defaults to
+    # true, so without this an unrelated apply re-arms them mid-pause and every
+    # down-detector pages continuously. Same reason desired_count/min_capacity
+    # are ignored in modules/service.
+    ignore_changes = [actions_enabled]
+  }
+}
+
 resource "aws_cloudwatch_metric_alarm" "p99_latency" {
   for_each = local.alb_services
 

@@ -21,6 +21,13 @@
 // The signature check alone cannot provide replay protection; server-side
 // state can, which is why both exist. See docs/adr/0003.
 //
+// One-time use is not the same as browser binding, and neither implies the
+// other: a *first* presentation of a genuine, unexpired, unused state is
+// accepted by every check above no matter who presents it. Flow.Binding
+// closes that: it is a secret the browser holds in a cookie and must present
+// alongside the state at Consume, so a callback URL that leaks (or is
+// deliberately delivered to a victim) is useless to anyone else.
+//
 // Flows expire after TTL (10 minutes: enough for a slow login at the
 // upstream, short enough that abandoned flows don't pile up) and expired
 // records are swept opportunistically on each new flow.
@@ -55,6 +62,13 @@ type Flow struct {
 	ID       string
 	Provider string
 	Mode     Mode
+	// Binding is the secret handed to the browser that started the flow (as a
+	// cookie) and demanded back at the callback. It is deliberately *not* the
+	// flow ID (that rides inside the signed state, through the upstream's URL
+	// bar, logs and Referer) and not the nonce (that goes upstream): a party
+	// who captures or is handed the callback URL still cannot complete the
+	// flow. This is what binds a flow to a user agent — see Consume.
+	Binding string
 	// Nonce binds the upstream ID token to this flow.
 	Nonce string
 	// Verifier is the PKCE code verifier; its S256 challenge went upstream.
@@ -72,15 +86,29 @@ var (
 	ErrBadState     = errors.New("relay: state invalid or tampered")
 	ErrStateExpired = errors.New("relay: state expired")
 	ErrStateUsed    = errors.New("relay: state already used or unknown (possible replay)")
+	ErrUnbound      = errors.New("relay: callback came from a different browser than started the flow")
+	ErrTooBusy      = errors.New("relay: too many login flows in flight")
 )
+
+// maxFlows caps in-flight flows. /login/{provider} is unauthenticated, so
+// without a cap an anonymous flood grows the map without bound; a full map
+// sheds new logins instead of the process.
+const maxFlows = 50_000
+
+// sweepInterval throttles the opportunistic expiry sweep. Sweeping on *every*
+// Begin makes each request O(live flows) under the manager's mutex, so a flood
+// costs quadratic time; once every 30s bounds that to a rounding error while
+// still keeping abandoned flows from accumulating past TTL by much.
+const sweepInterval = 30 * time.Second
 
 // Manager creates and consumes login flows. Safe for concurrent use.
 type Manager struct {
 	hmacKey []byte
 	now     func() time.Time
 
-	mu    sync.Mutex
-	flows map[string]Flow
+	mu        sync.Mutex
+	flows     map[string]Flow
+	lastSweep time.Time
 }
 
 // NewManager builds a Manager. hmacKey must be at least 32 bytes of secret
@@ -110,6 +138,7 @@ func (m *Manager) Begin(provider string, mode Mode, appID, sessionID string) (Fl
 		ID:        randomToken(),
 		Provider:  provider,
 		Mode:      mode,
+		Binding:   randomToken(),
 		Nonce:     randomToken(),
 		Verifier:  randomToken(), // 43 base64url chars: a valid RFC 7636 verifier
 		AppID:     appID,
@@ -123,25 +152,36 @@ func (m *Manager) Begin(provider string, mode Mode, appID, sessionID string) (Fl
 	state := base64.RawURLEncoding.EncodeToString(payload) + "." + m.sign(payload)
 
 	m.mu.Lock()
-	// Opportunistic sweep: expired flows are garbage, collect them here
-	// rather than with a background goroutine.
-	for id, old := range m.flows {
-		if m.now().After(old.Expires) {
-			delete(m.flows, id)
+	defer m.mu.Unlock()
+	// Opportunistic sweep: expired flows are garbage, collect them here rather
+	// than with a background goroutine — but at most every sweepInterval, so
+	// the cost is not paid per request.
+	if now := m.now(); now.Sub(m.lastSweep) >= sweepInterval {
+		m.lastSweep = now
+		for id, old := range m.flows {
+			if now.After(old.Expires) {
+				delete(m.flows, id)
+			}
 		}
 	}
+	if len(m.flows) >= maxFlows {
+		return Flow{}, "", ErrTooBusy
+	}
 	m.flows[f.ID] = f
-	m.mu.Unlock()
 	return f, state, nil
 }
 
 // Consume verifies a state parameter for the given provider and returns its
-// flow, deleting it: a state can be consumed exactly once.
+// flow, deleting it: a state can be consumed exactly once. binding is the
+// secret the browser presented (Flow.Binding, held in a cookie); an absent
+// cookie is "" and fails like any other mismatch.
 //
 // Check order matters for the error a caller can trust: signature first
 // (everything else in the payload is attacker-controlled until it passes),
-// then expiry, then one-time-use.
-func (m *Manager) Consume(state, provider string) (Flow, error) {
+// then expiry, then one-time-use, then the browser binding — the binding
+// check runs *after* the record is deleted so a wrong-browser callback still
+// burns the flow rather than leaving it available for a retry.
+func (m *Manager) Consume(state, provider, binding string) (Flow, error) {
 	dot := -1
 	for i, c := range state {
 		if c == '.' {
@@ -179,6 +219,9 @@ func (m *Manager) Consume(state, provider string) (Flow, error) {
 	}
 	if m.now().After(f.Expires) {
 		return Flow{}, ErrStateExpired
+	}
+	if subtle.ConstantTimeCompare([]byte(f.Binding), []byte(binding)) != 1 {
+		return Flow{}, ErrUnbound
 	}
 	return f, nil
 }

@@ -123,6 +123,51 @@ func TestVerifyIDToken(t *testing.T) {
 		}
 	})
 
+	// (provider, subject) is the entire identity model. An upstream that omits
+	// sub would otherwise collapse every one of its users onto whichever
+	// identity first got JIT-provisioned under the empty subject.
+	t.Run("token without a sub rejected", func(t *testing.T) {
+		p := newProvider(t, s)
+		s.SetUser(fakeidp.User{Subject: "", Email: "one@example.com", Name: "User One"})
+		defer s.SetUser(alice)
+		token, nonce := authenticate(t, s, p)
+		if _, err := p.VerifyIDToken(ctx, token, nonce); !errors.Is(err, ErrMissingSubject) {
+			t.Fatalf("got %v, want ErrMissingSubject", err)
+		}
+	})
+
+	// OIDC Core §3.1.3.7 rules 4-5. jose.Expect{Audience} is membership only,
+	// so a token that merely lists us among several audiences passes it.
+	t.Run("azp rules", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			azp      string
+			extraAud []string
+			wantErr  bool
+		}{
+			{name: "single aud, no azp"},
+			{name: "azp names us", azp: clientID},
+			{name: "azp names another client", azp: "other-client", wantErr: true},
+			{name: "multi aud without azp", extraAud: []string{"other-client"}, wantErr: true},
+			{name: "multi aud with our azp", azp: clientID, extraAud: []string{"other-client"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				p := newProvider(t, s)
+				if tc.azp != "" {
+					s.SetExtraClaims(map[string]any{"azp": tc.azp})
+					defer s.SetExtraClaims(nil)
+				}
+				s.SetExtraAudience(tc.extraAud...)
+				defer s.SetExtraAudience()
+				token, nonce := authenticate(t, s, p)
+				_, err := p.VerifyIDToken(ctx, token, nonce)
+				if tc.wantErr != errors.Is(err, ErrAzpMismatch) {
+					t.Fatalf("got %v, wantErr=%v", err, tc.wantErr)
+				}
+			})
+		}
+	})
+
 	t.Run("token signed by unpublished key rejected", func(t *testing.T) {
 		p := newProvider(t, s)
 		s.SetUnpublishedKey(true)

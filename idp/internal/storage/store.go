@@ -43,13 +43,19 @@ type UserStore interface {
 
 type AuthCodeStore interface {
 	Create(ctx context.Context, c AuthCode) error
+	// Get fetches a code without consuming it, so the caller can validate the
+	// request and sign tokens before the irreversible single-use step. It
+	// applies no expiry or single-use policy — Consume remains the sole
+	// authority on both; Get only reports Used so a replay can be answered
+	// without a wasted signing call. Unknown codes return ErrNotFound.
+	Get(ctx context.Context, realm, codeHash string) (AuthCode, error)
 	// Consume atomically fetches and invalidates the code. A second call
 	// returns the (already used) record with ErrConsumed so the caller can
 	// revoke what the first redemption issued. Expired codes return
 	// ErrNotFound.
-	Consume(ctx context.Context, codeHash string, now time.Time) (AuthCode, error)
+	Consume(ctx context.Context, realm, codeHash string, now time.Time) (AuthCode, error)
 	// MarkFamily records the refresh-token family a consumed code issued.
-	MarkFamily(ctx context.Context, codeHash, familyID string) error
+	MarkFamily(ctx context.Context, realm, codeHash, familyID string) error
 }
 
 type RefreshTokenStore interface {
@@ -77,8 +83,10 @@ type DeviceCodeStore interface {
 	GetByDeviceCode(ctx context.Context, realm, deviceCodeHash string) (DeviceCode, error)
 	GetByUserCode(ctx context.Context, realm, userCode string) (DeviceCode, error)
 	// SetStatus transitions pending → approved/denied; any other
-	// transition returns ErrConsumed.
-	SetStatus(ctx context.Context, realm, deviceCodeHash string, status DeviceCodeStatus, userID string) error
+	// transition returns ErrConsumed. authTime is when the approving user
+	// last actively authenticated, carried through to the ID token's
+	// auth_time claim at redemption.
+	SetStatus(ctx context.Context, realm, deviceCodeHash string, status DeviceCodeStatus, userID string, authTime time.Time) error
 	// TouchPoll records a poll and returns the previous poll time so the
 	// caller can enforce the interval (slow_down).
 	TouchPoll(ctx context.Context, realm, deviceCodeHash string, now time.Time) (previous time.Time, err error)

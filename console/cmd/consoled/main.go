@@ -84,7 +84,10 @@ func run(logger *slog.Logger) error {
 	srv := server.New(cfg)
 	var handler http.Handler = srv
 	if dir := os.Getenv("CONSOLE_WEB_DIR"); dir != "" {
-		handler = withSPA(srv, dir)
+		// withSPA serves static files itself, bypassing the server's own
+		// middleware — so index.html would carry no CSP unless the composed
+		// handler is wrapped here.
+		handler = server.WithSecurityHeaders(withSPA(srv, dir))
 	}
 
 	httpSrv := &http.Server{
@@ -146,10 +149,10 @@ func seed(e *rbac.Engine, store *server.MemStore, v auth.HS256) map[string]strin
 	}
 	now := time.Now().UTC()
 	for i, u := range []server.User{
-		{ID: "u-100", Email: "dana@meridian.dev", Name: "Dana Levin", Realm: "engineering"},
-		{ID: "u-101", Email: "eli@meridian.dev", Name: "Eli Ortiz", Realm: "engineering"},
-		{ID: "u-102", Email: "fay@meridian.dev", Name: "Fay Chen", Realm: "finance"},
-		{ID: "u-103", Email: "gus@meridian.dev", Name: "Gus Adeyemi", Realm: "finance", Disabled: true},
+		{ID: "u-100", Email: "dana@example.com", Name: "Dana Levin", Realm: "engineering"},
+		{ID: "u-101", Email: "eli@example.com", Name: "Eli Ortiz", Realm: "engineering"},
+		{ID: "u-102", Email: "fay@example.com", Name: "Fay Chen", Realm: "finance"},
+		{ID: "u-103", Email: "gus@example.com", Name: "Gus Adeyemi", Realm: "finance", Disabled: true},
 	} {
 		store.AddUser(u)
 		store.AddSession(server.Session{

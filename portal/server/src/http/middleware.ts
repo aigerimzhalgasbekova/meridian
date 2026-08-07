@@ -129,7 +129,13 @@ export function rateLimit(ctx: AppContext): RequestHandler {
   let sweptAt = 0;
   return (req, res, next) => {
     const { limit, windowMs } = ctx.config.rateLimit;
-    const key = `${req.ip}:${req.path}`;
+    // Bucket by the *matched route*, never by req.path: Express routes
+    // case-insensitively and ignores a trailing slash by default, so
+    // /API/Auth/Login/ reaches the same handler as /api/auth/login while
+    // spelling a different req.path — one fresh bucket per casing, i.e. no
+    // limit at all. req.route is set for route-level middleware, which is the
+    // only way this is mounted; the fallback keeps it honest if it ever isn't.
+    const key = `${req.ip}:${req.route?.path ?? req.path}`;
     const now = ctx.now().getTime();
     // Sweep at most once per window, never per key: keys are attacker-chosen
     // (one per source IP and path), so without a sweep the map is an unbounded

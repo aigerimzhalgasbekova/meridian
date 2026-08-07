@@ -223,21 +223,26 @@ func (s *Store) Validate(ctx context.Context, token string) (Session, error) {
 		}
 		return sess, nil
 	}
+	// readAt is when Redis answered, not when the entry is filled: the cache
+	// entry describes truth as of readAt, so its lifetime must be measured
+	// from there. Otherwise a slow round trip widens the staleness bound to
+	// CacheTTL + RTT, and the documented "at most CacheTTL" stops being true.
+	readAt := s.cfg.Now().UnixMilli()
 	res, err := touchScript.Run(ctx, s.rdb, []string{sessKey(id)},
-		s.cfg.Now().UnixMilli(), s.cfg.IdleTTL.Milliseconds()).Result()
+		readAt, s.cfg.IdleTTL.Milliseconds(), id).Result()
 	if err != nil {
 		return Session{}, fmt.Errorf("store: validate: %w", err)
 	}
 	fields, ok := res.([]any)
 	if !ok || len(fields) == 0 {
-		s.cache.putNegative(id)
+		s.cache.putNegative(id, readAt)
 		return Session{}, ErrNotFound
 	}
 	sess, err := parseSession(id, fields)
 	if err != nil {
 		return Session{}, err
 	}
-	s.cache.put(id, sess)
+	s.cache.put(id, sess, readAt)
 	return sess, nil
 }
 
@@ -272,7 +277,7 @@ func (s *Store) Rotate(ctx context.Context, oldToken, ip, userAgent string) (str
 		return "", Session{}, err
 	}
 	sess.IP, sess.UAHash = ip, uaFingerprint(userAgent)
-	s.cache.put(newID, sess)
+	s.cache.put(newID, sess, now.UnixMilli())
 	return newTok, sess, nil
 }
 
@@ -284,9 +289,14 @@ func (s *Store) RevokeToken(ctx context.Context, token string) error {
 // RevokeID revokes a session by its server-side ID (admin surface).
 // Revocation is idempotent: revoking a dead session returns nil.
 func (s *Store) RevokeID(ctx context.Context, id string) error {
-	if _, err := revokeScript.Run(ctx, s.rdb, []string{sessKey(id)}, id).Result(); err != nil {
+	n, err := revokeScript.Run(ctx, s.rdb, []string{sessKey(id)}, id).Int64()
+	if err != nil {
 		return fmt.Errorf("store: revoke: %w", err)
 	}
+	// The API stays non-oracular (always 204), but the operator running an
+	// emergency kill needs to know whether it hit anything — a mistyped or
+	// wrong-cased ID is otherwise indistinguishable from a successful revoke.
+	s.cfg.Logger.Info("session revoked", "session_id", id, "matched", n == 1)
 	s.broadcastRevocation(ctx, id)
 	return nil
 }
@@ -321,6 +331,9 @@ func (s *Store) List(ctx context.Context, realm, userID string) ([]Session, erro
 	if err != nil {
 		return nil, fmt.Errorf("store: list: %w", err)
 	}
+	// One clock reading governs the whole listing, matching how the scripts
+	// pin one clock per call.
+	now := s.cfg.Now()
 	sessions := make([]Session, 0, len(members))
 	for _, id := range members {
 		m, err := s.rdb.HGetAll(ctx, sessKey(id)).Result()
@@ -335,6 +348,15 @@ func (s *Store) List(ctx context.Context, realm, userID string) ([]Session, erro
 		sess, err := parseSessionMap(id, m)
 		if err != nil {
 			return nil, err
+		}
+		if !sess.AbsDeadline.After(now) {
+			// Past its absolute cap despite a live TTL (clock skew, restored
+			// snapshot). touchScript refuses this session, so List — the
+			// surface an operator reads before deciding what to revoke — must
+			// not report it as live either.
+			_ = s.rdb.ZRem(ctx, uk, id).Err()
+			_ = s.rdb.Del(ctx, sessKey(id)).Err()
+			continue
 		}
 		sessions = append(sessions, sess)
 	}

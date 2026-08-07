@@ -27,13 +27,14 @@ def _details(rec):
 
 
 def build_report(records, verdict):
-    """Render the report. verdict is (ok, reason) from verify_chain.verify_export.
+    """Render the report. verdict is (ok, reason, unvouched) from
+    verify_chain.verify_export.
 
     The verdict is passed in rather than recomputed here: a report must not
     reach its own conclusion about integrity from the chain walk alone, which
     cannot see tail-truncation.
     """
-    ok, reason = verdict
+    ok, reason, unvouched = verdict
 
     decisions = [r for r in records if r.get("type") == "sentinel.decision"]
     results = [r for r in records if r.get("type") == "auth.result"]
@@ -74,6 +75,10 @@ def build_report(records, verdict):
     if ok:
         head = records[-1]["hash"] if records else "-"
         out("- Chain integrity: **INTACT** (head `%s`)" % head)
+        if unvouched:
+            out("- Unvouched tail: **%d** record(s) past the last anchor — no "
+                "anchor vouches for them, so their deletion or fabrication is "
+                "not detectable here" % unvouched)
     else:
         out("- Chain integrity: **BROKEN** — %s" % reason)
     out("")

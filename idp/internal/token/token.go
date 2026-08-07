@@ -51,8 +51,11 @@ type AccessTokenInput struct {
 // AccessToken mints a JWT access token.
 //
 // Shape notes:
-//   - aud is the realm's umbrella resource audience ("meridian"): resource
-//     servers verify realm issuer + this audience + scopes.
+//   - aud is the realm's issuer URL. It must carry the tenant: all realms are
+//     signed by one keysmith key set, so a realm-agnostic audience would let a
+//     resource server that checks the conventional signature + aud + scope
+//     accept another tenant's token, with only iss telling them apart. Using
+//     the issuer URL collapses the two checks into one value.
 //   - azp (authorized party) carries the client_id per OIDC Core §2 usage.
 //   - sub is the user (or the client_id for service tokens, prefixed so a
 //     service identity can never collide with a user ID).
@@ -64,7 +67,7 @@ func (i *Issuer) AccessToken(ctx context.Context, in AccessTokenInput) (string, 
 	claims := jose.Claims{
 		Issuer:   i.IssuerURL(in.Realm.Name),
 		Subject:  sub,
-		Audience: []string{"meridian"},
+		Audience: []string{i.IssuerURL(in.Realm.Name)},
 		ID:       secrets.New("jti_"),
 		Extra: map[string]any{
 			"azp":   in.ClientID,

@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE UNIQUE INDEX IF NOT EXISTS users_realm_username ON users (realm_name, lower(username));
 
 CREATE TABLE IF NOT EXISTS auth_codes (
-    code_hash        TEXT PRIMARY KEY,
+    code_hash        TEXT NOT NULL,
     realm_name       TEXT NOT NULL,
     client_id        TEXT NOT NULL,
     user_id          TEXT NOT NULL,
@@ -60,9 +60,23 @@ CREATE TABLE IF NOT EXISTS auth_codes (
     used             BOOLEAN NOT NULL DEFAULT FALSE,
     issued_family_id TEXT NOT NULL DEFAULT '',
     expires_at       TIMESTAMPTZ NOT NULL,
-    created_at       TIMESTAMPTZ NOT NULL
+    created_at       TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (realm_name, code_hash)
 );
 CREATE INDEX IF NOT EXISTS auth_codes_expiry ON auth_codes (expires_at);
+-- auth_codes was originally keyed on code_hash alone, which let any realm's
+-- token endpoint consume (and thereby burn) another realm's code before the
+-- application-level realm check ran. Realm-scope the key like every other
+-- table. Existing rows keep their values; the constraint is only rebuilt when
+-- the current primary key is still single-column, so this is a no-op after the
+-- first run.
+DO $$
+BEGIN
+    IF (SELECT indnatts FROM pg_index WHERE indrelid = 'auth_codes'::regclass AND indisprimary) = 1 THEN
+        ALTER TABLE auth_codes DROP CONSTRAINT auth_codes_pkey;
+        ALTER TABLE auth_codes ADD PRIMARY KEY (realm_name, code_hash);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     token_hash TEXT NOT NULL,
@@ -99,6 +113,9 @@ CREATE TABLE IF NOT EXISTS device_codes (
     scopes           TEXT[] NOT NULL DEFAULT '{}',
     status           TEXT NOT NULL,
     user_id          TEXT NOT NULL DEFAULT '',
+    -- When the approving user last actively authenticated. NULL until
+    -- approval, and on rows approved before this column existed.
+    auth_time        TIMESTAMPTZ,
     interval_secs    INT NOT NULL,
     expires_at       TIMESTAMPTZ NOT NULL,
     last_polled_at   TIMESTAMPTZ,
@@ -106,6 +123,7 @@ CREATE TABLE IF NOT EXISTS device_codes (
     PRIMARY KEY (realm_name, device_code_hash),
     UNIQUE (realm_name, user_code)
 );
+ALTER TABLE device_codes ADD COLUMN IF NOT EXISTS auth_time TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS sessions (
     id_hash          TEXT NOT NULL,

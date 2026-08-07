@@ -9,7 +9,10 @@ import (
 // (validate) does not pay a Redis round trip per request, and it is the
 // reason revocation needs pub/sub at all.
 //
-// Correctness argument: an entry lives at most ttl (CacheTTL). Revocations
+// Correctness argument: an entry lives at most ttl (CacheTTL) past the Redis
+// read it describes — expiry is computed from that read's timestamp, not from
+// when the entry was filled, so the bound holds under any round-trip latency.
+// Revocations
 // arriving over pub/sub delete entries immediately; a *missed* broadcast
 // therefore extends a revoked session on this node by at most ttl. The cache
 // never writes back to Redis, so it can only ever serve a stale read — it
@@ -49,12 +52,16 @@ func (c *cache) get(id string) (sess Session, negative, ok bool) {
 	return e.sess, e.negative, true
 }
 
-func (c *cache) put(id string, sess Session) {
-	c.set(id, cacheEntry{sess: sess, expires: c.now() + c.ttl})
+// put caches a validation result. readAt is when the underlying Redis read
+// happened, not when this call is made: staleness is measured from the truth
+// the entry reflects, so a slow round trip cannot push the bound past ttl. An
+// entry filled after a stall longer than ttl is simply born expired.
+func (c *cache) put(id string, sess Session, readAt int64) {
+	c.set(id, cacheEntry{sess: sess, expires: readAt + c.ttl})
 }
 
-func (c *cache) putNegative(id string) {
-	c.set(id, cacheEntry{negative: true, expires: c.now() + c.ttl})
+func (c *cache) putNegative(id string, readAt int64) {
+	c.set(id, cacheEntry{negative: true, expires: readAt + c.ttl})
 }
 
 func (c *cache) set(id string, e cacheEntry) {

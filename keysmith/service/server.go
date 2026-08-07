@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/aikazzh/portfolio/keysmith/jose"
@@ -51,12 +52,26 @@ type Server struct {
 }
 
 // New validates cfg against the keystore configuration and builds the server.
-func New(manager *keystore.Manager, ks keystore.Config, cfg Config) (*Server, error) {
+//
+// ponytail: the ks parameter is ignored — the invariants below are checked
+// against manager.Config(), the configuration the manager actually holds, so
+// they cannot be satisfied on paper by a caller passing a different or stale
+// value. It stays in the signature only so callers in sibling modules keep
+// compiling; delete the parameter once they are updated.
+func New(manager *keystore.Manager, _ keystore.Config, cfg Config) (*Server, error) {
+	ks := manager.Config()
 	if cfg.DefaultAlg == "" {
 		cfg.DefaultAlg = jose.AlgEdDSA
 	}
 	if !cfg.DefaultAlg.Supported() {
 		return nil, fmt.Errorf("service: unsupported default algorithm %q", cfg.DefaultAlg)
+	}
+	// The manager only maintains an active key for algorithms it was configured
+	// with, and both /healthz and the /v1/sign fallback resolve DefaultAlg — a
+	// mismatch boots cleanly and then 503s forever.
+	if !slices.Contains(ks.Algorithms, cfg.DefaultAlg) {
+		return nil, fmt.Errorf("service: DefaultAlg %q is not one of the keystore algorithms %v",
+			cfg.DefaultAlg, ks.Algorithms)
 	}
 	if cfg.MaxTokenTTL == 0 {
 		cfg.MaxTokenTTL = time.Hour
@@ -93,6 +108,7 @@ func New(manager *keystore.Manager, ks keystore.Config, cfg Config) (*Server, er
 	mux.Handle("GET /v1/keys", admin(http.HandlerFunc(s.handleListKeys)))
 	mux.Handle("POST /v1/keys/generate", admin(http.HandlerFunc(s.handleGenerate)))
 	mux.Handle("POST /v1/keys/{id}/promote", admin(http.HandlerFunc(s.handlePromote)))
+	mux.Handle("POST /v1/keys/{id}/revoke", admin(http.HandlerFunc(s.handleRevoke)))
 
 	s.handler = withObservability(cfg.Logger, mux)
 	return s, nil

@@ -104,22 +104,28 @@ def check_anchors(records, anchors):
     Anchors live in a separate append-only sidecar, so tail-truncating the
     main log cannot also delete them. If the last anchor vouches for a
     (seq, hash) the truncated log no longer contains, the loss is detected.
-    Returns (ok, reason).
+
+    Records PAST the last anchor are a blind spot: nothing vouches for them,
+    so they can be deleted, and fabricated records appended in their place,
+    and this still returns ok. The count is returned so the caller can say how
+    large the unvouched window is instead of leaving it silent.
+
+    Returns (ok, reason, unvouched).
     """
     if not records and not anchors:
-        return True, None  # nothing logged yet, so nothing to vouch for
+        return True, None, 0  # nothing logged yet, so nothing to vouch for
     if not anchors:
-        return False, "anchor sidecar is empty (deleted or truncated?)"
+        return False, "anchor sidecar is empty (deleted or truncated?)", len(records)
     last = anchors[-1]
     head_seq = int(last["head_seq"])
     head_hash = last["head_hash"]
     by_seq = {int(r["seq"]): r for r in records}
     rec = by_seq.get(head_seq)
     if rec is None:
-        return False, "anchor vouches for seq %d, absent from log (truncated?)" % head_seq
+        return False, "anchor vouches for seq %d, absent from log (truncated?)" % head_seq, 0
     if rec["hash"] != head_hash:
-        return False, "anchor hash mismatch at seq %d" % head_seq
-    return True, None
+        return False, "anchor hash mismatch at seq %d" % head_seq, 0
+    return True, None, sum(1 for r in records if int(r["seq"]) > head_seq)
 
 
 def verify_export(path, records, allow_missing_anchors=False):
@@ -131,20 +137,20 @@ def verify_export(path, records, allow_missing_anchors=False):
     this, never verify() on its own.
 
     Raises OSError/ValueError if the sidecar is unreadable. Returns
-    (ok, reason).
+    (ok, reason, unvouched) — see check_anchors for what unvouched means.
     """
     ok, seq, reason = verify(records)
     if not ok:
-        return False, "chain broken at seq %s: %s" % (seq, reason)
+        return False, "chain broken at seq %s: %s" % (seq, reason), 0
     # The sidecar's absence fails closed: deleting it would otherwise restore
     # the very blind spot it exists to remove.
     anchor_path = path + ".anchors"
     if not os.path.exists(anchor_path):
         if allow_missing_anchors:
-            return True, None
+            return True, None, len(records)
         return False, ("anchor sidecar %s missing (deleted?); pass "
                        "--allow-missing-anchors only for pre-sidecar logs"
-                       % anchor_path)
+                       % anchor_path), 0
     return check_anchors(records, load(anchor_path))
 
 
@@ -159,7 +165,7 @@ def main(argv):
         return 2
     try:
         records = load(argv[1])
-        ok, reason = verify_export(argv[1], records, allow_missing)
+        ok, reason, unvouched = verify_export(argv[1], records, allow_missing)
     except (OSError, ValueError) as e:
         print("ERROR: %s" % e, file=sys.stderr)
         return 1
@@ -168,6 +174,9 @@ def main(argv):
         return 1
     print("OK: chain of %d records intact (head %s)"
           % (len(records), records[-1]["hash"][:16] + "..." if records else "empty"))
+    if unvouched:
+        print("NOTE: %d record(s) past the last anchor are unvouched — nothing "
+              "detects their deletion or fabrication" % unvouched)
     return 0
 
 

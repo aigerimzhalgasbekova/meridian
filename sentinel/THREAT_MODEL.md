@@ -38,6 +38,14 @@ sessiond), never end users or the public internet.
 - Whole-file rewrite is detectable only via external anchoring: anchor
   records are the mount point for KMS/WORM/RFC 3161 notarization (documented,
   not wired — no cloud account in this environment).
+- Residual, narrower than a whole-file rewrite: only the *last* anchor is
+  cross-checked, so records after it are unvouched — an attacker with write
+  access to the log can delete them and append fabricated ones, and both
+  verifiers still report the chain intact. The window is `AnchorEvery`
+  records wide (100 in production) and is now reported as
+  `unvouched_records` / a "NOTE:" line rather than left silent. External
+  anchoring closes it; nothing in-process can, because the chain is unkeyed
+  and the sidecar shares the log's owner and mode.
 
 ### Denial of service
 - **Against victims via lockout** — the signature abuse case. Account lockout

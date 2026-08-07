@@ -34,7 +34,8 @@ ADRs, threat models, or a test run. No invented features or metrics.
 
 ## Deploy
 
-**S3 + CloudFront (target, pending AWS credentials):**
+S3 + CloudFront, provisioned by `platform/terraform/envs/dev/site.tf`. Upload is
+out-of-band:
 
 ```sh
 npm run build
@@ -42,18 +43,8 @@ aws s3 sync dist/ s3://<bucket> --delete
 aws cloudfront create-invalidation --distribution-id <id> --paths '/*'
 ```
 
-**GitHub Pages (works today):** the site builds with `base` unset for a
-root-domain deploy. For `https://aikazzh.github.io/portfolio/`, edit
-`astro.config.mjs`:
-
-```js
-export default defineConfig({
-  site: 'https://aikazzh.github.io',
-  base: '/portfolio',
-});
-```
-
-Layout and component links use `import.meta.env.BASE_URL` and survive the base
-change. Note: absolute internal links inside the markdown content
-(`/projects/...`, `/guide/...`) assume a root deploy; for a subpath deploy,
-prefix them or serve from a custom domain.
+`astro.config.mjs` sets `site` to the apex domain (the CloudFront alias) and
+leaves `base` unset for a root deploy. Layout and component links use
+`import.meta.env.BASE_URL` and survive a `base` change, but absolute internal
+links inside the markdown content (`/projects/...`, `/guide/...`) assume a root
+deploy — prefix them if you ever serve from a subpath.

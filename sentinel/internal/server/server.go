@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aikazzh/portfolio/sentinel/audit"
@@ -51,6 +52,11 @@ type Config struct {
 type Server struct {
 	cfg     Config
 	handler http.Handler
+
+	// cached /v1/audit/verify result; see handleAuditVerify.
+	verifyMu   sync.Mutex
+	verified   audit.VerifyResult
+	verifiedAt time.Time
 }
 
 // New builds the server.
@@ -209,19 +215,16 @@ func (s *Server) handleReportAuthResult(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "account and ip are required")
 		return
 	}
-	if req.Success {
-		s.cfg.Lockouts.Success(req.Account, req.IP)
-	} else {
-		s.cfg.Lockouts.Fail(req.Account, req.IP)
-	}
-	s.cfg.Risk.Observe(risk.Attempt{
-		Account: req.Account, IP: req.IP, DeviceID: req.DeviceID, At: s.cfg.Now(),
-	}, req.Success)
-
 	result := "failure"
 	if req.Success {
 		result = "success"
 	}
+	// Audit BEFORE mutating state. The record describes what the caller
+	// observed, not what sentinel did, so writing it first is semantically
+	// correct — and neither Fail nor Observe can fail or be undone, so the
+	// old order left the failure counter incremented with no evidence in the
+	// chain, and let a caller retrying the 500 double-count the same failure
+	// into a lockout at half the configured threshold.
 	if err := s.audit(audit.Event{
 		Type:   "auth.result",
 		Actor:  req.Account,
@@ -234,6 +237,14 @@ func (s *Server) handleReportAuthResult(w http.ResponseWriter, r *http.Request) 
 		s.internalError(w, "audit append", err)
 		return
 	}
+	if req.Success {
+		s.cfg.Lockouts.Success(req.Account, req.IP)
+	} else {
+		s.cfg.Lockouts.Fail(req.Account, req.IP)
+	}
+	s.cfg.Risk.Observe(risk.Attempt{
+		Account: req.Account, IP: req.IP, DeviceID: req.DeviceID, At: s.cfg.Now(),
+	}, req.Success)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 }
 
@@ -268,12 +279,28 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"seq": rec.Seq, "hash": rec.Hash})
 }
 
+const verifyCacheTTL = 30 * time.Second
+
 // handleAuditVerify answers with the chain walk *and* the out-of-band anchor
 // cross-check. The walk alone cannot see tail-truncation — a prefix of a valid
 // chain is itself a valid chain — so this endpoint would otherwise pronounce a
 // gutted log intact.
+//
+// The result is cached: VerifyAll re-reads and re-hashes the whole log while
+// holding the store mutex, which every audit append — and therefore every
+// /v1/check — waits on. Without the cache a monitoring probe turns log size
+// into service-wide stall time and per-request heap.
+//
+// ponytail: one cached result per verifyCacheTTL. Swap for a streaming
+// Store.Walk (the seam named in audit.Store's doc) when a single pass is
+// itself the problem.
 func (s *Server) handleAuditVerify(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.cfg.Audit.VerifyAll())
+	s.verifyMu.Lock()
+	defer s.verifyMu.Unlock()
+	if now := s.cfg.Now(); now.Sub(s.verifiedAt) > verifyCacheTTL {
+		s.verified, s.verifiedAt = s.cfg.Audit.VerifyAll(), now
+	}
+	writeJSON(w, http.StatusOK, s.verified)
 }
 
 // audit appends and returns any error: the audit chain IS the compliance

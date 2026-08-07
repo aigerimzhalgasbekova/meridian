@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"slices"
 
@@ -70,6 +71,13 @@ func (b roleBody) role() rbac.Role {
 	return rbac.Role{Name: b.Name, Description: b.Description, Extends: b.Extends, Grants: b.Grants, Denies: b.Denies}
 }
 
+// detail summarizes a role write for the audit trail: a role.update event
+// with no content cannot reveal the escalation it carried (someone adding
+// "*:*" to a widely-held role).
+func (b roleBody) detail() string {
+	return fmt.Sprintf("extends=%q grants=%v denies=%v", b.Extends, b.Grants, b.Denies)
+}
+
 func (s *Server) createRole(w http.ResponseWriter, r *http.Request) {
 	var b roleBody
 	if !decode(w, r, &b) {
@@ -87,6 +95,7 @@ func (s *Server) createRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	s.audit(r, "role.create", b.Name, rbac.Global, true, b.detail())
 	role, _ := s.cfg.Engine.Role(b.Name)
 	writeJSON(w, http.StatusCreated, role)
 }
@@ -113,6 +122,7 @@ func (s *Server) updateRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	s.audit(r, "role.update", name, rbac.Global, true, b.detail())
 	role, _ := s.cfg.Engine.Role(name)
 	writeJSON(w, http.StatusOK, role)
 }
@@ -130,18 +140,33 @@ func (s *Server) deleteRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "conflict", err.Error())
 		return
 	}
+	s.audit(r, "role.delete", name, rbac.Global, true, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- assignments ---
 
+// listAssignments returns the assignments the caller may read. An assignment
+// is the one object in the model that is intrinsically realm-partitioned, so
+// the catalog-read gate is not enough on its own: the list is filtered to the
+// scopes the caller actually holds assignments:read in, the same rule
+// /v1/users and /v1/authz/explain enforce.
+//
+// ponytail: one Check per assignment, like listUsers. Memoize by scope if the
+// assignment table ever gets big enough for the repeated walks to show up.
 func (s *Server) listAssignments(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAnywhere(w, r, "assignments:read") {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"assignments": s.cfg.Engine.Assignments(r.URL.Query().Get("subject")),
-	})
+	sub := subject(r)
+	all := s.cfg.Engine.Assignments(r.URL.Query().Get("subject"))
+	out := make([]rbac.Assignment, 0, len(all))
+	for _, a := range all {
+		if s.cfg.Engine.Check(sub, "assignments:read", a.Scope).Allowed {
+			out = append(out, a)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"assignments": out})
 }
 
 // Assignment writes are authorized at the scope being granted or revoked —
@@ -158,6 +183,7 @@ func (s *Server) createAssignment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	s.audit(r, "assignment.create", a.Subject+"→"+a.Role, a.Scope, true, "")
 	writeJSON(w, http.StatusCreated, a)
 }
 
@@ -173,6 +199,7 @@ func (s *Server) revokeAssignment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "assignment not found")
 		return
 	}
+	s.audit(r, "assignment.revoke", a.Subject+"→"+a.Role, a.Scope, true, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -243,19 +270,36 @@ func (s *Server) setUserDisabled(disabled bool) http.HandlerFunc {
 			return
 		}
 		if !ok {
+			// The realm-derived scope forces a lookup before the check, so a
+			// bare 404 would be a cross-realm existence oracle. Answer 404
+			// only to a caller authorized at global scope — they could have
+			// operated on any target, so the miss tells them nothing new.
+			// Everyone else gets the target-blind 403, and the probe is audited.
+			if !s.requireTarget(w, r, "users:write", rbac.Global, action, id) {
+				return
+			}
 			writeError(w, http.StatusNotFound, "not_found", "user not found")
 			return
 		}
 		// Authorized at the target user's realm: an engineering realm-admin
 		// cannot disable a finance user.
-		if !s.requireAudited(w, r, "users:write", rbac.Scope{Realm: u.Realm}, action, id) {
+		scope := rbac.Scope{Realm: u.Realm}
+		if !s.requireTarget(w, r, "users:write", scope, action, id) {
 			return
 		}
-		u, _, err = s.cfg.Users.SetDisabled(r.Context(), id, disabled)
+		u, changed, err := s.cfg.Users.SetDisabled(r.Context(), id, disabled)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "server_error", "user store unavailable")
 			return
 		}
+		// The user can vanish between the lookup above and this write — an
+		// ordinary race once users live in Postgres. Nothing changed, so there
+		// is no success to audit and no user to return.
+		if !changed {
+			writeError(w, http.StatusNotFound, "not_found", "user not found")
+			return
+		}
+		s.audit(r, action, id, scope, true, "")
 		writeJSON(w, http.StatusOK, u)
 	}
 }
@@ -270,10 +314,14 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		// Same existence-oracle guard as setUserDisabled.
+		if !s.requireTarget(w, r, "sessions:read", rbac.Global, "", "") {
+			return
+		}
 		writeError(w, http.StatusNotFound, "not_found", "user not found")
 		return
 	}
-	if !s.require(w, r, "sessions:read", rbac.Scope{Realm: u.Realm}) {
+	if !s.requireTarget(w, r, "sessions:read", rbac.Scope{Realm: u.Realm}, "", "") {
 		return
 	}
 	sessions, err := s.cfg.Sessions.Sessions(r.Context(), id)
@@ -295,21 +343,39 @@ func (s *Server) revokeSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		// Same existence-oracle guard as setUserDisabled.
+		if !s.requireTarget(w, r, "sessions:revoke", rbac.Global, "session.revoke", id) {
+			return
+		}
 		writeError(w, http.StatusNotFound, "not_found", "session not found")
 		return
 	}
-	// Scope is the session owner's realm.
-	scope := rbac.Global
-	if u, uok, _ := s.cfg.Users.User(r.Context(), sess.UserID); uok {
-		scope = rbac.Scope{Realm: u.Realm}
+	// Scope is the session owner's realm. Never fall back to global on an
+	// unresolvable owner: global is the strictest scope for allows but the
+	// weakest for denies — a realm-scoped deny carve-out does not cover a
+	// global query, so widening the scope would revoke what the realm check
+	// refuses. Refuse instead, like every sibling handler.
+	u, uok, err := s.cfg.Users.User(r.Context(), sess.UserID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "user store unavailable")
+		return
 	}
-	if !s.requireAudited(w, r, "sessions:revoke", scope, "session.revoke", id) {
+	if !uok {
+		if !s.requireTarget(w, r, "sessions:revoke", rbac.Global, "session.revoke", id) {
+			return
+		}
+		writeError(w, http.StatusNotFound, "not_found", "session owner not found")
+		return
+	}
+	scope := rbac.Scope{Realm: u.Realm}
+	if !s.requireTarget(w, r, "sessions:revoke", scope, "session.revoke", id) {
 		return
 	}
 	if _, err := s.cfg.Sessions.RevokeSession(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "session backend unavailable")
 		return
 	}
+	s.audit(r, "session.revoke", id, scope, true, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 

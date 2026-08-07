@@ -2,18 +2,16 @@ name: release
 
 # On tag: build all seven images, push to ECR, roll the ECS services.
 #
-# AWS access is OIDC-only — no long-lived keys. One-time setup (documented in
-# platform/docs/adr/0002-ssm-secrets-and-oidc-ci.md):
-#   1. Create the GitHub OIDC provider in IAM (token.actions.githubusercontent.com).
-#   2. Create role meridian-ci with a trust policy limited to
-#      repo:<owner>/portfolio:ref:refs/tags/* and permissions for ECR push +
-#      ECS deploy (RegisterTaskDefinition/UpdateService/DescribeTaskDefinition
-#      + iam:PassRole on the meridian-dev-* task/execution roles).
-#   3. Set repository secrets AWS_ROLE_ARN and ECR_REGISTRY (e.g.
-#      123456789012.dkr.ecr.eu-west-1.amazonaws.com), and repository variable
-#      AWS_REGION. The first two embed the AWS account id: secrets keep it out
-#      of workflow logs, which repository variables are interpolated into
-#      verbatim. AWS_REGION carries nothing sensitive and stays a variable.
+# AWS access is OIDC-only — no long-lived keys. Do NOT hand-build the provider
+# or the role: platform/terraform/envs/dev/ci.tf creates the GitHub OIDC
+# provider, the meridian-ci role, its tag-only trust policy and its permissions,
+# and is the single source of truth for all of them (see
+# platform/docs/adr/0002-ssm-secrets-and-oidc-ci.md). One-time setup is only:
+# set repository secrets AWS_ROLE_ARN (`terraform output ci_role_arn`) and
+# ECR_REGISTRY (e.g. 123456789012.dkr.ecr.eu-west-1.amazonaws.com), and
+# repository variable AWS_REGION. The first two embed the AWS account id:
+# secrets keep it out of workflow logs, which repository variables are
+# interpolated into verbatim. AWS_REGION carries nothing sensitive.
 #
 # Until those exist the workflow skips with a notice instead of failing — the
 # repo stays green while there is no AWS account.

@@ -32,7 +32,16 @@ documented and hoped for:
 bootstrap, availability recovery (pending exists, active missing → promote
 immediately: an unsignable IdP is a worse failure than a cold cache),
 pre-rotation generation, dwell-gated promotion, retirement. Manual
-`Promote(force=true)` exists for key-compromise response and is audited.
+`Promote(force=true)` exists for an urgent *scheduled* rotation and is audited.
+
+Key compromise is a separate lever: `Revoke` (`POST /v1/keys/{id}/revoke`).
+Force-promotion is not a compromise response — it stops the key signing new
+legitimate tokens but leaves it published for the whole `RetireAfter` window,
+and that window's premise ("every token it signed has expired") is false
+against an adversary who holds the private half and mints fresh ones. Revoke
+unpublishes immediately and promotes a successor in the same call, preferring
+a pending key whose caches are already warm; the cost, accepted deliberately,
+is that genuine in-flight tokens signed by that key stop verifying.
 
 ## Rationale
 
@@ -40,7 +49,9 @@ The alternative — rotate by immediately swapping keys and letting verifiers
 417 their way through a refresh storm — is the common industry bug this
 project exists to demonstrate the fix for. Encoding the timing invariants as
 constructor errors makes the safety property hold by configuration-time proof
-rather than runtime luck. The client library closes the last gap (a verifier
+rather than runtime luck — and the proof is taken against `Manager.Config()`,
+the configuration the manager actually holds, not a value passed alongside it
+that can silently disagree. The client library closes the last gap (a verifier
 that slept through the dwell) with a single forced re-fetch on unknown `kid`.
 
 ## Consequences

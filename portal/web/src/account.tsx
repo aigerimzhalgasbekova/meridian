@@ -68,6 +68,9 @@ export function Security() {
   const [code, setCode] = useState('');
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
+  // Every change to the second factor re-authenticates with the password, so a
+  // stolen session cookie alone cannot enroll (or remove) an authenticator.
+  const [password, setPassword] = useState('');
 
   const loadSessions = () => {
     void api<{ sessions: SessionRow[] }>('GET', '/api/security/sessions')
@@ -80,10 +83,51 @@ export function Security() {
 
   const fail = (err: unknown) => setError(err instanceof Error ? err.message : String(err));
 
-  const startEnroll = () => {
+  const startEnroll = (e: React.FormEvent) => {
+    e.preventDefault();
     setError('');
-    api<{ secret: string; otpauthUri: string; qrSvg: string }>('POST', '/api/security/totp/setup').then(setEnroll).catch(fail);
+    api<{ secret: string; otpauthUri: string; qrSvg: string }>('POST', '/api/security/totp/setup', { password })
+      .then((r) => {
+        setEnroll(r);
+        setPassword('');
+      })
+      .catch(fail);
   };
+
+  const regenerateCodes = () => {
+    setError('');
+    api<{ recoveryCodes: string[] }>('POST', '/api/security/totp/recovery-codes', { password })
+      .then(async (r) => {
+        setRecoveryCodes(r.recoveryCodes);
+        setPassword('');
+        setMe(await fetchMe());
+      })
+      .catch(fail);
+  };
+
+  const disableTotp = () => {
+    setError('');
+    api('POST', '/api/security/totp/disable', { password })
+      .then(async () => {
+        setPassword('');
+        setRecoveryCodes(null);
+        setMe(await fetchMe());
+      })
+      .catch(fail);
+  };
+
+  const passwordField = (
+    <label>
+      Confirm your password
+      <input
+        type="password"
+        value={password}
+        onChange={(ev) => setPassword(ev.target.value)}
+        required
+        autoComplete="current-password"
+      />
+    </label>
+  );
 
   const activate = (e: React.FormEvent) => {
     e.preventDefault();
@@ -115,7 +159,23 @@ export function Security() {
         </div>
       )}
       {me.user.totpEnabled ? (
-        <p><span className="ok">Enabled.</span> Signing in requires a code from your authenticator app.</p>
+        <>
+          <p><span className="ok">Enabled.</span> Signing in requires a code from your authenticator app.</p>
+          <p className={me.user.recoveryCodesRemaining <= 2 ? 'warn' : 'muted'}>
+            {me.user.recoveryCodesRemaining} unused recovery {me.user.recoveryCodesRemaining === 1 ? 'code' : 'codes'} left.
+            {' '}Spending the last one with no authenticator to hand locks you out for good.
+          </p>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              regenerateCodes();
+            }}
+          >
+            {passwordField}
+            <button>Generate new recovery codes</button>
+            <button className="secondary" type="button" onClick={disableTotp}>Turn off two-factor</button>
+          </form>
+        </>
       ) : enroll ? (
         <form onSubmit={activate}>
           <p>Scan the QR code with your authenticator app, then enter the current code to activate.</p>
@@ -129,7 +189,10 @@ export function Security() {
           <button>Activate</button>
         </form>
       ) : (
-        <button onClick={startEnroll}>Set up authenticator app</button>
+        <form onSubmit={startEnroll}>
+          {passwordField}
+          <button>Set up authenticator app</button>
+        </form>
       )}
 
       <h2>Active sessions</h2>
