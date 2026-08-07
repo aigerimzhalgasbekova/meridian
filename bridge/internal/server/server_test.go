@@ -395,3 +395,32 @@ func TestUpstreamErrorParam(t *testing.T) {
 		t.Fatalf("upstream error param: %d", resp.StatusCode)
 	}
 }
+
+// An upstream that does not vouch for the email must not have that email
+// recorded or stamped into the app-facing assertion (OIDC Core §5.7).
+func TestUnverifiedUpstreamEmailIsDropped(t *testing.T) {
+	e := newEnv(t)
+	e.alpha.SetExtraClaims(map[string]any{"email_verified": false})
+
+	resp, _ := get(t, e.client(t), e.srv.URL+"/login/alpha?app=demo")
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := jose.NewKeySet(e.verKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := jose.VerifyClaims(loc.Query().Get("assertion"), set, []jose.Algorithm{jose.AlgEdDSA}, jose.Expect{
+		Issuer: e.srv.URL, Audience: "demo", Now: e.clock.now,
+	})
+	if err != nil {
+		t.Fatalf("assertion failed verification: %v", err)
+	}
+	if claims.Extra["email"] != "" || claims.Extra["email_verified"] != false {
+		t.Fatalf("unverified email forwarded: %+v", claims.Extra)
+	}
+	if idents, _ := e.store.IdentitiesByEmail("alice@example.com"); len(idents) != 0 {
+		t.Fatalf("unverified email recorded on %d identities", len(idents))
+	}
+}

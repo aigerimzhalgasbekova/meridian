@@ -106,6 +106,8 @@ def check_anchors(records, anchors):
     (seq, hash) the truncated log no longer contains, the loss is detected.
     Returns (ok, reason).
     """
+    if not records and not anchors:
+        return True, None  # nothing logged yet, so nothing to vouch for
     if not anchors:
         return False, "anchor sidecar is empty (deleted or truncated?)"
     last = anchors[-1]

@@ -274,6 +274,13 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	email, _ := claims.Extra["email"].(string)
+	if !claimTrue(claims.Extra["email_verified"]) {
+		// OIDC Core §5.7: an unverified upstream email is attacker-chosen.
+		// ADR 0001 already refuses to *match* on it; we must not record it or
+		// forward it downstream as an authenticated attribute either — an app
+		// that keys accounts on the email claim would be trivially takeoverable.
+		email = ""
+	}
 	name, _ := claims.Extra["name"].(string)
 	link := directory.Link{Provider: p.Config().Name, Subject: claims.Subject, Email: email}
 
@@ -349,9 +356,13 @@ func (s *Server) deliverAssertion(w http.ResponseWriter, r *http.Request, appID 
 		IssuedAt:  now.Unix(),
 		Extra: map[string]any{
 			"email": ident.Email,
-			"name":  ident.Name,
-			"idp":   idp,
-			"amr":   []string{"federated"},
+			// Only upstream-verified emails are ever recorded, so a present
+			// email is a verified one. Stated explicitly so relying apps do
+			// not have to assume it.
+			"email_verified": ident.Email != "",
+			"name":           ident.Name,
+			"idp":            idp,
+			"amr":            []string{"federated"},
 		},
 	})
 	if err != nil {
@@ -468,4 +479,17 @@ func (s *Server) upstreamError(w http.ResponseWriter, p *provider.Provider, err 
 	s.render(w, http.StatusBadGateway, "error.html", map[string]any{
 		"Message": "The identity provider could not be reached. Try again shortly.",
 	})
+}
+
+// claimTrue reads a boolean OIDC claim. Providers are inconsistent about the
+// JSON type — Google sends a bool, some send the string "true" — so accept
+// both and treat anything else (including absent) as false.
+func claimTrue(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return t == "true"
+	}
+	return false
 }

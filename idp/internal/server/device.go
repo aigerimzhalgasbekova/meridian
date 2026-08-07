@@ -148,8 +148,29 @@ func (s *Server) handleDeviceSubmit(w http.ResponseWriter, r *http.Request) {
 		renderErr("That code has expired. Start again on your device.")
 		return
 	}
+	client, cerr := s.cfg.Store.Clients().Get(ctx, realm.Name, dc.ClientID)
+	if cerr != nil {
+		renderErr("Unknown code. Check the code shown on your device.")
+		return
+	}
 	status := storage.DeviceStatusDenied
 	if r.PostFormValue("decision") == "allow" {
+		// RFC 8628 §3.3: the user typed a code with no idea what it belongs
+		// to. Approval only counts once they have seen the client and the
+		// scopes — the same bar /authorize sets via renderConsent.
+		if r.PostFormValue("confirmed") != "1" {
+			csrf := s.ensureCSRF(w, r, realm.Name)
+			renderTemplate(w, deviceConfirmTemplate, map[string]any{
+				"Title":             "Approve device",
+				"Action":            "/realms/" + realm.Name + "/device",
+				"ClientName":        client.Name,
+				"Username":          user.Username,
+				"ScopeDescriptions": scopeDescriptions(dc.Scopes),
+				"UserCode":          r.PostFormValue("user_code"),
+				"CSRF":              csrf,
+			})
+			return
+		}
 		status = storage.DeviceStatusApproved
 	}
 	if err := s.cfg.Store.DeviceCodes().SetStatus(ctx, realm.Name, dc.DeviceCodeHash, status, user.ID); err != nil {
@@ -157,6 +178,22 @@ func (s *Server) handleDeviceSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if status == storage.DeviceStatusApproved {
+		// Record the grant so it shows up alongside code-flow consents and
+		// can be reviewed and revoked. First-party clients are exempt, as in
+		// needsConsent.
+		if !client.FirstParty {
+			now := s.now()
+			if err := s.cfg.Store.Consents().Upsert(ctx, storage.Consent{
+				RealmName: realm.Name,
+				UserID:    user.ID,
+				ClientID:  client.ClientID,
+				Scopes:    dc.Scopes,
+				GrantedAt: now,
+				UpdatedAt: now,
+			}); err != nil {
+				s.cfg.Logger.Warn("device consent record failed", "err", err)
+			}
+		}
 		s.writePageError(w, http.StatusOK, "Device approved",
 			"You can return to your device — it will finish signing in shortly.")
 	} else {

@@ -453,6 +453,20 @@ module "bridge" {
     health_check_path = "/healthz"
   }
 
+  # In-flight login flows (relay.Manager.flows) and browser sessions live in
+  # per-process maps, and the ALB has no stickiness: a callback landing on a
+  # task that did not begin the flow fails with "link already used" on
+  # 1 - 1/N of sign-ins.
+  # ponytail: pin to one task; scaling out needs a shared flow/session store.
+  # The pin alone is not enough: the default rolling deploy starts the
+  # replacement before draining the old task, so every release would run two
+  # bridges behind a non-sticky ALB. Trade a few seconds of hard downtime for
+  # never serving a callback from the wrong process.
+  stop_before_start = true
+  desired_count     = 1
+  min_count         = 1
+  max_count         = 1
+
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn
   vpc_id                         = local.common.vpc_id
@@ -474,6 +488,10 @@ module "portal" {
   env = {
     PORT     = "3000"
     BASE_URL = "https://portal.${var.domain}"
+    # Behind the ALB, so req.ip must come from the last X-Forwarded-For hop —
+    # otherwise the rate limiter buckets every client into the balancer's IP.
+    # The listener pins XFF handling (append + drop-invalid-headers).
+    PORTAL_TRUST_PROXY = "1"
     # /app is root-owned in the image and the server runs as "node"; the
     # default outbox path (cwd/outbox) fails with EACCES. /tmp is writable.
     OUTBOX_DIR = "/tmp/outbox"
@@ -527,6 +545,17 @@ module "console" {
     priority          = 40
     health_check_path = "/healthz"
   }
+
+  # The RBAC engine and audit log are in-memory and mutated through the API,
+  # so a second task would serve a divergent policy and a partial audit trail.
+  # ponytail: pin to one task; scaling out needs the Postgres-backed store.
+  # Same reason as bridge: without this the rolling deploy overlaps two tasks,
+  # and here that means two divergent copies of the policy. The state is lost
+  # on restart either way, so the drain-first outage costs nothing extra.
+  stop_before_start = true
+  desired_count     = 1
+  min_count         = 1
+  max_count         = 1
 
   env_name                       = local.common.env_name
   cluster_arn                    = local.common.cluster_arn

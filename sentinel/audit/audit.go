@@ -119,6 +119,9 @@ type Log struct {
 	now         func() time.Time
 	anchorEvery uint64
 	anchorSink  io.Writer // out-of-band anchor sidecar; nil disables it
+	// anchorSource reopens that sidecar for reading, so VerifyAll can do the
+	// truncation cross-check the chain walk cannot.
+	anchorSource func() (io.ReadCloser, error)
 	// chain head, cached to avoid re-reading the store per append
 	lastSeq  uint64
 	lastHash string
@@ -136,8 +139,35 @@ type Options struct {
 	// main log leaves the sidecar's last anchor pointing past the new head, so
 	// verify_chain.py detects the loss.
 	AnchorSink io.Writer
+	// AnchorSource opens the same sidecar for reading. Required for
+	// VerifyExport to do the cross-check — without it a truncated log looks
+	// intact, because a prefix of a valid chain is itself a valid chain.
+	AnchorSource func() (io.ReadCloser, error)
 	// Now supplies the clock; defaults to time.Now.
 	Now func() time.Time
+}
+
+// Anchor is one line of the out-of-band sidecar: a checkpointed chain head.
+type Anchor struct {
+	HeadSeq  uint64 `json:"head_seq"`
+	HeadHash string `json:"head_hash"`
+	TS       string `json:"ts"`
+}
+
+// ReadAnchors parses the JSONL anchor sidecar.
+func ReadAnchors(r io.Reader) ([]Anchor, error) {
+	var out []Anchor
+	dec := json.NewDecoder(r)
+	for {
+		var a Anchor
+		if err := dec.Decode(&a); err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			return nil, fmt.Errorf("audit: reading anchor sidecar: %w", err)
+		}
+		out = append(out, a)
+	}
 }
 
 // New opens a log over store, resuming the chain from the store's last
@@ -146,7 +176,11 @@ func New(store Store, opts Options) (*Log, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	l := &Log{store: store, now: opts.Now, anchorEvery: opts.AnchorEvery, anchorSink: opts.AnchorSink, empty: true, lastHash: GenesisPrev}
+	l := &Log{
+		store: store, now: opts.Now, anchorEvery: opts.AnchorEvery,
+		anchorSink: opts.AnchorSink, anchorSource: opts.AnchorSource,
+		empty: true, lastHash: GenesisPrev,
+	}
 	last, ok, err := store.Last()
 	if err != nil {
 		return nil, fmt.Errorf("audit: reading chain head: %w", err)
@@ -167,7 +201,11 @@ func (l *Log) Append(e Event) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	if l.anchorEvery > 0 && rec.Seq%l.anchorEvery == 0 {
+	// Anchor the first record as well as every Nth: until an anchor exists the
+	// sidecar is empty, and an empty sidecar is indistinguishable from a
+	// deleted one — VerifyExport would call a healthy young log tampered, and
+	// a log truncated below the first anchor untampered.
+	if l.anchorEvery > 0 && (rec.Seq == 1 || rec.Seq%l.anchorEvery == 0) {
 		// The anchor checkpoints the head we just wrote; in production its
 		// hash would also go to the external notary (see package doc).
 		if _, err := l.append(Event{
@@ -287,6 +325,74 @@ func Verify(records []Record) VerifyResult {
 		prevSeq, prevHash = r.Seq, r.Hash
 	}
 	return res
+}
+
+// VerifyExport is the only honest answer to "is this log intact": the chain
+// walk *and* the out-of-band anchor cross-check. A prefix of a valid chain is
+// itself a valid chain, so Verify alone cannot see tail-truncation — only the
+// sidecar can, because it lives in a separate file the truncation did not
+// touch. This mirrors verify_chain.py's verify_export; any entry point that
+// pronounces on integrity must call this, never Verify on its own.
+//
+// What this covers: truncating or rewriting the log alone, and deleting or
+// emptying the sidecar (both fail closed — every non-empty log is anchored
+// from its first record). What it does not cover: an attacker who edits *both*
+// files, since the sidecar sits beside the log with the same owner and mode —
+// trimming the anchors to match a truncated log still verifies. Nor does it
+// see the last (AnchorEvery-1) records, which no anchor vouches for yet.
+// ponytail: closing that needs the sidecar somewhere this service cannot
+// rewrite (object-locked S3 or a separate writer identity), which is what the
+// package doc's "external notary" means.
+func VerifyExport(records []Record, anchors []Anchor, anchorErr error) VerifyResult {
+	res := Verify(records)
+	if !res.OK {
+		return res
+	}
+	if anchorErr != nil {
+		return VerifyResult{Records: len(records), Reason: "anchor sidecar unreadable: " + anchorErr.Error()}
+	}
+	if len(records) == 0 && len(anchors) == 0 {
+		return res // nothing logged yet, so nothing to vouch for
+	}
+	if len(anchors) == 0 {
+		return VerifyResult{Records: len(records), Reason: "anchor sidecar is empty (deleted or truncated?)"}
+	}
+	last := anchors[len(anchors)-1]
+	for _, r := range records {
+		if r.Seq != last.HeadSeq {
+			continue
+		}
+		if r.Hash != last.HeadHash {
+			return VerifyResult{Records: len(records), BrokenSeq: r.Seq, Reason: "anchor hash mismatch"}
+		}
+		return res
+	}
+	return VerifyResult{
+		Records:   len(records),
+		BrokenSeq: last.HeadSeq,
+		Reason:    "anchor vouches for a seq absent from the log (truncated?)",
+	}
+}
+
+// VerifyAll is VerifyExport over the log's own records and sidecar.
+func (l *Log) VerifyAll() VerifyResult {
+	recs, err := l.store.Records()
+	if err != nil {
+		return VerifyResult{Reason: "audit read failed: " + err.Error()}
+	}
+	if l.anchorSource == nil {
+		// No sidecar configured (memory store, tests): the chain walk is all
+		// there is, and it cannot see tail-truncation. Say so rather than
+		// claiming more than we checked.
+		return Verify(recs)
+	}
+	rc, err := l.anchorSource()
+	if err != nil {
+		return VerifyExport(recs, nil, err)
+	}
+	defer rc.Close()
+	anchors, err := ReadAnchors(rc)
+	return VerifyExport(recs, anchors, err)
 }
 
 // VerifyErr is Verify with an error shape for callers that want errors.Is.

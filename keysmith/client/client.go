@@ -38,7 +38,27 @@ type Client struct {
 	etag      string
 	fetchedAt time.Time
 	maxAge    time.Duration
+
+	flightMu sync.Mutex
+	flight   *flight   // in-progress refresh, if any
+	lastKid  time.Time // last unknown-kid-triggered refresh
 }
+
+// flight is one in-progress JWKS refresh that concurrent callers share.
+type flight struct {
+	done chan struct{}
+	set  *jose.KeySet
+	err  error
+}
+
+// unknownKidInterval bounds how often an unrecognized kid may trigger a fetch.
+// jose reports ErrUnknownKey after only base64-decoding the token header —
+// before any cryptography — so the kid is attacker-chosen and free to vary.
+// Without this bound one bearer token per request is one JWKS fetch per
+// request, and a verifier under load becomes a load generator against the key
+// server it depends on. A real rotation still refreshes on the first unknown
+// kid; only the repeats are throttled.
+const unknownKidInterval = 10 * time.Second
 
 // Option configures the client.
 type Option func(*Client)
@@ -126,16 +146,66 @@ func (c *Client) Verify(ctx context.Context, token string, expect jose.Expect) (
 	}
 	claims, err := jose.VerifyClaims(token, set,
 		[]jose.Algorithm{jose.AlgEdDSA, jose.AlgES256, jose.AlgRS256}, expect)
-	if errors.Is(err, jose.ErrUnknownKey) {
+	if errors.Is(err, jose.ErrUnknownKey) && c.allowKidRefresh() {
 		// Possibly a token signed by a key newer than our cache: refresh
 		// once and retry. This is the path that makes rotation seamless
 		// even for verifiers that missed the pending-dwell window.
-		if set, ferr := c.forceRefresh(ctx); ferr == nil {
+		if set, ferr := c.refreshOnce(ctx); ferr == nil {
 			return jose.VerifyClaims(token, set,
 				[]jose.Algorithm{jose.AlgEdDSA, jose.AlgES256, jose.AlgRS256}, expect)
 		}
 	}
 	return claims, err
+}
+
+// allowKidRefresh reports whether an unknown kid may trigger a fetch now, and
+// claims the slot if so.
+func (c *Client) allowKidRefresh() bool {
+	c.flightMu.Lock()
+	defer c.flightMu.Unlock()
+	now := c.now()
+	if !c.lastKid.IsZero() && now.Sub(c.lastKid) < unknownKidInterval {
+		return false
+	}
+	c.lastKid = now
+	return true
+}
+
+// refreshOnce collapses concurrent refreshes into a single outbound fetch:
+// the first caller does the work, the rest wait on its result. Without it a
+// burst of verifies past max-age becomes a burst of JWKS requests.
+func (c *Client) refreshOnce(ctx context.Context) (*jose.KeySet, error) {
+	c.flightMu.Lock()
+	if f := c.flight; f != nil {
+		c.flightMu.Unlock()
+		select {
+		case <-f.done:
+			return f.set, f.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f := &flight{done: make(chan struct{})}
+	c.flight = f
+	c.flightMu.Unlock()
+
+	// The fetch outlives whoever started it: with Verify called on r.Context(),
+	// binding it to the leader lets one client disconnecting mid-fetch fail
+	// every parked caller's perfectly valid token. Each caller then honours its
+	// own deadline instead of inheriting the leader's.
+	go func() {
+		f.set, f.err = c.forceRefresh(context.WithoutCancel(ctx))
+		c.flightMu.Lock()
+		c.flight = nil
+		c.flightMu.Unlock()
+		close(f.done)
+	}()
+	select {
+	case <-f.done:
+		return f.set, f.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // keySet returns cached keys, refreshing if stale. Serves stale on refresh
@@ -148,7 +218,7 @@ func (c *Client) keySet(ctx context.Context) (*jose.KeySet, error) {
 	if fresh {
 		return set, nil
 	}
-	newSet, err := c.forceRefresh(ctx)
+	newSet, err := c.refreshOnce(ctx)
 	if err != nil {
 		if set != nil {
 			return set, nil // stale beats broken

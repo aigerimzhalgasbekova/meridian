@@ -81,6 +81,33 @@ describe('signup and login', () => {
     expect(res.status).toBe(403);
   });
 
+  it('CSRF: a same-length token with a non-ASCII byte is a 403, not a 500', async () => {
+    // Node parses header values as latin1: one char >= 0x80 is one UTF-16
+    // unit but two UTF-8 bytes, so a JS-length comparison passes and
+    // timingSafeEqual throws — reporting an authorization failure as a
+    // server fault, and handing any unauthenticated client a 500 generator.
+    const t = testApp();
+    const { cookie, csrf } = await signup(t);
+    const sameLength = 'Ã' + csrf.slice(1);
+    expect(sameLength.length).toBe(csrf.length);
+    const res = await request(t.app)
+      .post('/api/account/email')
+      .set('Cookie', cookie)
+      .set('x-csrf-token', sameLength)
+      .send({ email: 'new@example.com' });
+    expect(res.status).toBe(403);
+  });
+
+  it('a malformed percent-escape in an unrelated cookie does not break the request', async () => {
+    // decodeURIComponent('100%') throws URIError, and sessionLoader runs for
+    // every request — one stray '%' in any cookie on this host would
+    // otherwise 500 the whole app for that browser.
+    const t = testApp();
+    const { cookie } = await signup(t);
+    await request(t.app).get('/api/me').set('Cookie', `promo=100%; ${cookie}`).expect(200);
+    await request(t.app).get('/api/me').set('Cookie', 'x=%').expect(401);
+  });
+
   it('logout destroys the session', async () => {
     const t = testApp();
     const { cookie, csrf } = await signup(t);
@@ -388,6 +415,30 @@ describe('sessions', () => {
     const { cookie } = await signup(t);
     t.clock.advance(25 * 60 * 60 * 1000);
     await request(t.app).get('/api/me').set('Cookie', cookie).expect(401);
+  });
+});
+
+describe('email normalization', () => {
+  it('login and signup treat case and whitespace as the same account', async () => {
+    // users.email is a plain case-sensitive UNIQUE column. Without
+    // normalization, signing up as Alice@Example.com and then logging in as
+    // alice@example.com is a 401 for an account that exists — and signing up
+    // again with the lowercase form silently creates a second one.
+    const t = testApp();
+    await request(t.app)
+      .post('/api/auth/signup')
+      .send({ email: 'Ada@Example.com ', password: PASSWORD })
+      .expect(202);
+
+    const res = await request(t.app).post('/api/auth/login').send({ email: 'ada@example.com', password: PASSWORD });
+    expect(res.status).toBe(200);
+    expect(res.body.user.email).toBe('ada@example.com');
+
+    // The second signup must find the existing account, not create a rival.
+    await request(t.app).post('/api/auth/signup').send({ email: 'ADA@EXAMPLE.COM', password: PASSWORD }).expect(202);
+    const again = await request(t.app).post('/api/auth/login').send({ email: 'ada@example.com', password: PASSWORD });
+    expect(again.status).toBe(200);
+    expect(again.body.user.id).toBe(res.body.user.id);
   });
 });
 

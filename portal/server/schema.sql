@@ -54,3 +54,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS jobs_claim_idx ON jobs (run_at, created_at) WHERE status = 'pending';
+
+-- Emails are stored normalized (see normalizeEmail in src/app.ts): the column
+-- is plain case-sensitive TEXT, so a row written before that was enforced is
+-- unreachable by login, and /forgot is enumeration-safe and would report
+-- success while sending nothing. Backfill first, then let the constraint keep
+-- it true. Re-running this file is safe.
+--
+-- If the UPDATE fails on users_email_key, two accounts differ only by case:
+-- pick the one to keep, migrate its data, delete the other, then re-run.
+UPDATE users SET email = lower(btrim(email)) WHERE email <> lower(btrim(email));
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_normalized;
+ALTER TABLE users ADD CONSTRAINT users_email_normalized CHECK (email = lower(btrim(email)));

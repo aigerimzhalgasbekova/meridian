@@ -1,0 +1,6 @@
+# Copy to backend.hcl (gitignored) and fill in your account id, then:
+#   terraform init -backend-config=backend.hcl
+# Only the bucket name lives here — S3 names are global, so the bare
+# `meridian-terraform-state` was taken and the account id is the suffix.
+# Everything else stays in versions.tf.
+bucket = "meridian-terraform-state-123456789012"

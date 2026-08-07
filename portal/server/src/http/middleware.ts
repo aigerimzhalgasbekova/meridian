@@ -23,7 +23,17 @@ export function parseCookies(header: string | undefined): Record<string, string>
   for (const part of header.split(';')) {
     const eq = part.indexOf('=');
     if (eq === -1) continue;
-    out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+    const raw = part.slice(eq + 1).trim();
+    let value = raw;
+    try {
+      value = decodeURIComponent(raw);
+    } catch {
+      // A stray '%' anywhere in the Cookie header throws URIError. One
+      // unrelated cookie must not 500 every request on this host, so keep
+      // the raw value — our own cookies are base64url and decode to
+      // themselves.
+    }
+    out[part.slice(0, eq).trim()] = value;
   }
   return out;
 }
@@ -84,12 +94,16 @@ export function requireSession(req: Request, res: Response, next: NextFunction):
 export function requireCsrf(req: Request, res: Response, next: NextFunction): void {
   const presented = req.headers['x-csrf-token'];
   const expected = req.session?.csrfToken;
-  if (
-    typeof presented !== 'string' ||
-    !expected ||
-    presented.length !== expected.length ||
-    !timingSafeEqual(Buffer.from(presented), Buffer.from(expected))
-  ) {
+  if (typeof presented !== 'string' || !expected) {
+    res.status(403).json({ error: 'invalid CSRF token' });
+    return;
+  }
+  // Compare byte lengths, not JS string lengths: a header char >= 0x80 is one
+  // UTF-16 unit but two UTF-8 bytes, and timingSafeEqual throws on a length
+  // mismatch — turning a rejection into a 500.
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
     res.status(403).json({ error: 'invalid CSRF token' });
     return;
   }
@@ -112,10 +126,19 @@ export function newCsrfToken(): string {
  */
 export function rateLimit(ctx: AppContext): RequestHandler {
   const windows = new Map<string, { count: number; resetAt: number }>();
+  let sweptAt = 0;
   return (req, res, next) => {
     const { limit, windowMs } = ctx.config.rateLimit;
     const key = `${req.ip}:${req.path}`;
     const now = ctx.now().getTime();
+    // Sweep at most once per window, never per key: keys are attacker-chosen
+    // (one per source IP and path), so without a sweep the map is an unbounded
+    // leak — but sweeping on every first-sight key is an O(n^2) CPU wedge,
+    // which on a single-threaded runtime is the worse of the two bugs.
+    if (now - sweptAt >= windowMs) {
+      for (const [k, v] of windows) if (v.resetAt <= now) windows.delete(k);
+      sweptAt = now;
+    }
     let w = windows.get(key);
     if (!w || w.resetAt <= now) {
       w = { count: 0, resetAt: now + windowMs };

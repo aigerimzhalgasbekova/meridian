@@ -231,6 +231,17 @@ func TestIntrospection(t *testing.T) {
 			t.Errorf("expired token active: %v", out)
 		}
 	})
+	t.Run("another client's tokens are inactive", func(t *testing.T) {
+		// RFC 7662 §5: introspection must not be a cross-client validity or
+		// identity oracle. "service" is a confidential client in the same
+		// realm; web-app's tokens are none of its business.
+		for _, tok := range []string{"access_token", "refresh_token"} {
+			status, body := introspectPath("service", webAppSecret, str(tokens, tok))
+			if status != http.StatusOK || body["active"] != false || len(body) != 1 {
+				t.Errorf("%s leaked to another client: %d %v", tok, status, body)
+			}
+		}
+	})
 	t.Run("unauthenticated caller rejected", func(t *testing.T) {
 		req, _ := http.NewRequest("POST", e.idp.URL+"/realms/test/introspect",
 			strings.NewReader(url.Values{"token": {"x"}}.Encode()))

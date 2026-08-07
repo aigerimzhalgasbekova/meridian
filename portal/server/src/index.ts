@@ -49,6 +49,7 @@ async function main(): Promise<void> {
       // Default (secure) wins unless dev opts out explicitly; an unset or
       // misspelled NODE_ENV must not silently downgrade to insecure cookies.
       secureCookies: process.env['NODE_ENV'] === 'development' ? false : defaultConfig.secureCookies,
+      trustProxy: process.env['PORTAL_TRUST_PROXY'] === '1',
       totpKek: loadTotpKek(),
     },
     now: () => new Date(),

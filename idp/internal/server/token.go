@@ -146,8 +146,16 @@ func (s *Server) grantAuthorizationCode(r *http.Request, realm storage.Realm, cl
 	if ac.ClientID != client.ClientID || ac.RealmName != realm.Name {
 		return nil, oauth.E(oauth.ErrInvalidGrant, "code was not issued to this client")
 	}
-	// redirect_uri must match the authorization request (§4.1.3).
-	if ac.RedirectURI != r.PostFormValue("redirect_uri") {
+	// redirect_uri must match the authorization request (§4.1.3) — but it is
+	// REQUIRED here only if the authorization request carried it. handleAuthorize
+	// backfills the sole registered URI when it is omitted, so a conforming
+	// single-URI client omits it at both endpoints; accept that, since the
+	// registered URI is then unambiguous and already bound to the code.
+	presentedRedirect := r.PostFormValue("redirect_uri")
+	if presentedRedirect == "" && len(client.RedirectURIs) == 1 && client.RedirectURIs[0] == ac.RedirectURI {
+		presentedRedirect = ac.RedirectURI
+	}
+	if ac.RedirectURI != presentedRedirect {
 		return nil, oauth.E(oauth.ErrInvalidGrant, "redirect_uri mismatch")
 	}
 	// PKCE (RFC 7636 §4.6). A code bound to a challenge requires a valid

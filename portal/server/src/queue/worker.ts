@@ -6,6 +6,8 @@ export interface WorkerOptions {
   pollIntervalMs?: number;
   now?: () => Date;
   onError?: (job: Job, err: unknown) => void;
+  /** Poll-loop failures (recover(), claim(), failed bookkeeping). */
+  onPollError?: (err: unknown) => void;
 }
 
 /**
@@ -31,20 +33,38 @@ export class Worker {
       this.running = this.tick();
       try {
         await this.running;
+      } catch (err) {
+        // The database being unreachable — a cold boot, an RDS failover — must
+        // not become an unhandled rejection: that kills the process and turns a
+        // transient blip into a crash-loop. Report it and retry next interval.
+        this.reportPollError(err);
       } finally {
         this.running = null;
       }
       if (!this.stopped) this.timer = setTimeout(poll, this.opts.pollIntervalMs ?? 500);
     };
     // Reclaim jobs stranded 'running' by a previous crash/kill before polling.
-    void this.queue.recover().then(poll);
+    // recover() failing is survivable too — poll anyway.
+    void this.queue
+      .recover()
+      .catch((err: unknown) => this.reportPollError(err))
+      .then(poll);
+  }
+
+  private reportPollError(err: unknown): void {
+    if (this.opts.onPollError) this.opts.onPollError(err);
+    else console.error('worker poll failed', err);
   }
 
   /** Stop polling and await the currently-running tick so no claimed job is stranded. */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
-    await this.running;
+    try {
+      await this.running;
+    } catch {
+      // Already reported by the poll loop; shutdown must still complete.
+    }
   }
 
   /** Drain everything currently eligible. Used by tests and graceful shutdown. */
