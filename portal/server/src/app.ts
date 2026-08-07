@@ -28,7 +28,18 @@ function badRequest(res: express.Response, error: string): void {
 }
 
 function isEmail(v: unknown): v is string {
-  return typeof v === 'string' && v.length <= 254 && EMAIL_RE.test(v);
+  return typeof v === 'string' && v.length <= 254 && EMAIL_RE.test(v.trim());
+}
+
+/**
+ * The canonical form an address is stored and looked up by. `users.email` is a
+ * plain case-sensitive UNIQUE column, so without this `Alice@Example.com` and
+ * `alice@example.com` are two accounts no login can tell apart — and the
+ * enumeration-safe /forgot path would silently send nothing to the one you
+ * cannot reach. Every request-supplied address goes through here.
+ */
+function normalizeEmail(v: string): string {
+  return v.trim().toLowerCase();
 }
 
 function isPassword(v: unknown): v is string {
@@ -60,6 +71,11 @@ function meBody(user: User, session: Session) {
 export function createApp(ctx: AppContext): Express {
   const { store, queue, config } = ctx;
   const app = express();
+  // Trust exactly one hop, so `req.ip` is the address the load balancer
+  // observed rather than the balancer itself — otherwise the rate limiter
+  // buckets the whole internet together. Everything left of that last hop
+  // is client-supplied and stays untrusted.
+  if (config.trustProxy) app.set('trust proxy', 1);
   app.get('/healthz', (_req, res) => {
     res.json({ ok: true });
   });
@@ -122,9 +138,10 @@ export function createApp(ctx: AppContext): Express {
   // ---- Auth -----------------------------------------------------------------
 
   app.post('/api/auth/signup', limited, wrap(async (req, res) => {
-    const { email, password } = req.body ?? {};
-    if (!isEmail(email)) return badRequest(res, 'valid email required');
+    const { email: rawEmail, password } = req.body ?? {};
+    if (!isEmail(rawEmail)) return badRequest(res, 'valid email required');
     if (!isPassword(password)) return badRequest(res, `password must be at least ${MIN_PASSWORD} characters`);
+    const email = normalizeEmail(rawEmail);
     // Enumeration-safe (mirrors /forgot): identical body + minimum duration
     // whether or not the address is taken. Both branches send mail, so the
     // address owner always has somewhere to go — a taken address gets a reset
@@ -152,9 +169,9 @@ export function createApp(ctx: AppContext): Express {
   }));
 
   app.post('/api/auth/login', limited, wrap(async (req, res) => {
-    const { email, password } = req.body ?? {};
-    if (typeof email !== 'string' || typeof password !== 'string') return badRequest(res, 'email and password required');
-    const user = await store.users.findByEmail(email);
+    const { email: rawEmail, password } = req.body ?? {};
+    if (typeof rawEmail !== 'string' || typeof password !== 'string') return badRequest(res, 'email and password required');
+    const user = await store.users.findByEmail(normalizeEmail(rawEmail));
     // Always verify against a real hash so timing does not reveal existence.
     const ok = await verifyPassword(user?.passwordHash ?? (await decoyHash()), password);
     if (!user || !ok) {
@@ -205,11 +222,11 @@ export function createApp(ctx: AppContext): Express {
   // ---- Password reset (enumeration-safe) -------------------------------------
 
   app.post('/api/auth/forgot', limited, wrap(async (req, res) => {
-    const { email } = req.body ?? {};
-    if (!isEmail(email)) return badRequest(res, 'valid email required');
+    const { email: rawEmail } = req.body ?? {};
+    if (!isEmail(rawEmail)) return badRequest(res, 'valid email required');
     // Identical body + minimum duration whether or not the account exists.
     await withMinDuration(config.uniformDelayMs, async () => {
-      const user = await store.users.findByEmail(email);
+      const user = await store.users.findByEmail(normalizeEmail(rawEmail));
       if (!user) return;
       await sendResetEmail(user.id, user.email,
         `Reset your ${config.issuer} password`,
@@ -271,8 +288,9 @@ export function createApp(ctx: AppContext): Express {
 
   app.post('/api/account/email', requireAuth, requireCsrf, wrap(async (req, res) => {
     const user = req.user!;
-    const { email } = req.body ?? {};
-    if (!isEmail(email)) return badRequest(res, 'valid email required');
+    const { email: rawEmail } = req.body ?? {};
+    if (!isEmail(rawEmail)) return badRequest(res, 'valid email required');
+    const email = normalizeEmail(rawEmail);
     if (email === user.email) return badRequest(res, 'that is already your email');
     if (await store.users.findByEmail(email)) {
       res.status(409).json({ error: 'that email is already in use' });

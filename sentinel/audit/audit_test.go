@@ -1,9 +1,11 @@
 package audit
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -136,18 +138,56 @@ func TestAnchors(t *testing.T) {
 	}
 	appendN(t, l, 3)
 	recs, _ := l.Records()
-	if len(recs) != 4 {
-		t.Fatalf("got %d records, want 3 events + 1 anchor", len(recs))
+	// seq 1 is anchored on sight (so the sidecar is never legitimately empty),
+	// then every 3rd seq: e1 a(1) e2 a(3) e3.
+	if len(recs) != 5 {
+		t.Fatalf("got %d records, want 3 events + 2 anchors", len(recs))
 	}
-	anchor := recs[3]
-	if anchor.Type != AnchorType {
-		t.Fatalf("record 4 type = %q, want anchor", anchor.Type)
-	}
-	if anchor.Details["head_hash"] != recs[2].Hash || anchor.Details["head_seq"] != "3" {
-		t.Fatalf("anchor does not checkpoint the chain head: %+v", anchor.Details)
+	for _, i := range []int{1, 3} {
+		anchor := recs[i]
+		if anchor.Type != AnchorType {
+			t.Fatalf("record %d type = %q, want anchor", i+1, anchor.Type)
+		}
+		head := recs[i-1]
+		if anchor.Details["head_hash"] != head.Hash ||
+			anchor.Details["head_seq"] != strconv.FormatUint(head.Seq, 10) {
+			t.Fatalf("anchor does not checkpoint the chain head: %+v", anchor.Details)
+		}
 	}
 	if res := Verify(recs); !res.OK {
 		t.Fatalf("anchored chain broken: %s", res.Reason)
+	}
+}
+
+// TestVerifyYoungLog pins the fix for the /v1/audit/verify false positive: with
+// the production AnchorEvery of 100, a log younger than its first interval used
+// to report "anchor sidecar is empty" — tampering, on every fresh instance, for
+// its first 99 events. Anchoring seq 1 makes an empty sidecar unambiguous.
+func TestVerifyYoungLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	s, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	sidecar, err := os.OpenFile(path+".anchors", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sidecar.Close()
+	l, err := New(s, Options{
+		Now: fixedClock(), AnchorEvery: 100, AnchorSink: sidecar,
+		AnchorSource: func() (io.ReadCloser, error) { return os.Open(path + ".anchors") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := l.VerifyAll(); !res.OK {
+		t.Fatalf("empty log reported broken: %s", res.Reason)
+	}
+	appendN(t, l, 5)
+	if res := l.VerifyAll(); !res.OK {
+		t.Fatalf("5-record log reported broken: %s", res.Reason)
 	}
 }
 
@@ -418,4 +458,64 @@ func TestPythonVerifierAgrees(t *testing.T) {
 	if err == nil {
 		t.Fatalf("python verifier accepted a tampered chain:\n%s", out)
 	}
+}
+
+// TestVerifyAllCatchesTruncation is the Go-side twin of
+// TestAnchorSidecarDetectsTruncation: /v1/audit/verify must not pronounce a
+// tail-truncated log intact just because a prefix of a valid chain is itself a
+// valid chain.
+func TestVerifyAllCatchesTruncation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	openLog := func() (*Log, *FileStore, *os.File) {
+		s, err := OpenFileStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sidecar, err := os.OpenFile(path+".anchors", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l, err := New(s, Options{
+			Now: fixedClock(), AnchorEvery: 3, AnchorSink: sidecar,
+			AnchorSource: func() (io.ReadCloser, error) { return os.Open(path + ".anchors") },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l, s, sidecar
+	}
+
+	l, s, sidecar := openLog()
+	appendN(t, l, 6) // sidecar anchors vouch for head_seq 3 and 6
+	if res := l.VerifyAll(); !res.OK {
+		t.Fatalf("intact anchored chain rejected: %+v", res)
+	}
+	s.Close()
+	sidecar.Close()
+
+	// Lop off the tail below the last anchor and reopen, as a restart would.
+	keepFirstLines(t, path, 3)
+	l2, s2, sidecar2 := openLog()
+	defer s2.Close()
+	defer sidecar2.Close()
+	if res := Verify(mustRecords(t, l2)); !res.OK {
+		t.Fatalf("the chain walk alone should still pass — that is the whole point: %+v", res)
+	}
+	res := l2.VerifyAll()
+	if res.OK {
+		t.Fatal("VerifyAll pronounced a truncated log intact")
+	}
+	if !strings.Contains(res.Reason, "anchor") {
+		t.Errorf("reason %q does not point at the anchor cross-check", res.Reason)
+	}
+}
+
+func mustRecords(t *testing.T, l *Log) []Record {
+	t.Helper()
+	recs, err := l.Records()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return recs
 }

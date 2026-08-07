@@ -19,6 +19,11 @@ node_modules/
 *.tfvars
 !*.auto.tfvars.example
 .terraform.lock.hcl
+# Plan files wrap a full copy of state (account ids, ARNs, resolved secrets).
+tfplan
+*.tfplan
+# Backend config carries the account-suffixed state bucket name.
+backend.hcl
 
 # Env & secrets — never commit
 .env

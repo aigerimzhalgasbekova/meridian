@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 
 	"github.com/aikazzh/portfolio/console/rbac"
 )
@@ -178,12 +179,16 @@ func (s *Server) revokeAssignment(w http.ResponseWriter, r *http.Request) {
 // --- explain ---
 
 func (s *Server) explain(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAnywhere(w, r, "authz:explain") {
-		return
-	}
 	q := r.URL.Query()
 	sub := q.Get("subject")
 	perm := rbac.Permission(q.Get("permission"))
+	scope := rbac.Scope{Realm: q.Get("realm")}
+	// Authorized at the *queried* scope, like every other realm-sensitive
+	// route: an engineering realm-admin must not read finance's authorization
+	// graph, and only a global holder may explain at global scope.
+	if !s.require(w, r, "authz:explain", scope) {
+		return
+	}
 	if sub == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "subject is required")
 		return
@@ -192,7 +197,13 @@ func (s *Server) explain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	d := s.cfg.Engine.Check(sub, perm, rbac.Scope{Realm: q.Get("realm")})
+	d := s.cfg.Engine.Check(sub, perm, scope)
+	// Scoping the *authorization* is not enough: Check traces every assignment
+	// the subject holds, so a realm-scoped caller would still read another
+	// realm's subject→role graph (and learn whether a subject exists at all).
+	// A non-matching assignment decided nothing here — its Chain is empty —
+	// so dropping it costs the answer nothing.
+	d.Trace = slices.DeleteFunc(d.Trace, func(at rbac.AssignmentTrace) bool { return !at.ScopeMatch })
 	writeJSON(w, http.StatusOK, d)
 }
 

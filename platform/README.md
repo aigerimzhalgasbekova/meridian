@@ -109,9 +109,9 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
 
 1. **Bootstrap remote state** — create the state bucket and lock table (one-time,
    with admin credentials — the account id suffix matters: S3 names are global
-   and the bare `meridian-terraform-state` is already taken), then enable the
-   `backend "s3"` block in
-   `terraform/envs/dev/versions.tf` and re-init:
+   and the bare `meridian-terraform-state` is already taken), then point the
+   partial `backend "s3"` block in `terraform/envs/dev/versions.tf` at it via a
+   gitignored `backend.hcl` (copy from `backend.hcl.example`) and re-init:
 
    ```sh
    aws s3api create-bucket --bucket meridian-terraform-state-<account-id> \
@@ -125,8 +125,8 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
      --key-schema AttributeName=LockID,KeyType=HASH \
      --billing-mode PAY_PER_REQUEST
 
-   # uncomment the backend "s3" block in versions.tf, then:
-   (cd terraform/envs/dev && terraform init -migrate-state)
+   # cp backend.hcl.example backend.hcl, set the bucket, then:
+   (cd terraform/envs/dev && terraform init -backend-config=backend.hcl -migrate-state)
    ```
 2. **DNS + TLS** — request an ACM certificate for `*.meridian.example.com` **in
    `eu-west-1`** (must match the ALB's region); put its ARN and the domain in
@@ -150,8 +150,8 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
    aws ssm put-parameter --type SecureString --name $P/console/CONSOLE_HS256_KEY       --value "$(openssl rand -hex 32)"
    ```
 
-4. **Apply** — `cd terraform/envs/dev && terraform init && terraform plan &&
-   terraform apply`. Tasks will crash-loop until steps 5–7 complete; ECS keeps
+4. **Apply** — `cd terraform/envs/dev && terraform init -backend-config=backend.hcl
+   && terraform plan && terraform apply`. Tasks will crash-loop until steps 5–7 complete; ECS keeps
    retrying, that's fine.
 
    > **Task-definition changes need an explicit roll.** The service module

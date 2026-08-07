@@ -268,13 +268,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"seq": rec.Seq, "hash": rec.Hash})
 }
 
-func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
-	recs, err := s.cfg.Audit.Records()
-	if err != nil {
-		s.internalError(w, "audit read", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, audit.Verify(recs))
+// handleAuditVerify answers with the chain walk *and* the out-of-band anchor
+// cross-check. The walk alone cannot see tail-truncation — a prefix of a valid
+// chain is itself a valid chain — so this endpoint would otherwise pronounce a
+// gutted log intact.
+func (s *Server) handleAuditVerify(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.cfg.Audit.VerifyAll())
 }
 
 // audit appends and returns any error: the audit chain IS the compliance

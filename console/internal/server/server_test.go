@@ -25,6 +25,7 @@ func newTestServer(t *testing.T) (*Server, *MemStore) {
 		{Subject: "olivia", Role: rbac.RoleOperator},
 		{Subject: "alice", Role: rbac.RoleRealmAdmin, Scope: rbac.Scope{Realm: "engineering"}},
 		{Subject: "vera", Role: rbac.RoleViewer},
+		{Subject: "carol", Role: rbac.RoleRealmAdmin, Scope: rbac.Scope{Realm: "finance"}},
 	} {
 		if err := e.Assign(a); err != nil {
 			t.Fatal(err)
@@ -194,6 +195,33 @@ func TestExplain(t *testing.T) {
 	}
 	if w := do(t, s, "vera", "GET", "/v1/authz/explain?permission=users:read", "", nil); w.Code != http.StatusBadRequest {
 		t.Errorf("missing subject: got %d, want 400", w.Code)
+	}
+
+	// Realm confinement: alice holds authz:explain only in engineering, so
+	// she must not read finance's authorization graph — the same rule
+	// /v1/users and /v1/users/{id}/sessions enforce.
+	if w := do(t, s, "alice", "GET", "/v1/authz/explain?subject=bob&permission=users:write&realm=engineering", "", nil); w.Code != http.StatusOK {
+		t.Errorf("own-realm explain: got %d, want 200: %s", w.Code, w.Body)
+	}
+	if w := do(t, s, "alice", "GET", "/v1/authz/explain?subject=bob&permission=users:write&realm=finance", "", nil); w.Code != http.StatusForbidden {
+		t.Errorf("cross-realm explain: got %d, want 403: %s", w.Code, w.Body)
+	}
+	if w := do(t, s, "alice", "GET", "/v1/authz/explain?subject=bob&permission=users:write", "", nil); w.Code != http.StatusForbidden {
+		t.Errorf("global-scope explain by a realm-admin: got %d, want 403", w.Code)
+	}
+
+	// Scoping the authorization is not enough: the trace itself must not carry
+	// assignments from realms the caller cannot read. carol is a finance
+	// realm-admin, and alice — authorized at engineering — must not learn that.
+	var cd rbac.Decision
+	if w := do(t, s, "alice", "GET", "/v1/authz/explain?subject=carol&permission=users:write&realm=engineering", "", &cd); w.Code != http.StatusOK {
+		t.Fatalf("explain: got %d, want 200: %s", w.Code, w.Body)
+	}
+	if cd.Allowed {
+		t.Error("carol must not be allowed users:write in engineering")
+	}
+	for _, at := range cd.Trace {
+		t.Errorf("explain leaked an out-of-scope assignment: %+v", at.Assignment)
 	}
 }
 
