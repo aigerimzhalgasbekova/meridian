@@ -185,8 +185,9 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
    ```
 
 6. **CI federation** — create the GitHub OIDC provider + `meridian-ci` role
-   (see `docs/adr/0002-ssm-secrets-and-oidc-ci.md`), set repo variables
-   `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REGISTRY`.
+   (see `docs/adr/0002-ssm-secrets-and-oidc-ci.md`), set repo secrets
+   `AWS_ROLE_ARN` and `ECR_REGISTRY` (both embed the account id, so they are
+   secrets rather than variables) and repo variable `AWS_REGION`.
 7. **First release** — `git tag v0.1.0 && git push --tags`. release.yml builds
    and pushes all seven images (`:v0.1.0` + `:dev`) and rolls the services.
 8. **DNS records** — CNAME `idp/sso/portal/console.meridian.example.com` to

@@ -31,7 +31,7 @@ Account `123456789012` (placeholder — the real id stays out of the repo), regi
 - **RDS Postgres** (idp + portal databases; portal verifies TLS against the pinned Amazon CA bundle), **ElastiCache Redis** (TLS) for sessiond.
 - **CloudFront** `d2pnpsrujas06i.cloudfront.net` serving the site from S3 behind OAC.
 - **CloudWatch** dashboard + 5xx / p99 / unhealthy-host / CPU alarms; ALB access logs to S3.
-- **GitHub OIDC CI role** `meridian-ci`, trust pinned to `aigerimzhalgasbekova/meridian` tags + main. Repo variables `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REGISTRY` are set — tagging `v0.1.0` runs release.yml end to end.
+- **GitHub OIDC CI role** `meridian-ci`, trust pinned to `aigerimzhalgasbekova/meridian` tags + main. Repo secrets `AWS_ROLE_ARN` + `ECR_REGISTRY` (both embed the account id, so not variables — those are echoed into public workflow logs) and repo variable `AWS_REGION` are set — tagging `v0.1.0` runs release.yml end to end.
 - Secrets in SSM SecureStrings under `/meridian/dev/…`; RDS master password AWS-managed in Secrets Manager. Nothing sensitive in state, tfvars, or CI.
 
 **Verified live** (16-check smoke, ALB-pinned TLS): health on all four public

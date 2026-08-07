@@ -96,6 +96,6 @@ resource "aws_iam_role_policy" "ci" {
 }
 
 output "ci_role_arn" {
-  description = "Set as the AWS_ROLE_ARN repository variable in GitHub."
+  description = "Set as the AWS_ROLE_ARN repository secret in GitHub (it embeds the account id)."
   value       = aws_iam_role.ci.arn
 }
