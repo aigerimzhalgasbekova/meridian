@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -94,6 +96,29 @@ func unauthorizedBearer(w http.ResponseWriter, code, description string) {
 	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": code})
 }
 
+// verifyAccessToken checks an access token against the realm's issuer and
+// audience. Tokens minted before the per-realm-audience change carry the fixed
+// aud "meridian" and are still valid for their remaining TTL, so an audience
+// mismatch retries against the legacy value — otherwise deploying the audience
+// flip 401s every in-flight token at once. Verification is local (cached
+// JWKS), so the retry costs one signature check on the error path only.
+// ponytail: delete the fallback once the longest access-token TTL has passed
+// post-deploy.
+func (s *Server) verifyAccessToken(ctx context.Context, realmName, raw string) (jose.Claims, error) {
+	expect := jose.Expect{
+		Issuer:   s.issuer.IssuerURL(realmName),
+		Audience: s.issuer.IssuerURL(realmName),
+		Now:      s.cfg.Now,
+		Leeway:   30 * time.Second,
+	}
+	claims, err := s.cfg.Keysmith.Verify(ctx, raw, expect)
+	if errors.Is(err, jose.ErrAudienceMismatch) {
+		expect.Audience = "meridian"
+		claims, err = s.cfg.Keysmith.Verify(ctx, raw, expect)
+	}
+	return claims, err
+}
+
 // handleUserinfo implements OIDC Core §5.3.
 func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
@@ -111,12 +136,7 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_request"})
 		return
 	}
-	claims, err := s.cfg.Keysmith.Verify(r.Context(), raw, jose.Expect{
-		Issuer:   s.issuer.IssuerURL(realm.Name),
-		Audience: s.issuer.IssuerURL(realm.Name),
-		Now:      s.cfg.Now,
-		Leeway:   30 * time.Second,
-	})
+	claims, err := s.verifyAccessToken(r.Context(), realm.Name, raw)
 	if err != nil {
 		unauthorizedBearer(w, "invalid_token", "token verification failed")
 		return
@@ -177,12 +197,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	inactive := func() { writeJSON(w, http.StatusOK, map[string]any{"active": false}) }
 
 	// Try as a JWT access token first.
-	if claims, err := s.cfg.Keysmith.Verify(r.Context(), presented, jose.Expect{
-		Issuer:   s.issuer.IssuerURL(realm.Name),
-		Audience: s.issuer.IssuerURL(realm.Name),
-		Now:      s.cfg.Now,
-		Leeway:   30 * time.Second,
-	}); err == nil {
+	if claims, err := s.verifyAccessToken(r.Context(), realm.Name, presented); err == nil {
 		// A caller only learns about tokens issued to itself — the same
 		// ownership rule handleRevoke enforces below. RFC 7662 §5 asks that
 		// introspection not become a cross-client oracle but does not require
@@ -260,10 +275,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 
 	// A structurally valid JWT from our issuer is an access token we cannot
 	// revoke — say so honestly rather than returning a misleading 200.
-	if _, err := s.cfg.Keysmith.Verify(r.Context(), presented, jose.Expect{
-		Issuer: s.issuer.IssuerURL(realm.Name), Audience: s.issuer.IssuerURL(realm.Name),
-		Now: s.cfg.Now, Leeway: 30 * time.Second,
-	}); err == nil {
+	if _, err := s.verifyAccessToken(r.Context(), realm.Name, presented); err == nil {
 		oauth.WriteTokenError(w, oauth.E(oauth.ErrUnsupportedTokenType,
 			"access tokens are stateless; bound by their short TTL"), false)
 		return

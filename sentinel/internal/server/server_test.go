@@ -286,11 +286,11 @@ func TestCheckFailsClosedWhenAuditFails(t *testing.T) {
 	}
 }
 
-// A 500 must leave nothing behind: the caller is expected to retry a 5xx, and
-// there is no idempotency key, so a lockout counter advanced before a failed
-// audit append double-counts on every retry — locking a real account at a
-// fraction of the configured threshold, with no record of why.
-func TestReportAuthResultLeavesNoStateWhenAuditFails(t *testing.T) {
+// An audit outage must not be fail-open: the caller still gets a 500 (and a
+// retry double-counts toward lockout — the safe direction), but the lockout
+// counters see every failure. Skipping them would suspend brute-force lockout
+// for exactly as long as the audit store is unwritable.
+func TestReportAuthResultStillCountsWhenAuditFails(t *testing.T) {
 	e := newEnv(t)
 	log, err := audit.New(failStore{}, audit.Options{})
 	if err != nil {
@@ -304,8 +304,8 @@ func TestReportAuthResultLeavesNoStateWhenAuditFails(t *testing.T) {
 			t.Fatalf("report with failing audit: status %d, want 500", w.Code)
 		}
 	}
-	if d := e.srv.cfg.Lockouts.Check("dave", "203.0.113.20"); d.Locked {
-		t.Fatalf("unaudited failures locked the account: %+v", d)
+	if d := e.srv.cfg.Lockouts.Check("dave", "203.0.113.20"); !d.Locked {
+		t.Fatalf("failures during an audit outage did not lock the account: %+v", d)
 	}
 }
 

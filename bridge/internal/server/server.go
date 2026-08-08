@@ -272,11 +272,12 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pname := p.Config().Name
-	// The flow is single-use whatever happens next, so the binding cookie is
-	// spent on every exit path from here on.
-	s.clearFlowCookie(w, pname)
 	q := r.URL.Query()
 	if e := q.Get("error"); e != "" {
+		// The flow record is deliberately not consumed here, so keep the
+		// binding cookie too: after a transient upstream error the user can
+		// retry at the IdP and complete against the same still-valid state.
+		// Clearing it would doom that retry to an ErrUnbound rejection.
 		s.cfg.Logger.Warn("upstream reported an error at the callback",
 			"provider", pname, "error", e, "remote", r.RemoteAddr)
 		s.render(w, http.StatusBadGateway, "error.html", map[string]any{
@@ -284,6 +285,9 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// The flow is single-use whatever happens next, so the binding cookie is
+	// spent on every exit path from here on.
+	s.clearFlowCookie(w, pname)
 	flow, err := s.relay.Consume(q.Get("state"), pname, flowBinding(r))
 	if err != nil {
 		// Deliberately uniform to the caller: replay, tamper, expiry and a

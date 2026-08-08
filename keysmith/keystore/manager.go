@@ -224,7 +224,44 @@ func (m *Manager) Revoke(ctx context.Context, id, reason string) error {
 	if k.State == StateRetired {
 		return fmt.Errorf("%w: %q", ErrAlreadyRetired, id)
 	}
-	wasActive := k.State == StateActive
+	if k.State == StateActive {
+		// Revoking the signer would otherwise hand the operator an outage
+		// instead of a containment. Prefer the newest pending key (verifier
+		// caches have already warmed on it); generate one only if there is
+		// none. Forced, because a compromise cannot wait out the dwell.
+		//
+		// Promote the successor BEFORE committing the retirement: if any step
+		// here fails, nothing has changed yet and the revoke is cleanly
+		// retryable — committing retirement first would leave the platform
+		// with zero active signing keys (every sign 503s) on a transient
+		// failure, with the retry answering already_retired.
+		keys, err := m.store.List(ctx)
+		if err != nil {
+			return err
+		}
+		var successor *Key
+		for i := range keys {
+			if keys[i].Alg == k.Alg && keys[i].State == StatePending &&
+				(successor == nil || keys[i].CreatedAt.After(successor.CreatedAt)) {
+				successor = &keys[i]
+			}
+		}
+		if successor == nil {
+			fresh, err := m.generateLocked(ctx, k.Alg)
+			if err != nil {
+				return err
+			}
+			successor = &fresh
+		}
+		if err := m.promoteLocked(ctx, successor.ID, true); err != nil {
+			return err
+		}
+		// promoteLocked demoted k to retiring; re-read so the retirement below
+		// updates the current row rather than clobbering it with stale state.
+		if k, err = m.store.Get(ctx, id); err != nil {
+			return err
+		}
+	}
 	now := m.cfg.Now()
 	if k.RetiringAt.IsZero() {
 		k.RetiringAt = now
@@ -234,32 +271,7 @@ func (m *Manager) Revoke(ctx context.Context, id, reason string) error {
 		return err
 	}
 	m.emit("revoked", k, map[string]string{"reason": reason})
-	if !wasActive {
-		return nil
-	}
-	// Revoking the signer would otherwise hand the operator an outage instead
-	// of a containment. Prefer the newest pending key (verifier caches have
-	// already warmed on it); generate one only if there is none. Forced,
-	// because a compromise cannot wait out the dwell.
-	keys, err := m.store.List(ctx)
-	if err != nil {
-		return err
-	}
-	var successor *Key
-	for i := range keys {
-		if keys[i].Alg == k.Alg && keys[i].State == StatePending &&
-			(successor == nil || keys[i].CreatedAt.After(successor.CreatedAt)) {
-			successor = &keys[i]
-		}
-	}
-	if successor == nil {
-		fresh, err := m.generateLocked(ctx, k.Alg)
-		if err != nil {
-			return err
-		}
-		successor = &fresh
-	}
-	return m.promoteLocked(ctx, successor.ID, true)
+	return nil
 }
 
 // Config returns the configuration this manager actually holds, post-defaults.

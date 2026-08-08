@@ -219,13 +219,15 @@ func (s *Server) handleReportAuthResult(w http.ResponseWriter, r *http.Request) 
 	if req.Success {
 		result = "success"
 	}
-	// Audit BEFORE mutating state. The record describes what the caller
-	// observed, not what sentinel did, so writing it first is semantically
-	// correct — and neither Fail nor Observe can fail or be undone, so the
-	// old order left the failure counter incremented with no evidence in the
-	// chain, and let a caller retrying the 500 double-count the same failure
-	// into a lockout at half the configured threshold.
-	if err := s.audit(audit.Event{
+	// Audit first (the record describes what the caller observed, not what
+	// sentinel did) — but an audit outage must not become fail-open: the
+	// lockout and risk counters see the attempt even when the append fails and
+	// the caller gets a 500. A caller retrying that 500 double-counts a failure
+	// toward lockout — erring toward locking sooner — where skipping the
+	// counters entirely would hand a brute-forcer an uncounted window for
+	// exactly the protection sentinel exists to provide. A retried success just
+	// resets the counter twice, which is harmless.
+	auditErr := s.audit(audit.Event{
 		Type:   "auth.result",
 		Actor:  req.Account,
 		Action: result,
@@ -233,10 +235,7 @@ func (s *Server) handleReportAuthResult(w http.ResponseWriter, r *http.Request) 
 			"ip":      req.IP,
 			"success": strconv.FormatBool(req.Success),
 		},
-	}); err != nil {
-		s.internalError(w, "audit append", err)
-		return
-	}
+	})
 	if req.Success {
 		s.cfg.Lockouts.Success(req.Account, req.IP)
 	} else {
@@ -245,6 +244,10 @@ func (s *Server) handleReportAuthResult(w http.ResponseWriter, r *http.Request) 
 	s.cfg.Risk.Observe(risk.Attempt{
 		Account: req.Account, IP: req.IP, DeviceID: req.DeviceID, At: s.cfg.Now(),
 	}, req.Success)
+	if auditErr != nil {
+		s.internalError(w, "audit append", auditErr)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 }
 

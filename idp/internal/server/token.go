@@ -141,6 +141,20 @@ func (s *Server) grantAuthorizationCode(r *http.Request, realm storage.Realm, cl
 		return oauth.E(oauth.ErrInvalidGrant, "code already redeemed")
 	}
 
+	// A deterministic mismatch (wrong client, wrong redirect_uri, failed PKCE)
+	// burns the code before rejecting: leaving it spendable would let a stolen
+	// code be probed repeatedly with no signal, where burning it makes the
+	// legitimate client's redemption surface the theft as a replay (RFC 9700
+	// §4.5.3). Transient paths — user store, keysmith signing — do NOT burn,
+	// so a blip stays retryable.
+	burn := func(msg string) *oauth.Error {
+		if _, err := s.cfg.Store.AuthCodes().Consume(ctx, realm.Name, codeHash, s.now()); err == nil {
+			s.cfg.Logger.Warn("authorization code burned on failed presentation",
+				"realm", realm.Name, "client_id", client.ClientID)
+		}
+		return oauth.E(oauth.ErrInvalidGrant, "%s", msg)
+	}
+
 	// Read without consuming: everything below up to Consume is either a
 	// rejection or a retryable remote call, so the code must stay spendable
 	// until the last possible moment (see the ordering note below).
@@ -152,7 +166,7 @@ func (s *Server) grantAuthorizationCode(r *http.Request, realm storage.Realm, cl
 		return nil, replay(ac)
 	}
 	if ac.ClientID != client.ClientID {
-		return nil, oauth.E(oauth.ErrInvalidGrant, "code was not issued to this client")
+		return nil, burn("code was not issued to this client")
 	}
 	// redirect_uri must match the authorization request (§4.1.3) — but it is
 	// REQUIRED here only if the authorization request carried it. handleAuthorize
@@ -164,17 +178,17 @@ func (s *Server) grantAuthorizationCode(r *http.Request, realm storage.Realm, cl
 		presentedRedirect = ac.RedirectURI
 	}
 	if ac.RedirectURI != presentedRedirect {
-		return nil, oauth.E(oauth.ErrInvalidGrant, "redirect_uri mismatch")
+		return nil, burn("redirect_uri mismatch")
 	}
 	// PKCE (RFC 7636 §4.6). A code bound to a challenge requires a valid
 	// verifier; a verifier against an unbound code is rejected too.
 	verifier := r.PostFormValue("code_verifier")
 	if ac.CodeChallenge != "" {
 		if !oauth.VerifyPKCE(ac.CodeChallenge, verifier) {
-			return nil, oauth.E(oauth.ErrInvalidGrant, "PKCE verification failed")
+			return nil, burn("PKCE verification failed")
 		}
 	} else if verifier != "" {
-		return nil, oauth.E(oauth.ErrInvalidGrant, "code_verifier provided but code has no challenge")
+		return nil, burn("code_verifier provided but code has no challenge")
 	}
 
 	user, err := s.cfg.Store.Users().Get(ctx, realm.Name, ac.UserID)

@@ -30,6 +30,19 @@ function toJob(r: JobRow): Job {
 }
 
 export function postgresQueue(pool: Pool): JobQueue {
+  // Parks stale claims that are out of attempts in the dead-letter state the
+  // same way fail() would (see claim() for why this is off the hot path).
+  const sweepDead = (staleBefore: Date) =>
+    pool.query(
+      `UPDATE jobs SET status = 'dead', last_error = $2
+       WHERE status = 'running' AND COALESCE(claimed_at, run_at) < $1 AND attempts >= max_attempts`,
+      [staleBefore, STALE_CLAIM_ERROR],
+    );
+  // ponytail: amortization counter, not a timer — a queue that never goes
+  // idle would otherwise never run the sweep and its zombies would stay
+  // 'running' (and invisible) forever.
+  let claimsSinceSweep = 0;
+
   return {
     async enqueue(type, payload, opts = {}) {
       const { rows } = await pool.query<JobRow>(
@@ -60,21 +73,25 @@ export function postgresQueue(pool: Pool): JobQueue {
          RETURNING *`,
         [now, staleBefore],
       );
-      if (rows[0]) return toJob(rows[0]);
+      if (rows[0]) {
+        // A saturated queue may never reach the idle branch below, so pay for
+        // the sweep occasionally on the busy path too — amortized, because the
+        // predicate is not sargable against jobs_claim_idx and running it
+        // ahead of every claim put a full pending+running scan on the hot
+        // path, N+1 of them per tick() drain.
+        if (++claimsSinceSweep >= 100) {
+          claimsSinceSweep = 0;
+          await sweepDead(staleBefore);
+        }
+        return toJob(rows[0]);
+      }
       // A stale claim still spends an attempt, so a handler that always outlives
       // the window (or a worker that crash-loops on a poison payload) would be
-      // redelivered every 5 minutes forever. Park it in the dead-letter state
-      // the same way fail() would. Only on an idle poll: the predicate is not
-      // sargable against jobs_claim_idx, and running it ahead of every claim
-      // put a scan of every pending+running row on the hot path — N+1 of them
-      // per tick() drain. Nothing claims these rows in the meantime (the claim
-      // above excludes attempts >= max_attempts), so the only cost of waiting
-      // for a quiet poll is when the row gets its 'dead' label.
-      await pool.query(
-        `UPDATE jobs SET status = 'dead', last_error = $2
-         WHERE status = 'running' AND COALESCE(claimed_at, run_at) < $1 AND attempts >= max_attempts`,
-        [staleBefore, STALE_CLAIM_ERROR],
-      );
+      // redelivered every 5 minutes forever. Nothing claims these rows in the
+      // meantime (the claim above excludes attempts >= max_attempts), so the
+      // only cost of sweeping lazily is when the row gets its 'dead' label.
+      claimsSinceSweep = 0;
+      await sweepDead(staleBefore);
       return null;
     },
 

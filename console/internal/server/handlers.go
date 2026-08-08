@@ -352,8 +352,11 @@ func (s *Server) revokeSession(w http.ResponseWriter, r *http.Request) {
 	}
 	u, uok, err := s.cfg.Users.User(r.Context(), sess.UserID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", "user store unavailable")
-		return
+		// The user store being down is exactly when an operator most needs
+		// this endpoint (killing a hijacked session mid-incident). Treat the
+		// owner as unresolvable and fall through to the global-scope check
+		// below — the strictest allow — rather than refusing to revoke at all.
+		uok = false
 	}
 	// Scope is the session owner's realm. A session outliving its owner is the
 	// ordinary state right after a user deletion — exactly when an operator
