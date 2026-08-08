@@ -752,13 +752,10 @@ describe('mailed links keep the token out of the request line', () => {
     for (const m of mails) expect(m.text).not.toContain('?token=');
   });
 
-  it('the web reader prefers the fragment, with a transition query fallback', () => {
+  it('the web reader reads the fragment and refuses a token in the query string', () => {
     const base = 'https://portal.example.com';
     expect(linkToken(`${base}/reset#token=fragment-form`)).toBe('fragment-form');
-    // Transition only: pre-deploy mails carry ?token= (24h TTL) and there is
-    // no resend route, so the fallback keeps those links working. See
-    // linkToken() for when to delete it — and flip this back to ''.
-    expect(linkToken(`${base}/reset?token=query-form`)).toBe('query-form');
+    expect(linkToken(`${base}/reset?token=query-form`)).toBe('');
     expect(linkToken(`${base}/reset?token=query#token=fragment`)).toBe('fragment');
     expect(linkToken(`${base}/reset`)).toBe('');
   });

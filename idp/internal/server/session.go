@@ -29,33 +29,6 @@ func (s *Server) sessionCookieName(realm string) string {
 	return s.cookiePrefix() + "idp_session_" + realm
 }
 
-// Sessions established before the __Host- rename live under the unprefixed
-// name at Path=/realms/{realm}. Without a transition, deploying the rename
-// logs every user out and — because the new delete path only clears the
-// prefixed name at Path=/ — the old cookie could never be expired by the
-// server, stranding its session record until TTL. currentSession falls back
-// to the legacy name, and every path that clears the session also expires the
-// legacy cookie at its original path.
-// ponytail: delete the legacy helpers once the longest session TTL has passed
-// post-deploy.
-func legacySessionCookieName(realm string) string {
-	return "idp_session_" + realm
-}
-
-func (s *Server) expireLegacySessionCookie(w http.ResponseWriter, realm string) {
-	if s.cookiePrefix() == "" {
-		return // dev: the legacy name is the current name
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     legacySessionCookieName(realm),
-		Path:     "/realms/" + realm,
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
-}
-
 func (s *Server) sessionCookie(realm, value string, maxAge time.Duration) *http.Cookie {
 	return &http.Cookie{
 		Name:     s.sessionCookieName(realm),
@@ -71,9 +44,6 @@ func (s *Server) sessionCookie(realm, value string, maxAge time.Duration) *http.
 // currentSession resolves the request's login session, if any.
 func (s *Server) currentSession(r *http.Request, realm storage.Realm) (storage.Session, storage.User, error) {
 	c, err := r.Cookie(s.sessionCookieName(realm.Name))
-	if (err != nil || c.Value == "") && s.cookiePrefix() != "" {
-		c, err = r.Cookie(legacySessionCookieName(realm.Name))
-	}
 	if err != nil || c.Value == "" {
 		return storage.Session{}, storage.User{}, errors.New("no session cookie")
 	}
@@ -96,13 +66,10 @@ func (s *Server) currentSession(r *http.Request, realm storage.Realm) (storage.S
 // Always a new session ID — never adopts one from the request (fixation
 // defense).
 func (s *Server) establishSession(w http.ResponseWriter, r *http.Request, realm storage.Realm, userID string) error {
-	// Any pre-existing session is replaced, not reused — under either name.
-	for _, name := range []string{s.sessionCookieName(realm.Name), legacySessionCookieName(realm.Name)} {
-		if c, err := r.Cookie(name); err == nil && c.Value != "" {
-			_ = s.cfg.Store.Sessions().Delete(r.Context(), realm.Name, secrets.Hash(c.Value))
-		}
+	// Any pre-existing session is replaced, not reused.
+	if c, err := r.Cookie(s.sessionCookieName(realm.Name)); err == nil && c.Value != "" {
+		_ = s.cfg.Store.Sessions().Delete(r.Context(), realm.Name, secrets.Hash(c.Value))
 	}
-	s.expireLegacySessionCookie(w, realm.Name)
 	id := secrets.New("sid_")
 	now := s.now()
 	sess := storage.Session{
@@ -125,13 +92,10 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	for _, name := range []string{s.sessionCookieName(realm.Name), legacySessionCookieName(realm.Name)} {
-		if c, err := r.Cookie(name); err == nil && c.Value != "" {
-			_ = s.cfg.Store.Sessions().Delete(r.Context(), realm.Name, secrets.Hash(c.Value))
-		}
+	if c, err := r.Cookie(s.sessionCookieName(realm.Name)); err == nil && c.Value != "" {
+		_ = s.cfg.Store.Sessions().Delete(r.Context(), realm.Name, secrets.Hash(c.Value))
 	}
 	http.SetCookie(w, s.sessionCookie(realm.Name, "", -1))
-	s.expireLegacySessionCookie(w, realm.Name)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
 }
 

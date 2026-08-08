@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -97,26 +96,14 @@ func unauthorizedBearer(w http.ResponseWriter, code, description string) {
 }
 
 // verifyAccessToken checks an access token against the realm's issuer and
-// audience. Tokens minted before the per-realm-audience change carry the fixed
-// aud "meridian" and are still valid for their remaining TTL, so an audience
-// mismatch retries against the legacy value — otherwise deploying the audience
-// flip 401s every in-flight token at once. Verification is local (cached
-// JWKS), so the retry costs one signature check on the error path only.
-// ponytail: delete the fallback once the longest access-token TTL has passed
-// post-deploy.
+// audience, shared by the three endpoints that accept one.
 func (s *Server) verifyAccessToken(ctx context.Context, realmName, raw string) (jose.Claims, error) {
-	expect := jose.Expect{
+	return s.cfg.Keysmith.Verify(ctx, raw, jose.Expect{
 		Issuer:   s.issuer.IssuerURL(realmName),
 		Audience: s.issuer.IssuerURL(realmName),
 		Now:      s.cfg.Now,
 		Leeway:   30 * time.Second,
-	}
-	claims, err := s.cfg.Keysmith.Verify(ctx, raw, expect)
-	if errors.Is(err, jose.ErrAudienceMismatch) {
-		expect.Audience = "meridian"
-		claims, err = s.cfg.Keysmith.Verify(ctx, raw, expect)
-	}
-	return claims, err
+	})
 }
 
 // handleUserinfo implements OIDC Core §5.3.
