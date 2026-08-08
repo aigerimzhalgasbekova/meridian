@@ -4,6 +4,7 @@ import { totp } from '../src/crypto/totp.js';
 import { base32Decode } from '../src/crypto/base32.js';
 import { hashPassword } from '../src/crypto/password.js';
 import { sessionCookieOf, testApp, type TestApp } from './helpers.js';
+import { linkToken } from '../../web/src/token.js';
 
 const EMAIL = 'ada@example.com';
 const PASSWORD = 'correct horse battery';
@@ -79,7 +80,7 @@ describe('signup and login', () => {
     // One verification mail for the real signup, one notice for the taken retry.
     expect(mails).toHaveLength(2);
     expect(mails[1]!.to).toBe(EMAIL);
-    expect(mails[1]!.text).toContain('/reset?token=');
+    expect(mails[1]!.text).toContain('/reset#token=');
     // The notice must not become a password-change oracle: the reset link is a
     // token, and the attacker's chosen password was never applied.
     await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: 'a-different-password' }).expect(401);
@@ -605,6 +606,7 @@ describe('TOTP MFA', () => {
       .expect(200);
 
     const undoToken = await t.lastToken(); // the notice mailed to the account address
+    expect((await t.drainMail()).at(-1)!.text).toContain('/undo-totp#token='); // fragment, never the request line
 
     // The owner controls the password and the inbox, and it is still not enough.
     const NEW_PASSWORD = 'a completely different passphrase';
@@ -730,5 +732,37 @@ describe('rate limiting', () => {
     await attempt('/api/auth/login').expect(429);
     await attempt('/API/Auth/LOGIN').expect(429);
     await attempt('/api/auth/login/').expect(429);
+  });
+});
+
+describe('mailed links keep the token out of the request line', () => {
+  // A reset token is still LIVE when /reset loads — it is spent later, by POST
+  // /api/auth/reset. In the query string it reaches the ALB access log, which
+  // is retained 14 days in an SSE-S3 bucket, so plain s3:GetObject yields a
+  // redeemable token inside its 15-minute window. A fragment is never
+  // transmitted to any server, so it cannot be logged (nor sent as a Referer).
+  it('verify-email and reset links use #token=, never ?token=', async () => {
+    const t = testApp();
+    await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD }).expect(202);
+    await request(t.app).post('/api/auth/forgot').send({ email: EMAIL }).expect(202);
+    const mails = await t.drainMail();
+    expect(mails).toHaveLength(2);
+    expect(mails[0]!.text).toContain('/verify-email#token=');
+    expect(mails[1]!.text).toContain('/reset#token=');
+    for (const m of mails) expect(m.text).not.toContain('?token=');
+  });
+
+  it('the web reader prefers the fragment and still resolves links already in inboxes', () => {
+    const base = 'https://portal.example.com';
+    expect(linkToken(`${base}/reset#token=fragment-form`)).toBe('fragment-form');
+    // Back-compat: mailed before the switch, still sitting in an inbox.
+    expect(linkToken(`${base}/reset?token=query-form`)).toBe('query-form');
+    expect(linkToken(`${base}/reset`)).toBe('');
+  });
+
+  it('sets Referrer-Policy: no-referrer', async () => {
+    const t = testApp();
+    const res = await request(t.app).get('/healthz').expect(200);
+    expect(res.headers['referrer-policy']).toBe('no-referrer');
   });
 });

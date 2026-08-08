@@ -537,6 +537,12 @@ func TestUpstreamErrorParam(t *testing.T) {
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("upstream error param: %d", resp.StatusCode)
 	}
+	// This page is rendered AT the callback URL, whose query string carries
+	// ?code= on the success path. Without the header any link or asset on it
+	// hands the authorization code to a third party in the Referer.
+	if got := resp.Header.Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("Referrer-Policy = %q, want no-referrer", got)
+	}
 }
 
 // An upstream that does not vouch for the email must not have that email

@@ -41,6 +41,18 @@ its outstanding verification token — a change queued by an attacker who held a
 session would otherwise still flip the login address 24 h later, since
 `verify-email` is authorized by the token alone.
 
+**Mailed link delivery.** Every one-time token is mailed in the URL *fragment*
+(`/reset#token=…`), never the query string. A reset token is still live when the
+page loads — it is spent later, by `POST /api/auth/reset` — and a query string
+travels in the request line, which the ALB writes to an S3 access log kept 14
+days under SSE-S3 (`platform/terraform/envs/dev/main.tf`); `s3:GetObject` on that
+bucket would then yield a redeemable token inside its 15-minute window. A
+fragment is never transmitted to any server, so it cannot be logged there, at an
+intermediary, or in a `Referer`. `Referrer-Policy: no-referrer` is set anyway,
+for the paths a session is on. Links mailed before this change are still honoured
+from the query string (`portal/web/src/token.ts`); that fallback can be deleted
+once 24 h — the longest token TTL — has passed since deploy.
+
 **Email change.** The login address is treated as a credential, not a profile
 field, because it is the root of every mailed recovery path: `/api/account/email`
 re-verifies the account password, so a stolen cookie alone cannot move it and

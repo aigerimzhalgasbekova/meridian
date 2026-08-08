@@ -13,8 +13,9 @@
 // attacker who knows a victim's username can fail logins on purpose and lock
 // the victim out forever. So the account dimension escalates but is CAPPED
 // (default 15m): the victim is inconvenienced, never bricked. The IP
-// dimension is where unbounded escalation is safe (the attacker only locks
-// out their own address) and gets a much higher cap. The residual gap — a
+// dimension is MOSTLY the attacker's own address, which is why it gets a much
+// higher threshold (10x) counted per FailWindow rather than cumulatively — a
+// shared egress is not the attacker and must not self-lock. The residual gap — a
 // distributed attacker repeatedly re-locking one account at the cap — is
 // handled by the ChallengeHook seam: after repeated account lockouts,
 // require CAPTCHA / step-up instead of longer lockout.
@@ -67,8 +68,11 @@ type Policy struct {
 	// AccountCap bounds account-dimension lockout (default 15m). Low on
 	// purpose: see the anti-DoS note in the package doc.
 	AccountCap time.Duration
-	// IPCap bounds IP-dimension lockout (default 24h). High on purpose:
-	// escalation here only hurts the attacker's own address.
+	// IPCap bounds IP-dimension lockout (default 24h). High on purpose: it
+	// takes 50 failures per FailWindow sustained across hours to get there,
+	// which no ordinary NAT does. If a real CGNAT ever trips it, the fix is a
+	// lower IPCap or an egress exemption — not restoring the success-based
+	// reset, which is the sprayer's escape hatch. See ADR 0002.
 	IPCap time.Duration
 	// FailWindow is the IP counting window — IPThreshold means "that many
 	// failures per FailWindow", and IP escalation decays after a full quiet

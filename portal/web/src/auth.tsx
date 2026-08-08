@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, setCsrf, type Me } from './api';
 import { Link, navigate, useSession } from './App';
+import { linkToken } from './token';
 
 function useForm(): {
   error: string;
@@ -119,7 +120,7 @@ export function Forgot() {
 }
 
 export function Reset() {
-  const token = new URLSearchParams(location.search).get('token') ?? '';
+  const token = linkToken(location.href);
   const [password, setPassword] = useState('');
   const [done, setDone] = useState(false);
   const { error, busy, submit } = useForm();
@@ -145,7 +146,7 @@ export function Reset() {
 // while a session is mfaPending: the owner it exists for cannot get past the
 // step-up, which is the whole lockout being undone.
 export function UndoTotp() {
-  const token = new URLSearchParams(location.search).get('token') ?? '';
+  const token = linkToken(location.href);
   const [done, setDone] = useState(false);
   const { error, busy, submit } = useForm();
 
@@ -168,7 +169,7 @@ export function UndoTotp() {
 }
 
 export function VerifyEmail() {
-  const token = new URLSearchParams(location.search).get('token') ?? '';
+  const token = linkToken(location.href);
   const [state, setState] = useState<'working' | 'ok' | 'error'>('working');
   const [detail, setDetail] = useState('');
 

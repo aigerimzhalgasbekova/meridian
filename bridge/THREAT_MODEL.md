@@ -67,6 +67,14 @@ Code leaks via redirect logs, referer, or a malicious app on the device.
   captured code cannot be redeemed by anyone else.
 - Exchange also sends the client secret (confidential client) — two
   independent proofs.
+- `Referrer-Policy: no-referrer` on every response. `/callback/{provider}`
+  renders its error pages *at* the code-bearing URL, so without it any link or
+  asset on that page hands `?code=` to a third party.
+- The code does still reach the ALB access log, which is retained 14 days
+  (`platform/terraform/envs/dev/main.tf`). Accepted: bridge consumes the state
+  and exchanges the code inside the same request, so a code recovered from a log
+  is already spent at both bridge and the upstream. Portal's mailed tokens, which
+  are *not* spent on arrival, use the URL fragment instead for that reason.
 
 ### T4. Token forgery / algorithm abuse
 

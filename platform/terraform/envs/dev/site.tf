@@ -31,8 +31,14 @@ resource "aws_cloudfront_origin_access_control" "site" {
 }
 
 # The apex is the only host that can assert HSTS for the whole *.<domain>
-# family; the ALB-backed services set their own headers in application
-# middleware (idp/internal/server/middleware.go, console/internal/server).
+# family; the four ALB-backed services set their own headers in application
+# middleware. idp (idp/internal/server/middleware.go) and console
+# (console/internal/server/server.go) set the full set; portal
+# (portal/server/src/app.ts) sets everything except CSP, which its SPA bundle
+# needs an audit for. bridge (bridge/internal/server/server.go) sets
+# Referrer-Policy only: it serves script-free server-rendered templates with no
+# authenticated state-changing UI, so framing and sniffing buy an attacker
+# nothing there.
 resource "aws_cloudfront_response_headers_policy" "site" {
   count = local.site_enabled ? 1 : 0
   name  = "${local.name}-site-security-headers"

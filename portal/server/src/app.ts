@@ -80,6 +80,19 @@ export function createApp(ctx: AppContext): Express {
   // buckets the whole internet together. Everything left of that last hop
   // is client-supplied and stays untrusted.
   if (config.trustProxy) app.set('trust proxy', 1);
+  // Mailed tokens live in the fragment, which a browser never puts in a
+  // Referer anyway; this covers the rest (a stray link on /security leaking
+  // the path a session was on). Mirrors idp/internal/server/middleware.go.
+  // X-Frame-Options because /security hosts state-changing forms (session
+  // revoke, email change); a framed click is a nuisance rather than a takeover
+  // since every destructive action re-authenticates, but DENY is one line.
+  // ponytail: no CSP — the SPA bundle needs its own audit first.
+  app.use((_req, res, next) => {
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    next();
+  });
   app.get('/healthz', (_req, res) => {
     res.json({ ok: true });
   });
@@ -103,6 +116,12 @@ export function createApp(ctx: AppContext): Express {
     return session;
   }
 
+  // All three mailed links below carry the token in the URL FRAGMENT, never
+  // the query string. A fragment is not transmitted to the server, so it
+  // cannot reach the ALB access log (platform/terraform/envs/dev/main.tf) or a
+  // Referer header. That matters most for /reset: the token is still live when
+  // the page loads — it is spent later, by POST /api/auth/reset — so a logged
+  // query string is a 15-minute account-takeover window.
   async function sendVerifyEmail(userId: string, address: string): Promise<void> {
     const { token, hash } = newToken();
     await store.tokens.create({
@@ -115,7 +134,7 @@ export function createApp(ctx: AppContext): Express {
     await queue.enqueue(SEND_EMAIL, {
       to: address,
       subject: `Verify your ${config.issuer} email address`,
-      text: `Confirm this address by opening:\n\n${config.baseUrl}/verify-email?token=${token}\n\nThis link expires in ${Math.round(config.verifyTokenTtlMs / 3_600_000)} hours.`,
+      text: `Confirm this address by opening:\n\n${config.baseUrl}/verify-email#token=${token}\n\nThis link expires in ${Math.round(config.verifyTokenTtlMs / 3_600_000)} hours.`,
     }, { runAt: ctx.now() });
   }
 
@@ -131,7 +150,7 @@ export function createApp(ctx: AppContext): Express {
     await queue.enqueue(SEND_EMAIL, {
       to: address,
       subject,
-      text: `${lead}\n\n${config.baseUrl}/reset?token=${token}\n\nThis link expires in ${Math.round(config.resetTokenTtlMs / 60_000)} minutes and can be used once.`,
+      text: `${lead}\n\n${config.baseUrl}/reset#token=${token}\n\nThis link expires in ${Math.round(config.resetTokenTtlMs / 60_000)} minutes and can be used once.`,
     }, { runAt: ctx.now() });
   }
 
@@ -158,7 +177,7 @@ export function createApp(ctx: AppContext): Express {
     await queue.enqueue(SEND_EMAIL, {
       to: address,
       subject: `Two-factor authentication was enabled on your ${config.issuer} account`,
-      text: `If this was you, nothing to do — keep your recovery codes safe.\n\nIf it was not, turn the second factor off and then change your password:\n\n${config.baseUrl}/undo-totp?token=${token}\n\nThis link expires in ${Math.round(config.verifyTokenTtlMs / 3_600_000)} hours and can be used once.`,
+      text: `If this was you, nothing to do — keep your recovery codes safe.\n\nIf it was not, turn the second factor off and then change your password:\n\n${config.baseUrl}/undo-totp#token=${token}\n\nThis link expires in ${Math.round(config.verifyTokenTtlMs / 3_600_000)} hours and can be used once.`,
     }, { runAt: ctx.now() });
   }
 

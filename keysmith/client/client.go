@@ -322,11 +322,16 @@ func (c *Client) RawJWKS(ctx context.Context) ([]byte, error) {
 	return c.rawJWKS, nil
 }
 
-// maxJWKSMaxAge caps how long this client will cache a key set whatever the
-// response asserts. The server computes JWKSMaxAge <= PendingDwell/2 so that
-// verifier caches provably refresh before a pending key starts signing; the
-// client is the other half of that invariant and must not honour a header
-// (or an intermediary rewriting one) that pins it past the dwell.
+// maxJWKSMaxAge is a fixed backstop against an absurd Cache-Control from a
+// misconfigured server or a rewriting intermediary. It is NOT an invariant
+// about the dwell: this client has no idea what the issuer's PendingDwell is,
+// so it cannot tell 14m from "past the dwell" — a server enforcing
+// JWKSMaxAge <= PendingDwell/2 (keysmith/service/server.go) keeps that promise
+// on its own side, and this constant only bounds the damage when nobody does.
+//
+// The mechanism that actually keeps verification correct across a promotion is
+// the unknown-kid refresh (allowKidRefresh): a token signed by a key the cache
+// has not seen triggers a fetch immediately, whatever the max-age says.
 const maxJWKSMaxAge = 15 * time.Minute
 
 func parseMaxAge(cacheControl string, fallback time.Duration) time.Duration {

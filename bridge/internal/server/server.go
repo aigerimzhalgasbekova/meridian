@@ -118,7 +118,19 @@ func New(cfg Config, reg *provider.Registry, dir directory.Store, signer Signer)
 }
 
 // ServeHTTP implements http.Handler.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+//
+// /callback/{provider} is reached with ?code=&state= in the request line and
+// renders its error pages at that same URL, so any link or asset on that page
+// would otherwise carry the authorization code out in a Referer. Same reason
+// idp sets it (idp/internal/server/authorize.go).
+//
+// ponytail: one header, not a middleware chain — bridge serves server-rendered
+// templates with no scripts, so CSP/HSTS here would be copy-paste from idp with
+// nothing to protect. Add them if bridge ever ships JS.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	s.mux.ServeHTTP(w, r)
+}
 
 func (s *Server) redirectURI(providerName string) string {
 	return s.cfg.BaseURL + "/callback/" + providerName

@@ -94,11 +94,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
     status = "Enabled"
     filter {}
     expiration {
-      # Access-log records carry the full request line, and portal mails
-      # single-use reset/verify tokens as query parameters — so this bucket is
-      # credential-adjacent (see THREAT_MODEL asset 6). Two weeks is enough for
-      # forensics on a dev stack and bounds the window. The root fix is
-      # portal-side (POST or URL fragment instead of a query parameter).
+      # Access-log records carry the full request line. Portal's one-time
+      # tokens no longer appear there — they are mailed in the URL fragment,
+      # which browsers never transmit (portal/server/src/app.ts) — except for
+      # links mailed before the switch, which carry ?token= until the 24h
+      # verify-email TTL lapses (portal/web/src/token.ts, dated for deletion).
+      # What is left is bridge's ?code=, already spent by the time the request
+      # completes.
+      # Two weeks is enough for forensics on a dev stack and bounds the window.
       days = 14
     }
   }

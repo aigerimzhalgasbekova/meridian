@@ -49,9 +49,11 @@ sessiond), never end users or the public internet.
 
 ### Denial of service
 - **Against victims via lockout** — the signature abuse case. Account lockout
-  is capped at 15m; unbounded escalation lives only in the attacker-owned IP
-  dimension; ChallengeHook seam moves repeat offenses to CAPTCHA/step-up
-  instead of longer locks (ADR 0002).
+  is capped at 15m; the long 24h escalation lives only in the IP dimension,
+  which is mostly but not only the attacker's own address — a shared egress is
+  kept out of it by a 10x threshold counted per hour rather than cumulatively
+  (ADR 0002); ChallengeHook seam moves repeat offenses to CAPTCHA/step-up
+  instead of longer locks.
 - **Against sentinel itself** — O(1) state per rate-limit key, amortized
   sweeping of stale keys, 1 MiB request-body cap, read/write timeouts.
   Residual: unbounded distinct-key cardinality from a spoofed-IP flood is
@@ -62,6 +64,9 @@ sessiond), never end users or the public internet.
 - Denied requests still count toward limits (no free retries).
 - Success during an active lockout does not unlock — a stolen password does
   not convert a lockout into a free pass.
+- Success never clears the IP counter, locked or not: a sprayer must not be
+  able to wipe it by logging into an account they control. The hourly window
+  roll bounds it instead.
 - Unknown rate-limit class is a hard error, not "unlimited" (typo-safe).
 
 ### Evading risk signals
