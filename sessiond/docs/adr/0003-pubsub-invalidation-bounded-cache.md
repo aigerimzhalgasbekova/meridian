@@ -69,3 +69,10 @@ hashes of fresh 256-bit tokens that cannot have been validated before creation.
 - `LastSeenAt` renewal is also amortized: a cached validate does not touch
   Redis, so the idle window renews at `CacheTTL` granularity. Irrelevant at
   2s against a 30m idle timeout.
+- Entry lifetime is measured from when the Redis read was *issued*, so once the
+  Redis round trip reaches `CacheTTL` every entry is born expired and the cache
+  stops absorbing load — exactly when Redis is slowest. Accepted: honouring the
+  staleness bound wins over shedding load. The operator signal is the existing
+  request log, no new metric: `duration_ms` on `/v1/sessions/validate` at or
+  above `CacheTTL` means the cache is effectively off. The lever is raising
+  `SESSIOND_CACHE_TTL`, which widens the staleness bound explicitly.

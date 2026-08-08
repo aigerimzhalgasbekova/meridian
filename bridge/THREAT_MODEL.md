@@ -145,8 +145,13 @@ A dead upstream ties up connections and blocks all logins.
   `/healthz/providers` exposes state. ADR 0002, `TestFailFastLoginPage`,
   `TestBreakerOpensOnUpstreamFailure`, `TestJWKSStaleTolerance`.
 - `/login/{provider}` is unauthenticated and mints a flow record per call, so
-  it is also a memory/CPU amplifier. The flow table is capped (`relay.maxFlows`
-  → 503) and the expiry sweep is throttled to once per 30s so a flood cannot
+  it is also a memory/CPU amplifier. The flow table is capped at
+  `relay.maxFlows`, and a full table evicts a random existing flow rather than
+  refusing the new login (refusing would let anyone buy a global login outage
+  for the price of `maxFlows` plain GETs); saturation is reported as a
+  `flow table saturated` warning, which is also what attributes the
+  `callback state rejected` spike an eviction causes. The expiry sweep is
+  throttled to once per 30s so a flood cannot
   make each request O(live flows) under the manager's mutex. The primary
   control is still the ALB's WAF rate-based rule (2000 req / 5 min / source
   IP), which is **absent in cheap/non-prod deployments** — see accepted risks.

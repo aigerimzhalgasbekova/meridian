@@ -33,12 +33,11 @@ export interface Session {
  * activated: redeeming it clears the factor. It is the only escape from a
  * hostile enrollment by someone who knows the password — reset does not clear
  * TOTP, and /security/totp/disable needs a session that already stepped up.
- *
- * `undo_email` is its twin for the login address: mailed to the address a
- * confirmed change moves away from, because relocating the address is what
- * makes every other mailed notice — including undo_totp — land on the mover.
+ * There is deliberately no counterpart for the login address: a token that
+ * restores it is a full account-recovery capability, and the address it would
+ * have to be mailed to is the one the account just stopped using.
  */
-export type TokenPurpose = 'password_reset' | 'verify_email' | 'undo_totp' | 'undo_email';
+export type TokenPurpose = 'password_reset' | 'verify_email' | 'undo_totp';
 
 export interface OneTimeToken {
   id: string;

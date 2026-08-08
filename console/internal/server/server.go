@@ -260,7 +260,8 @@ func (s *Server) requireAudited(w http.ResponseWriter, r *http.Request, perm rba
 // checks at the target's realm, so a denial envelope that
 // names the scope — in the message or in the attached decision — is exactly the
 // cross-realm existence oracle the bare 404 was. Both branches emit one fixed
-// body instead, byte-identical for a miss and a cross-realm hit.
+// body instead, byte-identical for a miss and a cross-realm hit — and one fixed
+// scope in the denial event, for the same reason (see denyTarget).
 //
 // This is the only place the console gives up its explanation trace, and it
 // buys the property the 403 was introduced for; every other route keeps it.
@@ -269,7 +270,7 @@ func (s *Server) requireTarget(w http.ResponseWriter, r *http.Request, perm rbac
 	if s.cfg.Engine.Check(subject(r), perm, scope).Allowed {
 		return true
 	}
-	s.denyTarget(w, r, perm, scope, action, target)
+	s.denyTarget(w, r, perm, action, target)
 	return false
 }
 
@@ -293,7 +294,7 @@ func (s *Server) requireAnyTarget(w http.ResponseWriter, r *http.Request, perm r
 	if s.allowedForAnyTarget(subject(r), perm) {
 		return true
 	}
-	s.denyTarget(w, r, perm, rbac.Global, action, target)
+	s.denyTarget(w, r, perm, action, target)
 	return false
 }
 
@@ -313,10 +314,16 @@ func (s *Server) allowedForAnyTarget(sub string, perm rbac.Permission) bool {
 }
 
 // denyTarget writes the fixed target-blind denial shared by both target gates.
+// The event records rbac.Global, not the scope that was checked: the miss
+// branch checks at global and the hit branch at the target's realm, so a
+// per-branch scope in the trail is the same existence oracle the fixed body
+// closes — and the carve-out holder routed here by requireAnyTarget is exactly
+// the caller who holds audit:read globally and can read her own probe rows
+// back. Target already names the probed id, which is what forensics needs.
 // action == "" skips the audit — a read is not a mutation.
-func (s *Server) denyTarget(w http.ResponseWriter, r *http.Request, perm rbac.Permission, scope rbac.Scope, action, target string) {
+func (s *Server) denyTarget(w http.ResponseWriter, r *http.Request, perm rbac.Permission, action, target string) {
 	if action != "" {
-		s.audit(r, action, target, scope, false, "")
+		s.audit(r, action, target, rbac.Global, false, "")
 	}
 	writeError(w, http.StatusForbidden, "forbidden", string(perm)+" denied for this target")
 }

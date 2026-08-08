@@ -1,7 +1,9 @@
 package relay
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +132,50 @@ func TestFullFlowTableEvictsInsteadOfRefusing(t *testing.T) {
 	}
 	if got, err := m.Consume(state, "google", f.Binding); err != nil || got.ID != f.ID {
 		t.Fatalf("the admitted flow must be usable: %v", err)
+	}
+}
+
+// The sweep is now the *only* thing that reclaims abandoned flows: eviction
+// hides a dead sweep, because a table stuck at maxFlows keeps admitting logins
+// while never releasing 10-minute-expired garbage. Pin the reclamation itself.
+func TestExpiredFlowsAreSwept(t *testing.T) {
+	clock := time.Now()
+	m := testManager(t, func() time.Time { return clock })
+	for i := 0; i < 10; i++ {
+		m.flows[randomToken()] = Flow{Expires: clock.Add(TTL)}
+	}
+	clock = clock.Add(TTL + sweepInterval)
+	if _, _, err := m.Begin("google", ModeLogin, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.flows) != 1 {
+		t.Fatalf("due sweep did not reclaim expired flows: %d left, want only the new one", len(m.flows))
+	}
+}
+
+// An evicted flow's callback fails as ErrStateUsed and logs "possible replay",
+// so saturation must announce itself or an operator cannot tell a full table
+// from an attack.
+func TestSaturationIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	clock := time.Now()
+	m := testManager(t, func() time.Time { return clock })
+	for i := 0; i < maxFlows; i++ {
+		m.flows[randomToken()] = Flow{Expires: clock.Add(TTL)}
+	}
+	if _, _, err := m.Begin("google", ModeLogin, "", ""); err != nil { // evicts
+		t.Fatal(err)
+	}
+	clock = clock.Add(sweepInterval) // next sweep tick drains the counter
+	if _, _, err := m.Begin("google", ModeLogin, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "flow table saturated") {
+		t.Fatalf("eviction produced no operator signal: %q", buf.String())
 	}
 }
 

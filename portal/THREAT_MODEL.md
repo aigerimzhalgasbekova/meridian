@@ -48,12 +48,11 @@ then simply ask `/forgot` for a new one. The old address remains the login until
 the new address proves receipt. Requesting a new change revokes prior pending
 tokens; a superseded token is rejected. Duplicate-address checks at request *and*
 confirm time. Confirming a change mails the address it moved *away from* a
-single-use `undo_email` token (24 h): redeeming it restores that address, signs
-out every session, and clears any second factor enrolled since — a factor
-enrolled after the move belongs to whoever moved it, and its own `undo_totp`
-notice went to the new address. That is not a new MFA bypass: `undo_totp`
-already lets the account inbox clear a factor, and this needs the old inbox
-*plus* a change only the password could have started.
+notification — no link, no token. A token that restored the address would be a
+full account-recovery capability (restore, `/forgot` there, `/reset`) mailed to
+an address the account has just stopped using and may never have proved receipt
+of at all: a signup typo of a stranger's address, corrected later, would hand
+that stranger the account. The move is announced, not reversible in-product.
 
 **TOTP.** Verify-to-activate (a wrong-device enrollment can't lock you out).
 ±1 step drift only. Replay defense: the last accepted time-step counter is
@@ -122,18 +121,18 @@ treated as secret-bearing: dead-lettered rows should be purged, not archived.
   password. TOTP step-up is deliberately *not* bypassed by reset — reset does
   not disable TOTP. The exit is `POST /api/security/totp/disable`, which needs
   the password *and* a session that already passed the step-up. The inbox alone
-  clears a second factor in exactly two windows, both single-use and both 24 h:
-  the `undo_totp` link mailed when the factor is enabled, and the `undo_email`
-  link mailed to the address a confirmed change moved away from. Uncovered:
-  a lost authenticator, all ten recovery codes spent, and both windows long
-  gone — unrecoverable in-product by design, since any standing escape hatch is
-  a standing MFA bypass. An out-of-band identity-proofed support path is the
+  clears a second factor in exactly one window: the single-use `undo_totp` link
+  mailed when that factor is enabled, expiring 24 h later. The uncovered case is
+  therefore a lost authenticator, all ten recovery codes spent, and that window
+  long gone: unrecoverable in-product by design, since any standing escape hatch
+  is a standing MFA bypass. An out-of-band identity-proofed support path is the
   upgrade.
-- **A *chain* of address changes still ends with whoever redeems last.** Each
-  confirmed change mints its own `undo_email` token, and redeeming one does not
-  revoke the others — revoking siblings would let a password-holding attacker
-  destroy the owner's token by moving the address twice, which is the worse
-  failure. So `A→B→C` leaves two live tokens (to A and to B) and the last
-  redemption wins. Closing it means ordering tokens by `created_at` and
-  revoking only those minted after the one redeemed. Strictly better than
-  before, where one change and no notice was the whole attack.
+- **An attacker who knows the password can still move the login address away.**
+  Password re-auth on `/api/account/email` stops a stolen cookie, not a stuffed
+  or phished password. Once the change is confirmed the old address is told, but
+  it has no in-product way back: everything downstream (`/forgot`, `undo_totp`)
+  is addressed to the new inbox. The counterweight tried in the previous
+  revision — an undo token mailed to the old address — was worse than the
+  attack it answered, because that inbox is not proven to belong to the account
+  either. Recovery here is the same out-of-band identity-proofed path as a lost
+  authenticator.

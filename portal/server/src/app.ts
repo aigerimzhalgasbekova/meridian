@@ -163,27 +163,19 @@ export function createApp(ctx: AppContext): Express {
   }
 
   /**
-   * Mailed to the address a confirmed change moves *away from*. The login
-   * address is the root of every email-based recovery path we have — including
-   * the undo_totp notice above — so an attacker who relocates it first receives
-   * every later warning himself and the owner's /forgot goes to an address on
-   * no account. This is the counterweight: it lands in the old inbox and its
-   * token puts the account back.
+   * Mailed to the address a confirmed change moves *away from*, so the move is
+   * never silent. Deliberately carries no token: a link that restores the login
+   * address is a full account-recovery capability, and mailing it to an address
+   * the account has just stopped using — one that may never have proved receipt
+   * in the first place — hands that capability to whoever reads that inbox. The
+   * remedy for "that was not me" is out-of-band, because by then the password is
+   * known to someone else too.
    */
-  async function sendEmailChangedNotice(userId: string, oldAddress: string, newAddress: string): Promise<void> {
-    const { token, hash } = newToken();
-    await store.tokens.create({
-      userId,
-      purpose: 'undo_email',
-      tokenHash: hash,
-      payload: oldAddress,
-      // ponytail: reuses the verify-email TTL (24h) rather than adding a knob.
-      expiresAt: new Date(ctx.now().getTime() + config.verifyTokenTtlMs),
-    });
+  async function sendEmailChangedNotice(oldAddress: string, newAddress: string): Promise<void> {
     await queue.enqueue(SEND_EMAIL, {
       to: oldAddress,
       subject: `The sign-in address on your ${config.issuer} account was changed`,
-      text: `This account now signs in as ${newAddress}.\n\nIf that was not you, put it back — this also signs every session out and removes any authenticator app added since the change:\n\n${config.baseUrl}/undo-email?token=${token}\n\nThis link expires in ${Math.round(config.verifyTokenTtlMs / 3_600_000)} hours and can be used once.`,
+      text: `This account now signs in as ${newAddress} and no longer uses this address.\n\nIf that was not you, whoever did it also knows your password — contact support, because this address can no longer sign in or reset it.`,
     }, { runAt: ctx.now() });
   }
 
@@ -353,60 +345,9 @@ export function createApp(ctx: AppContext): Express {
       // Email change confirmed: only now does the old address stop being the login.
       const previous = user.email; // read before the update, not after
       await store.users.update(user.id, { email: address, pendingEmail: null, emailVerified: true });
-      await sendEmailChangedNotice(user.id, previous, address);
+      await sendEmailChangedNotice(previous, address);
     }
     res.json({ ok: true, email: address });
-  }));
-
-  /**
-   * The old inbox's counterweight to a confirmed address change. Authorized by
-   * the mailed token alone, like /reset and /verify-email: by the time it is
-   * needed the account no longer answers to the address its owner has.
-   */
-  app.post('/api/auth/undo-email', limited, wrap(async (req, res) => {
-    const { token } = req.body ?? {};
-    if (typeof token !== 'string' || token.length === 0) return badRequest(res, 'token required');
-    const record = await store.tokens.findActiveByHash(hashToken(token), 'undo_email', ctx.now());
-    const previous = record?.payload;
-    if (!record || !previous) {
-      res.status(400).json({ error: 'invalid or expired token' });
-      return;
-    }
-    // Someone else registered the old address in the meantime: a recoverable
-    // conflict, so check it before spending the token (mirrors /verify-email).
-    const holder = await store.users.findByEmail(previous);
-    if (holder && holder.id !== record.userId) {
-      res.status(409).json({ error: 'that email is already in use' });
-      return;
-    }
-    // markUsed is atomic: a concurrent double-submit loses here (single use).
-    if (!(await store.tokens.markUsed(record.id, ctx.now()))) {
-      res.status(400).json({ error: 'invalid or expired token' });
-      return;
-    }
-    await store.users.update(record.userId, {
-      email: previous,
-      // Clicking a link mailed here is proof of receipt, and pendingEmail: null
-      // cancels any further change the mover had queued.
-      emailVerified: true,
-      pendingEmail: null,
-      // Whoever moved the address had the password, so a factor enrolled after
-      // the move is theirs — and its own undo notice went to the address they
-      // moved to. Not a new bypass: undo_totp already lets the account inbox
-      // clear a factor, and this needs that inbox *plus* a change only the
-      // password could have started.
-      totpSecret: null,
-      totpPendingSecret: null,
-      totpLastCounter: null,
-    });
-    await store.recoveryCodes.replaceForUser(record.userId, []);
-    await store.sessions.deleteAllForUser(record.userId);
-    // ponytail: siblings from a *chain* of changes (A->B->C) are deliberately
-    // left live — revoking them would let the mover burn the owner's token by
-    // moving twice. So a chain still ends with whoever redeems last. Closing it
-    // needs tokens ordered by created_at (revoke only those minted after this
-    // one), i.e. a new TokenRepo method; out of proportion until it is seen.
-    res.json({ ok: true, email: previous });
   }));
 
   // ---- Account ----------------------------------------------------------------

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,17 +21,16 @@ import (
 // ID and algorithm into the AEAD; v2 additionally binds the lifecycle state,
 // the timestamps and the document generation.
 //
-// A v1 document loads only under migrateEnvVar, and is rewritten as v2 on open.
-// Accepting it unconditionally would leave a permanent forgery primitive: in a
-// v1 record the lifecycle fields are unauthenticated, so one retained copy of a
-// pre-upgrade file lets a KEK-less attacker put a retired key back in the active
-// slot — and the upgrade would then re-seal that forged state as a valid v2
-// record. Gating it on an operator action gives the downgrade window a start and
-// an end.
-const (
-	fileVersion   = 2
-	migrateEnvVar = "KEYSMITH_KEYSTORE_MIGRATE_V1"
-)
+// A v1 document loads — verified under the v1 AAD — and is rewritten at v2 on
+// open: back-compat on read, upgrade on write, no env var and no operator step.
+// The residual is a standing downgrade path: the lifecycle fields of a
+// *retained* pre-upgrade copy are unauthenticated, so a KEK-less attacker who
+// kept one and can write the keystore path can replay it with forged state.
+// Closing that needs a generation anchor outside the document (see
+// fileDoc.Generation); an operator-set opt-in did not close it either, it only
+// converted the exposure into a way to brick the platform's only signer on
+// deploy. Documented in THREAT_MODEL.md.
+const fileVersion = 2
 
 // FileStore persists keys to a single JSON file with private key material
 // envelope-encrypted. Writes are atomic (temp file + rename) and fsynced.
@@ -118,21 +116,6 @@ func OpenFileStore(ctx context.Context, path string, kek KEK) (*FileStore, error
 		s.Close()
 		return nil, fmt.Errorf("keystore: %s has document version %d, this build understands 1..%d",
 			path, doc.Version, fileVersion)
-	}
-	if doc.Version < fileVersion && os.Getenv(migrateEnvVar) != "1" {
-		s.Close()
-		return nil, fmt.Errorf("keystore: %s is a version %d document whose lifecycle metadata is unauthenticated; "+
-			"start once with %s=1 to upgrade it to v%d, then remove the variable",
-			path, doc.Version, migrateEnvVar, fileVersion)
-	}
-	if doc.Version == fileVersion && os.Getenv(migrateEnvVar) == "1" {
-		// The migration deploy has to set the variable (terraform does), and the
-		// deploy after it has to drop it. Forgetting is silent otherwise: the
-		// downgrade window just stays open. Refusing to start would trade the
-		// window for an outage, so it alarms instead.
-		slog.Warn("keysmith keystore migration opt-in is still enabled; remove it",
-			"var", migrateEnvVar, "path", path, "version", doc.Version,
-			"risk", "a retained pre-upgrade copy of this file can be replayed with forged lifecycle state")
 	}
 	s.gen = doc.Generation
 	for _, rec := range doc.Keys {

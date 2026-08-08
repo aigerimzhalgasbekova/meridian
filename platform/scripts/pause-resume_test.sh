@@ -6,6 +6,8 @@
 #   1. a failed describe-alarms is reported as a failure, not as "no alarms".
 #   2. resume.sh brings the stack back BEFORE it touches CloudWatch, so a
 #      monitoring hiccup can never leave RDS stopped and every service at 0.
+#   3. a warning on aws's stderr never becomes an alarm name (the stub emits
+#      one on every successful describe-alarms).
 set -uo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 STUB=$(mktemp -d)
@@ -19,6 +21,8 @@ if [ "$1" = cloudwatch ] && [ "$2" = describe-alarms ]; then
     echo "ExpiredToken: the security token included in the request is expired" >&2
     exit 255
   fi
+  # A pip-installed CLI warns on stderr and still exits 0.
+  echo "urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+" >&2
   echo "meridian-dev-idp-no-healthy-hosts	meridian-dev-bridge-no-healthy-hosts"
 fi
 exit 0
@@ -60,6 +64,13 @@ export AWS_STUB_LOG="$STUB/resume-ok.log" AWS_STUB_ALARMS=ok
 "$HERE/resume.sh" >/dev/null 2>&1 &&
   grep -q "enable-alarm-actions --alarm-names meridian-dev-idp-no-healthy-hosts meridian-dev-bridge-no-healthy-hosts" "$AWS_STUB_LOG"
 check "resume.sh re-arms both discovered alarms on the happy path" $?
+
+# 5. Happy path silences exactly the two real alarms — not the stderr warning.
+export AWS_STUB_LOG="$STUB/pause-ok.log"
+: >"$AWS_STUB_LOG"
+"$HERE/pause.sh" >/dev/null 2>&1 &&
+  grep -qx "cloudwatch disable-alarm-actions --alarm-names meridian-dev-idp-no-healthy-hosts meridian-dev-bridge-no-healthy-hosts" "$AWS_STUB_LOG"
+check "pause.sh silences exactly the discovered alarms" $?
 
 [ "$fails" -eq 0 ] || { echo "$fails check(s) failed"; exit 1; }
 echo "all checks passed"

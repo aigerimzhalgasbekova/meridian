@@ -46,9 +46,14 @@ type Policy struct {
 	// account lockout (default 5). Consecutive, NOT per-window: the account
 	// dimension exists to catch a distributed attacker guessing one victim's
 	// password, and such an attacker only has to pace guesses under any
-	// counting window to never trip it. The counter is cleared by Success
-	// and by the entry going idle for FailWindow — both of which mean the
-	// attack stopped — but never by the mere passage of time under load.
+	// counting window to never trip it, so nothing here clears the counter
+	// by the mere passage of time. It IS cleared by Success, by the lock
+	// itself firing (see fail), by the entry going idle for FailWindow —
+	// and, the one path an attacker can force, by reclaim dropping any
+	// below-threshold entry once the accounts map hits MaxKeys. A username
+	// flood is exactly that pressure, so a paced guesser with a second
+	// source can reset a victim's count; the backstop for that is the IP
+	// dimension and the ChallengeHook, not this counter (see ADR 0002).
 	Threshold int
 	// IPThreshold is the number of failures per FailWindow from one IP that
 	// triggers an IP lockout (default 10x Threshold). Deliberately higher than

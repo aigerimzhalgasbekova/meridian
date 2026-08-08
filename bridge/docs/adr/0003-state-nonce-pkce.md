@@ -61,7 +61,10 @@ everything from it:
   browser) into one uniform user-facing message, and logs the distinct typed
   error with the provider and remote address — never state, code or token
   bytes. That log line is the only place replay, tamper, expiry and hijack are
-  distinguishable, so it is a required part of the design, not decoration.
+  distinguishable, so it is a required part of the design, not decoration. It
+  has one benign producer too — a flow evicted by a saturated table reads as
+  replay at its callback — which is why saturation logs its own
+  `flow table saturated` line to attribute the spike.
 - Expired flows are swept opportunistically on `Begin` — no background
   goroutine to leak — but at most once every 30s, and the table is capped at
   `maxFlows`. `/login/{provider}` is unauthenticated: sweeping the whole map on

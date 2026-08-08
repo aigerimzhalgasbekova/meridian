@@ -335,60 +335,37 @@ describe('email verification and change', () => {
     expect(await t.drainMail()).toHaveLength(1); // the signup verification, and nothing else
   });
 
-  it('a confirmed address change tells the old inbox, which can put the account back', async () => {
-    // An attacker who knows the password (stuffing, phishing) passes the
-    // re-auth above. Moving the address first made every later notice — the
-    // undo_totp escape hatch included — arrive in their own inbox, while the
-    // owner's /forgot went to an address on no account: permanent lockout with
-    // no notification at any point.
+  it('the notice to the old inbox is a notification, not a way back into the account', async () => {
+    // It used to carry a single-use token that restored the login address,
+    // cleared TOTP and burned every recovery code — minted on EVERY confirmed
+    // change, including one away from an address that never proved receipt.
+    // Sign up with a typo of a stranger's address, never open the verification
+    // link, fix the typo: the stranger was mailed 24 h of account takeover
+    // (restore, /forgot there, /reset). A notice is not a credential.
     const t = testApp();
-    const attacker = await signup(t);
-    const EVIL = 'attacker@example.com';
+    const TYPO = 'stranger@example.com';
+    const { cookie, csrf } = await signup(t, TYPO);
     await request(t.app)
       .post('/api/account/email')
-      .set('Cookie', attacker.cookie)
-      .set('x-csrf-token', attacker.csrf)
-      .send({ email: EVIL, password: PASSWORD })
+      .set('Cookie', cookie)
+      .set('x-csrf-token', csrf)
+      .send({ email: EMAIL, password: PASSWORD })
       .expect(202);
     await request(t.app).post('/api/auth/verify-email').send({ token: await t.lastToken() }).expect(200);
 
     const mails = await t.drainMail();
-    expect(mails[mails.length - 1]!.to).toBe(EMAIL); // the notice goes to the address left behind
-    const undoToken = await t.lastToken();
+    const notice = mails[mails.length - 1]!;
+    expect(notice.to).toBe(TYPO); // the address left behind is told
+    expect(notice.text).toContain(EMAIL);
+    expect(notice.text).not.toMatch(/token=/); // ...and given nothing to redeem
+    await request(t.app).post('/api/auth/undo-email').send({ token: 'x' }).expect(404);
 
-    // The attacker now enrolls a factor, and *its* notice does land on them.
-    const setup = await request(t.app)
-      .post('/api/security/totp/setup')
-      .set('Cookie', attacker.cookie)
-      .set('x-csrf-token', attacker.csrf)
-      .send({ password: PASSWORD })
-      .expect(200);
-    await request(t.app)
-      .post('/api/security/totp/activate')
-      .set('Cookie', attacker.cookie)
-      .set('x-csrf-token', attacker.csrf)
-      .send({ code: totp(base32Decode(setup.body.secret as string), t.clock.now.getTime() / 1000) })
-      .expect(200);
-    const afterEnroll = await t.drainMail();
-    expect(afterEnroll[afterEnroll.length - 1]!.to).toBe(EVIL);
-
-    // The owner's documented remedy produces nothing: no account has that address.
-    await request(t.app).post('/api/auth/forgot').send({ email: EMAIL }).expect(202);
-    expect(await t.drainMail()).toHaveLength(afterEnroll.length);
-
-    // The link in the old inbox is the way back, and it takes the factor the
-    // mover enrolled with it.
-    const undo = await request(t.app).post('/api/auth/undo-email').send({ token: undoToken }).expect(200);
-    expect(undo.body.email).toBe(EMAIL);
-    await request(t.app).post('/api/auth/login').send({ email: EVIL, password: PASSWORD }).expect(401);
-    const back = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD }).expect(200);
-    expect(back.body.mfaPending).toBe(false);
-    expect(back.body.user.totpEnabled).toBe(false);
-    const user = await t.ctx.store.users.findByEmail(EMAIL);
-    expect(await t.ctx.store.recoveryCodes.countUnused(user!.id)).toBe(0);
-    await request(t.app).get('/api/me').set('Cookie', attacker.cookie).expect(401);
-    // single use
-    await request(t.app).post('/api/auth/undo-email').send({ token: undoToken }).expect(400);
+    // The account answers to the new address only, and the old inbox cannot
+    // reach it: /forgot there mails nothing.
+    await request(t.app).post('/api/auth/login').send({ email: TYPO, password: PASSWORD }).expect(401);
+    await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD }).expect(200);
+    await request(t.app).post('/api/auth/forgot').send({ email: TYPO }).expect(202);
+    expect(await t.drainMail()).toHaveLength(mails.length);
   });
 
   it('rate-limits the email-change existence oracle', async () => {

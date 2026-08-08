@@ -7,12 +7,6 @@
 //	KEYSMITH_MASTER_KEY      base64 (std) 32-byte KEK master key. REQUIRED unless
 //	                         KEYSMITH_DEV_MODE=1, which generates an ephemeral
 //	                         in-memory store (keys lost on exit — dev only).
-//	KEYSMITH_KEYSTORE_MIGRATE_V1
-//	                         set to 1 for ONE start to upgrade a version 1
-//	                         keystore (lifecycle metadata outside the AEAD) to
-//	                         v2, then remove it — while set, a pre-upgrade copy
-//	                         of the file can be replayed with forged lifecycle
-//	                         state.
 //	KEYSMITH_SIGNER_TOKENS   comma-separated bearer tokens for the sign API
 //	KEYSMITH_ADMIN_TOKENS    comma-separated bearer tokens for the admin API
 //	KEYSMITH_ALGS            comma-separated algorithms (default EdDSA,RS256)

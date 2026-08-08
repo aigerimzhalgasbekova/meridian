@@ -247,28 +247,27 @@ resource "aws_ecs_service" "this" {
   deployment_minimum_healthy_percent = var.stop_before_start ? 0 : 100
   deployment_maximum_percent         = var.stop_before_start ? 100 : 200
 
-  # stop_before_start deliberately removes the "old task keeps serving" safety
-  # net, so a bad image is a hard outage that ECS retries forever. The breaker
-  # puts a stop back in its place. On the 100/200 path it costs nothing and
-  # still shortens a failed deploy. Requires the default ECS deployment
-  # controller, which is what this module uses.
+  # stop_before_start removes the "old task keeps serving" safety net, so a bad
+  # image is a hard outage that ECS retries forever. The breaker puts a stop
+  # back in its place — but only where a failed launch actually means a bad
+  # image. Requires the default ECS deployment controller, which this module
+  # uses.
   #
-  # Automatic rollback only for services WITHOUT an exclusive EFS file. The
-  # keystore/audit flock is LOCK_NB (fail fast), and if the old task is
-  # SIGKILLed rather than SIGTERMed its NFSv4 lock lease survives on the EFS
-  # server for the grace period (~90s). Every replacement launched in that
-  # window exits immediately; at desired_count = 1 the breaker's threshold is
-  # its floor of 3, so three fast exits trip it. With rollback = true ECS would
-  # then revert to the PREVIOUS task definition, the lease would expire, the
-  # old image would start clean — and the stack looks healthy while running an
-  # image the operator never shipped. rollback = false makes that case stall
-  # visibly as a FAILED deployment instead. Bad-image risk is unchanged: the
-  # breaker still stops the retry loop, it just does not choose for us.
+  # It is OFF for services holding an exclusive EFS file. Their flock is
+  # LOCK_NB (fail fast), and a SIGKILLed predecessor leaves its NFSv4 lock lease
+  # alive on the EFS server for ~90s: every replacement launched in that window
+  # exits instantly, and at desired_count = 1 three of them hit the breaker's
+  # floor of 3 — condemning a perfectly good image. Neither breaker outcome is
+  # acceptable there: rollback = true runs an image nobody shipped, and
+  # rollback = false parks the platform's only signer at zero tasks with no
+  # automatic recovery. With the breaker off ECS just keeps retrying, the lease
+  # expires, and the image the operator shipped starts. A genuinely bad image
+  # retries visibly and the deploy job is what times out.
   deployment_circuit_breaker {
-    enable = true
-    # ponytail: the real cure is a bounded retry around the LOCK_NB acquisition
-    # in keysmith/keystore (and sentinel's audit store) so the container
-    # outlives the lease; restore rollback = true unconditionally once it lands.
+    # ponytail: the real cure is a blocking LOCK_EX under a ~120s deadline in
+    # keysmith/keystore and sentinel/audit; enable this unconditionally once it
+    # lands. rollback tracks enable — ECS ignores it while the breaker is off.
+    enable   = var.efs == null
     rollback = var.efs == null
   }
 

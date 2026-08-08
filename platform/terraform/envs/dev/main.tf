@@ -289,20 +289,13 @@ module "keysmith" {
   env = {
     KEYSMITH_ADDR       = ":8081"
     KEYSMITH_STORE_PATH = "/data/keys.json"
-
-    # The keystore already on the EFS access point is a version 1 document, and
-    # v1 leaves the key lifecycle metadata outside the AEAD, so keysmithd now
-    # refuses to load it without this opt-in. Without the variable the task exits
-    # before binding, and stop_before_start below means the healthy task is gone
-    # first: keysmith is the platform's only signer, so that is a total token and
-    # JWKS outage, not a rolling-deploy failure.
-    #
-    # REMOVE THIS IN THE NEXT DEPLOY. The first start rewrites /data/keys.json at
-    # v2 and every later start logs a warning while the variable is still set —
-    # it holds the downgrade window open, in which a retained pre-upgrade copy of
-    # the file can be replayed with forged lifecycle state.
-    KEYSMITH_KEYSTORE_MIGRATE_V1 = "1"
   }
+  # ONE-WAY DEPLOY: the first v2 keysmith to start rewrites /data/keys.json at
+  # document version 2, and a pre-v2 image refuses to open it ("understands
+  # 1..1"). Downgrading keysmith after that means restoring the keystore from an
+  # EFS recovery point, not `ecs update-service --task-definition <previous>`.
+  # Take one before the upgrade deploy; this service is the platform's only
+  # signer, so a keystore you cannot open is a total token and JWKS outage.
   secrets = {
     KEYSMITH_MASTER_KEY    = "${local.ssm}/keysmith/KEYSMITH_MASTER_KEY"
     KEYSMITH_SIGNER_TOKENS = "${local.ssm}/keysmith/KEYSMITH_SIGNER_TOKENS"

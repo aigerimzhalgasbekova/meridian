@@ -183,8 +183,8 @@ export function runStoreContract(makeStore: () => Store): void {
     // Every purpose is created here on purpose: postgres CHECKs the column, so
     // a purpose the schema's constraint predates fails at INSERT — and the API
     // tests all run on memory, where the constraint does not exist. Without
-    // this the undo_totp / undo_email escape hatches could be 500ing in
-    // production with the suite fully green.
+    // this the undo_totp escape hatch could be 500ing in production with the
+    // suite fully green.
     const store = makeStore();
     const user = await newUser(store);
     const now = new Date();
@@ -193,18 +193,15 @@ export function runStoreContract(makeStore: () => Store): void {
     await store.tokens.create({ userId: user.id, purpose: 'password_reset', tokenHash: 'r2', payload: null, expiresAt: exp });
     await store.tokens.create({ userId: user.id, purpose: 'verify_email', tokenHash: 'v1', payload: null, expiresAt: exp });
     await store.tokens.create({ userId: user.id, purpose: 'undo_totp', tokenHash: 'u1', payload: null, expiresAt: exp });
-    await store.tokens.create({ userId: user.id, purpose: 'undo_email', tokenHash: 'e1', payload: 'old@example.test', expiresAt: exp });
 
     await store.tokens.revokeAllForUser(user.id, 'password_reset');
     expect(await store.tokens.findActiveByHash('r1', 'password_reset', now)).toBeNull();
     expect(await store.tokens.findActiveByHash('r2', 'password_reset', now)).toBeNull();
     expect(await store.tokens.findActiveByHash('v1', 'verify_email', now)).not.toBeNull();
     expect(await store.tokens.findActiveByHash('u1', 'undo_totp', now)).not.toBeNull();
-    expect(await store.tokens.findActiveByHash('e1', 'undo_email', now)).toMatchObject({ payload: 'old@example.test' });
 
     await store.tokens.revokeAllForUser(user.id, 'undo_totp');
     expect(await store.tokens.findActiveByHash('u1', 'undo_totp', now)).toBeNull();
-    expect(await store.tokens.findActiveByHash('e1', 'undo_email', now)).not.toBeNull();
     await expect(store.tokens.revokeAllForUser(randomUUID(), 'password_reset')).resolves.toBeUndefined();
   });
 

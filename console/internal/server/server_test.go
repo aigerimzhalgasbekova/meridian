@@ -568,6 +568,20 @@ func TestTargetEnumerationWithRealmDeny(t *testing.T) {
 	if w := do(t, s, "olivia", "POST", "/v1/users/u-eng/disable", "", nil); w.Code != http.StatusOK {
 		t.Errorf("uncarved realm: got %d, want 200: %s", w.Code, w.Body)
 	}
+
+	// The response is not the whole oracle either: she holds audit:read at
+	// global, so she reads her own probe rows back. A per-branch Scope there
+	// ("global" for the miss, "realm:finance" for the cross-realm hit) tells
+	// her both that the id exists and which realm it is in.
+	var resp struct{ Events []AuditEvent }
+	if w := do(t, s, "olivia", "GET", "/v1/audit", "", &resp); w.Code != http.StatusOK {
+		t.Fatalf("carve-out holder reading her own trail: %d", w.Code)
+	}
+	for _, e := range resp.Events {
+		if !e.Allowed && e.Scope != rbac.Global.String() {
+			t.Errorf("denial event discloses the checked scope: %+v", e)
+		}
+	}
 }
 
 func TestAuditTrail(t *testing.T) {

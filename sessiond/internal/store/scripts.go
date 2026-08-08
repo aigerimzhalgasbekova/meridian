@@ -24,14 +24,19 @@ import "github.com/redis/go-redis/v9"
 // Returns the array of evicted session IDs (possibly empty), or the string
 // "LIMIT" when policy=reject and the user is at the cap.
 var createScript = redis.NewScript(`
--- Prune index members whose session keys have already expired, so the cap
--- counts live sessions only.
+local now = tonumber(ARGV[1])
+-- Prune index members that are no longer live sessions, using the same test
+-- touchScript and List apply — a past-deadline key with a TTL still running
+-- (clock skew, restored snapshot) is dead. Counting it would hold a cap slot
+-- that List refuses to show and revoke-by-id cannot be aimed at.
 local members = redis.call('ZRANGE', KEYS[1], 0, -1)
 local live = {}
 for _, m in ipairs(members) do
-  if redis.call('EXISTS', 'sess:' .. m) == 1 then
+  local dl = tonumber(redis.call('HGET', 'sess:' .. m, 'deadline_ms'))
+  if dl and now < dl then
     live[#live + 1] = m
   else
+    redis.call('DEL', 'sess:' .. m)
     redis.call('ZREM', KEYS[1], m)
   end
 end
@@ -51,7 +56,6 @@ if #live >= max then
   end
 end
 
-local now = tonumber(ARGV[1])
 local deadline = tonumber(ARGV[3])
 local key = 'sess:' .. ARGV[6]
 redis.call('HSET', key,
@@ -82,15 +86,23 @@ return evicted
 //	ARGV    = now_ms, idle_ttl_ms, id
 //
 // Returns the full session hash (flat field/value array) on success, or an
-// empty array if the session is missing or past its absolute deadline. The
-// deadline re-check matters: the key TTL is clamped at write time, but only
-// this check protects against a node whose clock ran ahead when it last
-// touched, or a Redis restore with stale TTLs.
+// empty array if the session is missing, past its absolute deadline, or
+// corrupt. The deadline re-check matters: the key TTL is clamped at write
+// time, but only this check protects against a node whose clock ran ahead when
+// it last touched, or a Redis restore with stale TTLs.
 var touchScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
 local now = tonumber(ARGV[1])
 local deadline = tonumber(redis.call('HGET', KEYS[1], 'deadline_ms'))
-if now >= deadline then
+local realm = redis.call('HGET', KEYS[1], 'realm')
+local uid = redis.call('HGET', KEYS[1], 'uid')
+local created = redis.call('HGET', KEYS[1], 'created_ms')
+-- One liveness test for every way a record stops being a session: past its
+-- deadline, or missing/unparsable a defining field (partial restore, operator
+-- surgery — a missing field arrives as false). Fail closed and delete: a record
+-- no sibling script can revoke, rotate or count must never authenticate. Same
+-- policy in create/rotate/revoke/List; there is no tolerant path.
+if not deadline or not realm or not uid or not tonumber(created) or now >= deadline then
   redis.call('DEL', KEYS[1])
   return {}
 end
@@ -109,16 +121,10 @@ redis.call('PEXPIRE', KEYS[1], ttl)
 -- it is a no-op on a missing key. Score is created_ms so eviction order stays
 -- by session age. ponytail: ~3 extra ops per cache miss, i.e. one per CacheTTL
 -- per token; move to a background reaper if that ever shows up in a profile.
--- A missing hash field arrives as false, and concatenating it raises: guard
--- like revokeScript does, so a partial record (restore, operator surgery) stays
--- validatable instead of erroring on every touch forever.
-local f = redis.call('HMGET', KEYS[1], 'realm', 'uid', 'created_ms')
-if f[1] and f[2] and f[3] then
-  local userkey = 'usersess:' .. f[1] .. ':' .. f[2] .. ':sessions'
-  redis.call('ZADD', userkey, 'NX', tonumber(f[3]), ARGV[3])
-  local want = deadline - now
-  if redis.call('PTTL', userkey) < want then redis.call('PEXPIRE', userkey, want) end
-end
+local userkey = 'usersess:' .. realm .. ':' .. uid .. ':sessions'
+redis.call('ZADD', userkey, 'NX', tonumber(created), ARGV[3])
+local want = deadline - now
+if redis.call('PTTL', userkey) < want then redis.call('PEXPIRE', userkey, want) end
 return redis.call('HGETALL', KEYS[1])
 `)
 
@@ -131,7 +137,7 @@ return redis.call('HGETALL', KEYS[1])
 //	ARGV    = now_ms, idle_ttl_ms, old_id, new_id, ip, ua
 //
 // Returns the new session hash (flat array), or an empty array if the old
-// session is missing or expired.
+// session is missing, expired or corrupt.
 var rotateScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
 local now = tonumber(ARGV[1])
@@ -139,10 +145,12 @@ local deadline = tonumber(redis.call('HGET', KEYS[1], 'deadline_ms'))
 local uid = redis.call('HGET', KEYS[1], 'uid')
 local realm = redis.call('HGET', KEYS[1], 'realm')
 local created = redis.call('HGET', KEYS[1], 'created_ms')
-local userkey = 'usersess:' .. realm .. ':' .. uid .. ':sessions'
 redis.call('DEL', KEYS[1])
+-- Same liveness test as touchScript. The old ID dies either way; a dead or
+-- corrupt record just must not be reborn under a fresh one.
+if not deadline or not realm or not uid or not tonumber(created) or now >= deadline then return {} end
+local userkey = 'usersess:' .. realm .. ':' .. uid .. ':sessions'
 redis.call('ZREM', userkey, ARGV[3])
-if now >= deadline then return {} end
 
 redis.call('HSET', KEYS[2],
   'uid', uid, 'realm', realm, 'ip', ARGV[5], 'ua', ARGV[6],
@@ -167,13 +175,17 @@ return redis.call('HGETALL', KEYS[2])
 //
 //	KEYS[1] = session hash
 //	ARGV    = id
+// Deleting first is deliberate: revocation is the last resort and must never be
+// blocked by a record too damaged to name its own index. DEL returns 0 on a
+// missing key, which is exactly the idempotent contract callers rely on.
 var revokeScript = redis.NewScript(`
 local uid = redis.call('HGET', KEYS[1], 'uid')
-if not uid then return 0 end
 local realm = redis.call('HGET', KEYS[1], 'realm')
-redis.call('DEL', KEYS[1])
-redis.call('ZREM', 'usersess:' .. realm .. ':' .. uid .. ':sessions', ARGV[1])
-return 1
+local n = redis.call('DEL', KEYS[1])
+if uid and realm then
+  redis.call('ZREM', 'usersess:' .. realm .. ':' .. uid .. ':sessions', ARGV[1])
+end
+return n
 `)
 
 // revokeUserScript deletes every session of a user atomically (global

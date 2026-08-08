@@ -30,7 +30,7 @@ with signer services (idp), verifiers (every other service), and operators.
 | 1 | Forged token via `alg:none` / HS256 confusion / embedded `jwk` | Structurally impossible in the JOSE profile (ADR 0001); regression-tested per CVE class |
 | 2 | Stolen keystore file | AES-256-GCM envelope; useless without KEK |
 | 3 | Keystore record shuffling by attacker with file write | AAD mismatch → fails closed (tested) |
-| 3b | Lifecycle rewrite by attacker with file write (retired key flipped back to `active`, `created_at` backdated past the dwell) | AAD covers state, all four timestamps and the document generation (v2). A v1 document — whose lifecycle fields are unauthenticated — is refused unless the operator sets `KEYSMITH_KEYSTORE_MIGRATE_V1=1` for one start, so a retained pre-upgrade file is not a standing forgery primitive. The generation stops an authentic record kept from while the key was active being spliced over its retired successor (tested) |
+| 3b | Lifecycle rewrite by attacker with file write (retired key flipped back to `active`, `created_at` backdated past the dwell) | AAD covers state, all four timestamps and the document generation (v2). A v1 document — whose lifecycle fields are unauthenticated — is accepted on read and rewritten at v2 on that same start, so the deployed file self-upgrades with no operator step; a *retained* pre-upgrade copy stays replayable with forged lifecycle state until the document version is anchored outside the keystore (residual risk below). The generation stops an authentic record kept from while the key was active being spliced over its retired successor (tested) |
 | 4 | Signer-token holder mints long-lived tokens | `MaxTokenTTL` cap server-side; `exp`/`iat` are server-set, client-supplied values rejected |
 | 5 | Token survives its key's retirement | `MaxTokenTTL ≤ RetireAfter` enforced at construction |
 | 6 | Verifier cache poisoning window during rotation | `JWKSMaxAge ≤ PendingDwell/2` enforced; pending keys published before signing |
@@ -46,18 +46,27 @@ with signer services (idp), verifiers (every other service), and operators.
 - **LocalKEK master key lives in process memory and env/secret configuration.**
   Accepted for dev/single-node. Production: KMS-backed KEK (interface seam
   exists); memory-scraping adversaries are out of scope.
-- **Whole-file rollback of the keystore.** The generation counter that binds a
-  record to a particular write lives *in* the document, so restoring an entire
-  older file (record set plus its generation) is internally consistent and
-  opens. Detecting it needs an anchor outside the keystore: the current
-  generation in an SSM parameter, or the KMS encryption context once the KMS
-  KEK lands, and a refusal to open below the anchored value. **Deployment
-  requirement:** upgrading an existing version 1 keystore takes one start with
-  `KEYSMITH_KEYSTORE_MIGRATE_V1=1` in the task environment — the dev env sets it
-  (`platform/terraform/envs/dev/main.tf`, keysmith `env`) for the deploy that
-  ships v2. Remove it in the next deploy or the downgrade path stays open;
-  keysmithd logs a warning on every start while it is set on an already-v2
-  store, since refusing to start would trade the window for a signing outage.
+- **Whole-file rollback of the keystore, including downgrade to version 1.** The
+  generation counter that binds a record to a particular write lives *in* the
+  document, so restoring an entire older file (record set plus its generation) is
+  internally consistent and opens. A version 1 document is the stronger form of
+  the same attack: its lifecycle fields sit outside the AEAD, so a retained
+  pre-upgrade copy can be replayed with `state` and the timestamps rewritten, and
+  the upgrade-on-open would then re-seal the forged lifecycle as a valid v2
+  record. Both need the same fix — an anchor outside the keystore (current
+  generation and minimum document version in an SSM parameter, or the KMS
+  encryption context once the KMS KEK lands) and a refusal to open below it.
+  Gating v1 acceptance on an operator-set variable was tried and removed: it did
+  not close the window (nothing forces the variable back off) and it gave the
+  upgrade deploy a way to brick the platform's only signer.
+- **The v1 → v2 keystore upgrade is one-way.** keysmithd rewrites the store at
+  v2 on the first start that reads a v1 document, and builds from before v2
+  decode every record under the v1 AAD — so rolling the service's image tag back
+  yields a signer that cannot open its own keystore. The EFS filesystem holding
+  the store has no backup plan, so the only rollback is a copy of the keystore
+  file taken off the access point *before* the upgrading task starts. Without
+  one, recovery means deleting the file: every issued token and every cached
+  JWKS entry is invalidated.
 - **Single-writer file store.** No coordination for multi-node keysmith. The
   store now refuses to open if another process holds the lock, so the failure
   is loud instead of silent key loss — but it is a *startup* failure, and

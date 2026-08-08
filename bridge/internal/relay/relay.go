@@ -42,6 +42,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -116,6 +117,12 @@ type Manager struct {
 	mu        sync.Mutex
 	flows     map[string]Flow
 	lastSweep time.Time
+	// evicted counts flows destroyed by saturation since the last sweep tick.
+	// An evicted flow's callback later fails as ErrStateUsed and is logged as a
+	// possible replay, so without this counter a full table is indistinguishable
+	// from an attack. Drained (and logged) on the sweep, which is already
+	// throttled — that is what keeps a saturated table from logging per request.
+	evicted uint64
 }
 
 // NewManager builds a Manager. hmacKey must be at least 32 bytes of secret
@@ -165,6 +172,13 @@ func (m *Manager) Begin(provider string, mode Mode, appID, sessionID string) (Fl
 	// the cost is not paid per request.
 	if now := m.now(); now.Sub(m.lastSweep) >= sweepInterval {
 		m.lastSweep = now
+		if m.evicted > 0 {
+			// ponytail: slog.Default(), not a Manager field — same sink the
+			// server logs to, and nothing to wire through NewManager.
+			slog.Warn("flow table saturated, evicting live flows (their callbacks will log as possible replay)",
+				"evicted", m.evicted, "cap", maxFlows)
+			m.evicted = 0
+		}
 		for id, old := range m.flows {
 			if now.After(old.Expires) {
 				delete(m.flows, id)
@@ -173,6 +187,7 @@ func (m *Manager) Begin(provider string, mode Mode, appID, sessionID string) (Fl
 	}
 	if len(m.flows) >= maxFlows {
 		// Make room in O(1) instead of shedding the new flow — see maxFlows.
+		m.evicted++
 		for id := range m.flows {
 			delete(m.flows, id)
 			break

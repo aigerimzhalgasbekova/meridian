@@ -347,14 +347,11 @@ func (s *Store) List(ctx context.Context, realm, userID string) ([]Session, erro
 			continue
 		}
 		sess, err := parseSessionMap(id, m)
-		if err != nil {
-			return nil, err
-		}
-		if !sess.AbsDeadline.After(now) {
-			// Past its absolute cap despite a live TTL (clock skew, restored
-			// snapshot). touchScript refuses this session, so List — the
+		if err != nil || !sess.AbsDeadline.After(now) {
+			// Corrupt, or past its absolute cap despite a live TTL (clock skew,
+			// restored snapshot). touchScript refuses both, so List — the
 			// surface an operator reads before deciding what to revoke — must
-			// not report it as live either. Reporting only: List is a read, and
+			// not report either as live. Reporting only: List is a read, and
 			// `now` is this node's unvalidated clock. A node running fast would
 			// otherwise destroy sessions that are still perfectly valid
 			// everywhere else, fleet-wide, on a page refresh — and without the

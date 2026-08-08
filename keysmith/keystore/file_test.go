@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -428,12 +427,9 @@ func TestFileStoreRecordReplayRejected(t *testing.T) {
 }
 
 // TestFileStoreV1LoadsAndUpgrades pins the migration: an existing v1 keystore
-// must still open (bricking a live deployment is worse than the hole) and must
-// be rewritten at v2 so the old, forgeable form does not survive a restart —
-// but only as a deliberate operator action. A v1 document accepted by default
-// would be a permanent lifecycle-forgery primitive: its state and timestamps
-// are unauthenticated, and the upgrade would launder the forged lifecycle into
-// a valid v2 record.
+// must open with no env var and no operator step (bricking the platform's only
+// signer on deploy is worse than the residual hole), and must be rewritten at v2
+// so the old, forgeable form does not survive the start that read it.
 func TestFileStoreV1LoadsAndUpgrades(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "keys.json")
@@ -463,17 +459,9 @@ func TestFileStoreV1LoadsAndUpgrades(t *testing.T) {
 		KEKID: kek.ID(), WrappedDEK: wrapped, PrivateCT: ct, PublicJWK: pubJWK,
 	}}})
 
-	// Without the opt-in the downgrade path is closed, so a retained copy of a
-	// pre-upgrade file is not a standing forgery primitive.
-	if s, err := OpenFileStore(ctx, path, kek); err == nil {
-		s.Close()
-		t.Fatalf("v1 document accepted without %s", migrateEnvVar)
-	}
-
-	t.Setenv(migrateEnvVar, "1")
 	s, err := OpenFileStore(ctx, path, kek)
 	if err != nil {
-		t.Fatalf("v1 keystore no longer opens under the migration opt-in — this bricks live deployments: %v", err)
+		t.Fatalf("v1 keystore does not open — this bricks live deployments: %v", err)
 	}
 	got, err := s.Get(ctx, k.ID)
 	if err != nil {
@@ -496,49 +484,6 @@ func TestFileStoreV1LoadsAndUpgrades(t *testing.T) {
 	if s2, err := OpenFileStore(ctx, path, kek); err == nil {
 		s2.Close()
 		t.Fatal("state edit accepted after the v2 upgrade")
-	}
-}
-
-// TestOpenFileStoreWarnsWhenMigrationOptInLeftSet: the migration opt-in has to
-// be set in the serving task's environment for the deploy that upgrades the
-// deployed v1 keystore, and dropped in the next one. Nothing forces the second
-// deploy, and refusing to start would swap the downgrade window for an outage of
-// the platform's only signer — so a store that is already at the current version
-// must at least say so on every start.
-func TestOpenFileStoreWarnsWhenMigrationOptInLeftSet(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "keys.json")
-	kek := testKEK(t)
-	s, err := OpenFileStore(ctx, path, kek)
-	if err != nil {
-		t.Fatal(err)
-	}
-	k, err := newKey(jose.AlgEdDSA, 2048, time.Now().UTC())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Put(ctx, k); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	var logged bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
-	t.Setenv(migrateEnvVar, "1")
-	s2, err := OpenFileStore(ctx, path, kek)
-	if err != nil {
-		t.Fatalf("a current-version store must still open with the opt-in set: %v", err)
-	}
-	if err := s2.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(logged.Bytes(), []byte(migrateEnvVar)) {
-		t.Fatalf("%s left set on an already-v%d store logged nothing: %q", migrateEnvVar, fileVersion, logged.String())
 	}
 }
 

@@ -12,10 +12,13 @@ CLUSTER=meridian-dev
 # otherwise page through every pause with nothing pointing at the omission.
 # A command substitution inside a here-string throws its exit status away, so
 # capture first: an expired token or a missing cloudwatch:DescribeAlarms grant
-# must not be reported as "no alarms exist".
+# must not be reported as "no alarms exist". Capture stdout ONLY — a CLI that
+# prints an urllib3 warning on the success path would otherwise become the
+# alarm list, and disable-alarm-actions silences nothing on names that do not
+# exist. aws's own stderr goes straight to the operator's terminal.
 if ! found=$(aws cloudwatch describe-alarms --alarm-name-prefix "$CLUSTER-" \
-  --query 'MetricAlarms[?ends_with(AlarmName, `-no-healthy-hosts`)].AlarmName' --output text 2>&1); then
-  echo "describe-alarms failed (credentials? IAM?): $found" >&2
+  --query 'MetricAlarms[?ends_with(AlarmName, `-no-healthy-hosts`)].AlarmName' --output text); then
+  echo "describe-alarms failed (credentials? IAM? see the error above)" >&2
   exit 1
 fi
 read -r -a DOWN_ALARMS <<<"$found"

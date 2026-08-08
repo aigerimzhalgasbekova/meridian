@@ -17,9 +17,11 @@ Two-level envelope scheme:
    the document generation the record was written in — so transplanting a
    record between key slots, editing the plaintext metadata, and replaying an
    authentic record from an earlier write all fail closed. Document version 1
-   bound only `id + algorithm`, leaving the lifecycle forgeable; it is refused
-   unless `KEYSMITH_KEYSTORE_MIGRATE_V1=1` is set for one start, which loads it
-   and rewrites the document at v2.
+   bound only `id + algorithm`, leaving the lifecycle forgeable; a v1 document
+   is still accepted on read (verified under the v1 AAD) and rewritten at v2 on
+   the start that reads it. Back-compat on read, upgrade on write: no opt-in
+   variable, no operator step, no way to brick the platform's only signer on
+   deploy. The residual downgrade path is in the threat model.
 2. Only the DEK is wrapped by a **KEK** behind a two-method interface
    (`Wrap`/`Unwrap`). Implementations: `LocalKEK` (32-byte master key from
    configuration) now; AWS KMS in the platform deployment (the interface is

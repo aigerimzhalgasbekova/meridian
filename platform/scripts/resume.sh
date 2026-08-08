@@ -24,11 +24,12 @@ aws ecs wait services-stable --cluster "$CLUSTER" --services "${SERVICES[@]}" ||
 
 # Discovery happens HERE, not at the top: bringing a paused stack back must
 # never be blocked by a CloudWatch read. Same discovery as pause.sh — the set
-# follows terraform, not this script — and the same status capture, so an
-# expired token is not reported as "no alarms exist".
+# follows terraform, not this script — and the same stdout-only capture, so an
+# expired token is not reported as "no alarms exist" and a warning on aws's
+# stderr never becomes an alarm name.
 if ! found=$(aws cloudwatch describe-alarms --alarm-name-prefix "$CLUSTER-" \
-  --query 'MetricAlarms[?ends_with(AlarmName, `-no-healthy-hosts`)].AlarmName' --output text 2>&1); then
-  echo "stack is UP but describe-alarms failed (credentials? IAM?): $found" >&2
+  --query 'MetricAlarms[?ends_with(AlarmName, `-no-healthy-hosts`)].AlarmName' --output text); then
+  echo "stack is UP but describe-alarms failed (credentials? IAM? see the error above)" >&2
   echo "down alarms are still silenced — re-run resume.sh once the API works." >&2
   exit 1
 fi

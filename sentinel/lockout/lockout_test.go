@@ -420,3 +420,29 @@ func TestSweepKeepsStillLockedEntries(t *testing.T) {
 		t.Error("still-locked account stopped being locked after a sweep")
 	}
 }
+
+// Pins the one attacker-forced path that clears a below-threshold account
+// counter, which Policy.Threshold's doc now names: MaxKeys pressure. A paced
+// guesser sitting one failure under the threshold gets their victim's count
+// wiped by an unrelated username flood, so the next guess does not lock.
+// This is the accepted trade (a locked entry is never evicted — see
+// TestEvictionNeverDropsALockedEntry); it is documented, not fixed here.
+func TestReclaimClearsBelowThresholdAccountCounter(t *testing.T) {
+	c := newClock()
+	policy := testPolicy
+	policy.MaxKeys = 64
+	policy.IPThreshold = 1000 // isolate the account dimension
+	tr := New(policy, c.now)
+
+	failN(tr, "victim", "10.0.0.1", policy.Threshold-1)
+
+	for i := 0; i < 20*policy.MaxKeys; i++ {
+		tr.Fail(fmt.Sprintf("flood-%d", i), "10.0.0.3")
+	}
+
+	tr.Fail("victim", "10.0.0.1")
+	if d := tr.Check("victim", "10.0.0.1"); d.Locked {
+		t.Fatal("victim locked: the flood no longer clears the account counter — " +
+			"Policy.Threshold's doc claims it does, update the doc")
+	}
+}

@@ -428,26 +428,111 @@ func TestCacheExpiryMeasuredFromReadTime(t *testing.T) {
 	}
 }
 
-// TestValidateTolerantOfPartialRecord: a session hash missing realm/uid (a
-// partial restore, an operator's HDEL) must still validate — the index upkeep
-// touchScript does is best-effort, not a precondition. Concatenating a missing
-// field in Lua raises, which would turn such a record into a permanent 500.
-func TestValidateTolerantOfPartialRecord(t *testing.T) {
+// damaged enumerates the ways a session hash stops being a session: a partial
+// restore, an operator's HDEL, a half-written record. One policy covers all of
+// them — corrupt is dead — and these tables pin it on every surface.
+var damaged = []struct {
+	name   string
+	damage func(mr *miniredis.Miniredis, key string)
+}{
+	{"missing realm and uid", func(mr *miniredis.Miniredis, k string) {
+		mr.HDel(k, "realm")
+		mr.HDel(k, "uid")
+	}},
+	{"missing realm only", func(mr *miniredis.Miniredis, k string) { mr.HDel(k, "realm") }},
+	{"non-numeric created_ms", func(mr *miniredis.Miniredis, k string) { mr.HSet(k, "created_ms", "n/a") }},
+	{"missing deadline_ms", func(mr *miniredis.Miniredis, k string) { mr.HDel(k, "deadline_ms") }},
+}
+
+// TestValidateFailsClosedOnPartialRecord: a corrupt record must not
+// authenticate. It used to abort the touch script (permanent 500), then a
+// tolerance guard made it validate — which was worse: nothing downstream could
+// revoke, rotate or count it. Now it is simply not a session.
+func TestValidateFailsClosedOnPartialRecord(t *testing.T) {
+	for _, tc := range damaged {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := miniredis.RunT(t)
+			s := testStore(t, mr, newFakeClock(), Config{CacheTTL: time.Millisecond})
+			tok, sess := mustCreate(t, s, "acme", "alice")
+			tc.damage(mr, "sess:"+sess.ID)
+
+			if _, err := s.Validate(context.Background(), tok); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Validate on a corrupt record: got %v, want ErrNotFound", err)
+			}
+			if mr.Exists("sess:" + sess.ID) {
+				t.Error("corrupt record left behind; it can never be validated again")
+			}
+		})
+	}
+}
+
+// TestRevokeWorksOnPartialRecord: revocation is the last resort, so it must
+// never be blocked by a record too damaged to name its own index. Missing uid
+// used to make revoke a silent no-op (logout that does not log out, emergency
+// kill-by-id that kills nothing); missing realm used to make it a hard 500.
+func TestRevokeWorksOnPartialRecord(t *testing.T) {
+	for _, tc := range damaged {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := miniredis.RunT(t)
+			s := testStore(t, mr, newFakeClock(), Config{CacheTTL: time.Millisecond})
+			tok, sess := mustCreate(t, s, "acme", "alice")
+			tc.damage(mr, "sess:"+sess.ID)
+
+			if err := s.RevokeToken(context.Background(), tok); err != nil {
+				t.Fatalf("RevokeToken on a corrupt record: %v", err)
+			}
+			if mr.Exists("sess:" + sess.ID) {
+				t.Error("session key survived revocation")
+			}
+		})
+	}
+}
+
+// TestRotateFailsClosedOnPartialRecord: rotation must not resurrect a corrupt
+// record under a fresh ID, and must not 500 concatenating a missing field.
+func TestRotateFailsClosedOnPartialRecord(t *testing.T) {
+	for _, tc := range damaged {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := miniredis.RunT(t)
+			s := testStore(t, mr, newFakeClock(), Config{CacheTTL: time.Millisecond})
+			tok, sess := mustCreate(t, s, "acme", "alice")
+			tc.damage(mr, "sess:"+sess.ID)
+
+			if _, _, err := s.Rotate(context.Background(), tok, "", ""); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Rotate on a corrupt record: got %v, want ErrNotFound", err)
+			}
+			if mr.Exists("sess:" + sess.ID) {
+				t.Error("corrupt record survived the rotation that refused it")
+			}
+		})
+	}
+}
+
+// TestPastDeadlineSessionDoesNotHoldCapSlot: List hides a past-deadline session
+// (live TTL, clock skew or restored snapshot) but does not delete it, so the
+// cap must not count it either — otherwise the user is locked out by a session
+// no operator can see in the listing or aim revoke-by-id at.
+func TestPastDeadlineSessionDoesNotHoldCapSlot(t *testing.T) {
 	mr := miniredis.RunT(t)
 	clk := newFakeClock()
-	s := testStore(t, mr, clk, Config{CacheTTL: time.Millisecond})
+	s := testStore(t, mr, clk, Config{
+		IdleTTL: time.Hour, AbsoluteTTL: 30 * time.Minute,
+		MaxPerUser: 1, Policy: Reject, CacheTTL: time.Millisecond,
+	})
 	ctx := context.Background()
 
-	tok, sess := mustCreate(t, s, "acme", "alice")
-	mr.HDel("sess:"+sess.ID, "realm")
-	mr.HDel("sess:"+sess.ID, "uid")
+	mustCreate(t, s, "acme", "alice")
+	clk.advance(31 * time.Minute) // clock moves past the deadline, TTLs do not
 
-	got, err := s.Validate(ctx, tok)
+	sessions, err := s.List(ctx, "acme", "alice")
 	if err != nil {
-		t.Fatalf("Validate on a partial record: %v", err)
+		t.Fatal(err)
 	}
-	if got.ID != sess.ID {
-		t.Errorf("session id = %q, want %q", got.ID, sess.ID)
+	if len(sessions) != 0 {
+		t.Fatalf("precondition: List shows %d sessions, want 0", len(sessions))
+	}
+	if _, _, err := s.Create(ctx, "acme", "alice", "", ""); err != nil {
+		t.Errorf("create blocked by an invisible past-deadline session: %v", err)
 	}
 }
 

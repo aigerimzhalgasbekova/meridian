@@ -58,10 +58,10 @@ run "efs_mount_with_stop_before_start_drains_first" {
 
 # A SIGKILLed EFS task leaves its NFSv4 lock lease held for ~90s. Replacements
 # exit instantly on the LOCK_NB while it drains, and at desired_count = 1 three
-# of those trip the breaker's floor — with rollback = true ECS would quietly
-# revert to the previous task definition and the stack would look healthy on an
-# image nobody shipped. EFS services must stall visibly instead.
-run "efs_mount_does_not_auto_rollback" {
+# of those trip the breaker's floor on a perfectly good image. Rolling back then
+# runs an image nobody shipped; not rolling back leaves the only signer at zero
+# tasks. The breaker must be off here so ECS retries until the lease expires.
+run "efs_mount_has_no_circuit_breaker" {
   command = plan
 
   variables {
@@ -69,9 +69,9 @@ run "efs_mount_does_not_auto_rollback" {
   }
 
   assert {
-    condition = (aws_ecs_service.this.deployment_circuit_breaker[0].enable &&
+    condition = (!aws_ecs_service.this.deployment_circuit_breaker[0].enable &&
     !aws_ecs_service.this.deployment_circuit_breaker[0].rollback)
-    error_message = "A service holding an EFS flock must stop a failed deploy, not roll it back."
+    error_message = "A service holding an EFS flock must retry the shipped image, never stall at zero tasks or auto-revert."
   }
 }
 
