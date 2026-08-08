@@ -200,6 +200,7 @@ return redis.call('HGETALL', KEYS[2])
 //
 //	KEYS[1] = session hash
 //	ARGV    = id
+//
 // Deleting first is deliberate: revocation is the last resort and must never be
 // blocked by a record too damaged to name its own index. DEL returns 0 on a
 // missing key, which is exactly the idempotent contract callers rely on.

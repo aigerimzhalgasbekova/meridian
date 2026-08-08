@@ -752,11 +752,12 @@ describe('mailed links keep the token out of the request line', () => {
     for (const m of mails) expect(m.text).not.toContain('?token=');
   });
 
-  it('the web reader prefers the fragment and still resolves links already in inboxes', () => {
+  it('the web reader reads the fragment and refuses a token in the query string', () => {
     const base = 'https://portal.example.com';
     expect(linkToken(`${base}/reset#token=fragment-form`)).toBe('fragment-form');
-    // Back-compat: mailed before the switch, still sitting in an inbox.
-    expect(linkToken(`${base}/reset?token=query-form`)).toBe('query-form');
+    // No back-compat: a ?token= reaches the ALB access log, so honouring one
+    // would keep the exposure alive and hand a replayed token a live reader.
+    expect(linkToken(`${base}/reset?token=query-form`)).toBe('');
     expect(linkToken(`${base}/reset`)).toBe('');
   });
 

@@ -17,9 +17,9 @@ type Store struct {
 	mu sync.Mutex
 
 	realms   map[string]storage.Realm
-	clients  map[string]storage.Client // key: realm/clientID
-	users    map[string]storage.User   // key: realm/id
-	byUser   map[string]string         // key: realm/username(lower) → realm/id
+	clients  map[string]storage.Client       // key: realm/clientID
+	users    map[string]storage.User         // key: realm/id
+	byUser   map[string]string               // key: realm/username(lower) → realm/id
 	codes    map[string]storage.AuthCode     // key: realm/codeHash
 	refresh  map[string]storage.RefreshToken // key: realm/hash
 	consents map[string]storage.Consent      // key: realm/user/client

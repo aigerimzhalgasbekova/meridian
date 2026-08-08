@@ -34,9 +34,7 @@ AWS-0053
 # S3 buckets (ALB access logs, site) use SSE-S3 (AES256) rather than a customer
 # managed key. Access-log records carry request lines, so "non-sensitive" has to
 # be earned rather than asserted: portal's one-time tokens are mailed in the URL
-# fragment and never reach a request line — bar links mailed before the switch,
-# which carry ?token= until the 24h verify-email TTL lapses — and bridge's
-# ?code= is spent inside the request that carries it. What lands here is IPs,
-# paths and user agents.
+# fragment and never reach a request line, and bridge's ?code= is spent inside
+# the request that carries it. What lands here is IPs, paths and user agents.
 # CMK adds key-management cost and is deferred to prod hardening.
 AWS-0132

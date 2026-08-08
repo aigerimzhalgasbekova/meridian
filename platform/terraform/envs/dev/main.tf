@@ -95,12 +95,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
     filter {}
     expiration {
       # Access-log records carry the full request line. Portal's one-time
-      # tokens no longer appear there — they are mailed in the URL fragment,
-      # which browsers never transmit (portal/server/src/app.ts) — except for
-      # links mailed before the switch, which carry ?token= until the 24h
-      # verify-email TTL lapses (portal/web/src/token.ts, dated for deletion).
-      # What is left is bridge's ?code=, already spent by the time the request
-      # completes.
+      # tokens never appear there: they are mailed in the URL fragment, which
+      # browsers do not transmit (portal/server/src/app.ts), and the reader
+      # accepts nothing else (portal/web/src/token.ts). What is left is
+      # bridge's ?code=, already spent by the time the request completes.
       # Two weeks is enough for forensics on a dev stack and bounds the window.
       days = 14
     }
