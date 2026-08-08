@@ -2,8 +2,10 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -120,6 +122,51 @@ func TestVerifyIDToken(t *testing.T) {
 		token, _ := authenticate(t, s, p)
 		if _, err := p.VerifyIDToken(ctx, token, "the-real-nonce"); !errors.Is(err, ErrNonceMismatch) {
 			t.Fatalf("got %v, want ErrNonceMismatch", err)
+		}
+	})
+
+	// (provider, subject) is the entire identity model. An upstream that omits
+	// sub would otherwise collapse every one of its users onto whichever
+	// identity first got JIT-provisioned under the empty subject.
+	t.Run("token without a sub rejected", func(t *testing.T) {
+		p := newProvider(t, s)
+		s.SetUser(fakeidp.User{Subject: "", Email: "one@example.com", Name: "User One"})
+		defer s.SetUser(alice)
+		token, nonce := authenticate(t, s, p)
+		if _, err := p.VerifyIDToken(ctx, token, nonce); !errors.Is(err, ErrMissingSubject) {
+			t.Fatalf("got %v, want ErrMissingSubject", err)
+		}
+	})
+
+	// OIDC Core §3.1.3.7 rules 4-5. jose.Expect{Audience} is membership only,
+	// so a token that merely lists us among several audiences passes it.
+	t.Run("azp rules", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			azp      string
+			extraAud []string
+			wantErr  bool
+		}{
+			{name: "single aud, no azp"},
+			{name: "azp names us", azp: clientID},
+			{name: "azp names another client", azp: "other-client", wantErr: true},
+			{name: "multi aud without azp", extraAud: []string{"other-client"}, wantErr: true},
+			{name: "multi aud with our azp", azp: clientID, extraAud: []string{"other-client"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				p := newProvider(t, s)
+				if tc.azp != "" {
+					s.SetExtraClaims(map[string]any{"azp": tc.azp})
+					defer s.SetExtraClaims(nil)
+				}
+				s.SetExtraAudience(tc.extraAud...)
+				defer s.SetExtraAudience()
+				token, nonce := authenticate(t, s, p)
+				_, err := p.VerifyIDToken(ctx, token, nonce)
+				if tc.wantErr != errors.Is(err, ErrAzpMismatch) {
+					t.Fatalf("got %v, wantErr=%v", err, tc.wantErr)
+				}
+			})
 		}
 	})
 
@@ -344,5 +391,42 @@ func TestPresets(t *testing.T) {
 	single := Entra("11111111-2222-3333-4444-555555555555", "cid", "sec")
 	if strings.Contains(single.Issuer, TenantPlaceholder) {
 		t.Fatalf("single-tenant entra must pin the issuer: %+v", single)
+	}
+}
+
+// A token endpoint behind a degraded proxy answers with an HTML error page,
+// not JSON. That body ends up in an error the server logs once per failed
+// callback, so it must not carry the full 1 MiB read limit into the log store.
+func TestExchangeErrorTruncatesUpstreamBody(t *testing.T) {
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(Metadata{
+			Issuer:                srv.URL,
+			AuthorizationEndpoint: srv.URL + "/authorize",
+			TokenEndpoint:         srv.URL + "/token",
+			JWKSURI:               srv.URL + "/jwks",
+		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte("<html><body>" + strings.Repeat("A", 1<<20) + "</body></html>"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	p, err := New(Config{Name: "fake", Issuer: srv.URL, ClientID: clientID, ClientSecret: clientSecret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Exchange(context.Background(), "code", strings.Repeat("v", 43), redirectURI)
+	if err == nil {
+		t.Fatal("a 502 from the token endpoint must be an error")
+	}
+	if len(err.Error()) > 1024 {
+		t.Fatalf("upstream body leaked into the error: %d bytes", len(err.Error()))
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Fatalf("error lost the diagnostic status: %q", err.Error())
 	}
 }

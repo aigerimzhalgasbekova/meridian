@@ -120,7 +120,7 @@ func (s *Server) handleDeviceSubmit(w http.ResponseWriter, r *http.Request) {
 		s.writePageError(w, http.StatusBadRequest, "Invalid request", "Malformed form submission.")
 		return
 	}
-	_, user, err := s.currentSession(r, realm)
+	sess, user, err := s.currentSession(r, realm)
 	if err != nil {
 		s.renderDeviceLogin(w, r, realm)
 		return
@@ -138,13 +138,24 @@ func (s *Server) handleDeviceSubmit(w http.ResponseWriter, r *http.Request) {
 			"Error":  msg,
 		})
 	}
+	// RFC 8628 §5.1: user codes are short by design, so guessing them must be
+	// rate-limited. Reuse the login guard, keyed on the signed-in user with a
+	// "device:" prefix so the bucket never collides with that user's login
+	// failures (the per-IP window is shared with login by design).
+	guardKey, ip := "device:"+user.ID, remoteIP(r, s.cfg.TrustProxyHeaders)
+	if !s.cfg.Guard.Allow(ctx, realm.Name, guardKey, ip) {
+		renderErr("Too many attempts. Try again later.")
+		return
+	}
 	dc, err := s.cfg.Store.DeviceCodes().GetByUserCode(ctx, realm.Name,
 		secrets.NormalizeUserCode(r.PostFormValue("user_code")))
 	if err != nil {
+		s.cfg.Guard.RecordFailure(ctx, realm.Name, guardKey, ip)
 		renderErr("Unknown code. Check the code shown on your device.")
 		return
 	}
 	if s.now().After(dc.ExpiresAt) {
+		s.cfg.Guard.RecordFailure(ctx, realm.Name, guardKey, ip)
 		renderErr("That code has expired. Start again on your device.")
 		return
 	}
@@ -173,7 +184,10 @@ func (s *Server) handleDeviceSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 		status = storage.DeviceStatusApproved
 	}
-	if err := s.cfg.Store.DeviceCodes().SetStatus(ctx, realm.Name, dc.DeviceCodeHash, status, user.ID); err != nil {
+	// Carry the browser session's authentication time to redemption: the ID
+	// token's auth_time must state when the user actually authenticated, which
+	// can be hours before the device polls.
+	if err := s.cfg.Store.DeviceCodes().SetStatus(ctx, realm.Name, dc.DeviceCodeHash, status, user.ID, sess.AuthenticatedAt); err != nil {
 		renderErr("That code was already used.")
 		return
 	}
@@ -245,8 +259,17 @@ func (s *Server) grantDeviceCode(r *http.Request, realm storage.Realm, client st
 	if err != nil || user.Disabled {
 		return nil, oauth.E(oauth.ErrInvalidGrant, "user unavailable")
 	}
-	resp, oerr := s.issueUserTokens(ctx, realm, client, user, dc.Scopes, now, "", "")
+	authTime := dc.AuthTime
+	if authTime.IsZero() {
+		// Approved before auth_time was recorded (pre-migration row): claim the
+		// poll time rather than the epoch — IDToken always emits the claim.
+		authTime = now
+	}
+	resp, oerr := s.signUserTokens(ctx, realm, client, user, dc.Scopes, authTime, "")
 	if oerr != nil {
+		return nil, oerr
+	}
+	if oerr := s.attachRefreshToken(ctx, realm, client, user, dc.Scopes, authTime, "", "", resp); oerr != nil {
 		return nil, oerr
 	}
 	if err := s.cfg.Store.DeviceCodes().Delete(ctx, realm.Name, hash); err != nil && !errors.Is(err, storage.ErrNotFound) {

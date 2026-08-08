@@ -39,6 +39,45 @@ status as the dead-letter parking lot.
   one atomic step), so retry/backoff/dead-letter and two-worker exclusivity are
   tested without a database; the same suite runs against real Postgres when
   `TEST_DATABASE_URL` is set.
+- A claim is owned and expires. `claimed_at` is set at claim time and is the
+  ownership token: `complete` and `fail` write a terminal state only `WHERE
+  status = 'running' AND claimed_at = <the stamp claim() returned>`. `status`
+  alone is not ownership — a reaped job is `running` again, so a straggler's
+  late `fail()` would requeue a job a peer is mid-way through and its late
+  `complete()` would swallow the peer's real failure. A `running` job becomes
+  claimable again once its claim is `STALE_CLAIM_MS` (5 min) old *and it has
+  attempts left*; a stale claim with none is dead-lettered, so a handler that
+  always outlives the window is not redelivered every 5 minutes forever. That replaced a startup-only `recover()` that requeued *every*
+  running row: harmless with one worker, but ECS runs two during every rolling
+  deploy (`deployment_maximum_percent = 200`), where it handed a peer's live
+  job to a second worker and let the loser's late `fail()` flip an already-done
+  job back to `pending`. The stale window also covers the case a startup
+  requeue never could — a `complete()`/`fail()` that fails on a transient
+  database error while the process stays up — so nothing is stranded until a
+  restart. Ceiling: a job that legitimately runs longer than the window gets a
+  concurrent second run and burns an attempt each window until it dead-letters;
+  raise it or heartbeat `claimed_at` before adding one.
+- Crash recovery is now delayed and attempt-priced, which the startup
+  `recover()` was neither. This is a different population from the slow handler
+  above: a job interrupted by a crash or a redeploy is an ordinary job whose
+  worker vanished, but it pays the same stale-window cost. It waits up to
+  `STALE_CLAIM_MS` (5 min) before any worker re-hands it out, where the startup
+  requeue picked it up as soon as the process came back — for a password-reset
+  mail, a third of the token's 15-minute TTL spent before the first
+  re-attempt. Each reap also spends an attempt, because attempts increment at
+  claim time and the counter cannot tell a reap from a handler failure, so a job
+  interrupted `DEFAULT_MAX_ATTEMPTS` (5) times across successive deploys is
+  dead-lettered with `STALE_CLAIM_ERROR` and the mail is never sent. Accepted:
+  portal's handlers run for seconds and its redeploys are rare, and the only
+  alternative that removes the delay is the blanket startup requeue whose
+  two-worker bug is the reason it went. Revisit by counting a stale reap
+  separately from a handler failure so a crash does not consume a retry — a
+  smaller change than heartbeating `claimed_at`, and the one to reach for first
+  if a mail is ever lost this way.
 - Handlers must be idempotent: attempts increment at claim time, and a worker
-  crash after a side effect re-runs the job. The mail transport writes
-  `outbox/<job-id>.json`, so a retry overwrites rather than duplicates.
+  crash after a side effect re-runs the job. Note that today this is supplied
+  entirely by the *dev* transport writing `outbox/<job-id>.json`, where a retry
+  overwrites rather than duplicates. An SES/SMTP transport has no such
+  property; it must bring its own idempotency (a `sent_messages(job_id)` row,
+  or a provider idempotency key) before it ships, or a retried job is a second
+  delivered email carrying a live token.

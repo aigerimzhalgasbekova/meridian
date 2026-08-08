@@ -61,7 +61,8 @@ type Server struct {
 	tokenIssuer     string // iss claim in issued tokens ("" = URL)
 	nonceOverride   string // nonce claim override ("" = echo the request nonce)
 	extraClaims     map[string]any
-	unpublishedKey  bool // sign with a key absent from the JWKS
+	extraAudience   []string // aud values beyond the client ID
+	unpublishedKey  bool     // sign with a key absent from the JWKS
 	codes           map[string]codeRec
 }
 
@@ -124,6 +125,10 @@ func (s *Server) SetNonceOverride(n string) { s.mu.Lock(); s.nonceOverride = n; 
 
 // SetExtraClaims adds claims (e.g. tid) to issued ID tokens.
 func (s *Server) SetExtraClaims(c map[string]any) { s.mu.Lock(); s.extraClaims = c; s.mu.Unlock() }
+
+// SetExtraAudience adds aud values beyond the client ID, producing the
+// multi-audience token OIDC Core §3.1.3.7 rule 4 requires an azp alongside.
+func (s *Server) SetExtraAudience(aud ...string) { s.mu.Lock(); s.extraAudience = aud; s.mu.Unlock() }
 
 // SetUnpublishedKey makes the fake sign with a key it never publishes in its
 // JWKS — a token no refresh can verify.
@@ -247,6 +252,7 @@ func (s *Server) issueIDToken(nonce string) (string, error) {
 	s.mu.Lock()
 	key, user := s.key, s.user
 	iss, nOver, extra, unpub := s.tokenIssuer, s.nonceOverride, s.extraClaims, s.unpublishedKey
+	aud := append([]string{s.clientID}, s.extraAudience...)
 	s.mu.Unlock()
 	if unpub {
 		key, _ = genKey()
@@ -261,7 +267,7 @@ func (s *Server) issueIDToken(nonce string) (string, error) {
 	claims := jose.Claims{
 		Issuer:    iss,
 		Subject:   user.Subject,
-		Audience:  []string{s.clientID},
+		Audience:  aud,
 		ExpiresAt: now.Add(time.Hour).Unix(),
 		IssuedAt:  now.Unix(),
 		Extra: map[string]any{

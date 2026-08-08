@@ -125,6 +125,7 @@ func run(logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		defer fs.Close() // releases the single-writer lock
 		store = fs
 	}
 
@@ -149,9 +150,12 @@ func run(logger *slog.Logger) error {
 	srv, err := service.New(manager, ksCfg, service.Config{
 		SignerTokens: splitList(os.Getenv("KEYSMITH_SIGNER_TOKENS")),
 		AdminTokens:  splitList(os.Getenv("KEYSMITH_ADMIN_TOKENS")),
-		MaxTokenTTL:  maxTokenTTL,
-		JWKSMaxAge:   jwksMaxAge,
-		Logger:       logger,
+		// Taken from KEYSMITH_ALGS rather than defaulted, so the service's
+		// default algorithm cannot disagree with the keystore's list.
+		DefaultAlg:  algs[0],
+		MaxTokenTTL: maxTokenTTL,
+		JWKSMaxAge:  jwksMaxAge,
+		Logger:      logger,
 	})
 	if err != nil {
 		return err

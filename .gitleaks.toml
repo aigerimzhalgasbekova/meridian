@@ -1,0 +1,32 @@
+# Gitleaks configuration. Extends the default ruleset — this file only adds an
+# allowlist, it never removes or weakens a rule.
+#
+# Two gitleaks 8.24 quirks are load-bearing here, both verified against
+# v8.24.3 (the version gitleaks-action pins in .github/workflows/ci.yml):
+#
+#   - The global allowlist must be the singular `[allowlist]` table. The
+#     `[[allowlists]]` array form parses without error and is then ignored, so
+#     it silently allowlists nothing.
+#   - `condition = "AND"` does not combine criteria. With a path and a
+#     deliberately unmatchable regex it still allowlisted the finding, so the
+#     allowlist below deliberately uses one criterion rather than appearing to
+#     be narrower than it is.
+title = "meridian"
+
+[extend]
+useDefault = true
+
+# Terraform test fixtures declare fabricated but syntactically valid AWS
+# resource IDs so `terraform test` can run a plan without touching an account.
+# An EFS access point ID (fsap- plus 17 hex characters) is dense enough to trip
+# the generic high-entropy rule, but it names a resource rather than authorising
+# anything, and the real IDs live in gitignored tfvars regardless.
+#
+# Matched on the line rather than the path: the line has to be an
+# `access_point_id`/`file_system_id` assignment to an fs-/fsap- value, so a
+# genuine credential in the same fixture is still caught. A path allowlist would
+# have silenced the whole file.
+[allowlist]
+description = "AWS EFS resource IDs in Terraform fixtures are placeholders, not credentials"
+regexTarget = "line"
+regexes = ['''(file_system_id|access_point_id)\s*=\s*"fs(ap)?-[0-9a-f]+"''']

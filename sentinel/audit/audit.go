@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -99,6 +100,10 @@ func canonical(r Record) ([]byte, error) {
 	}
 	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
 }
+
+// validUTF8 replaces invalid UTF-8 bytes with U+FFFD, making hashRecord a
+// function of the record alone (see Log.append).
+func validUTF8(s string) string { return strings.ToValidUTF8(s, "�") }
 
 // hashRecord computes hex(SHA-256(prev hash hex || canonical JSON)).
 func hashRecord(r Record) (string, error) {
@@ -251,16 +256,22 @@ func (l *Log) writeAnchor(head Record) error {
 }
 
 func (l *Log) append(e Event) (Record, error) {
-	if e.Details == nil {
-		e.Details = map[string]string{}
+	// encoding/json escapes an invalid UTF-8 byte as � but writes a real
+	// U+FFFD raw, so a record containing one hashes differently before and
+	// after the store's JSON round-trip — it would verify as BROKEN forever,
+	// indistinguishable from tampering. Coerce rather than reject: the chain's
+	// job is to record what happened, not to refuse it.
+	details := make(map[string]string, len(e.Details))
+	for k, v := range e.Details { // fresh map: Append does not own the caller's
+		details[validUTF8(k)] = validUTF8(v)
 	}
 	rec := Record{
 		Seq:     l.lastSeq + 1,
 		TS:      l.now().UTC().Format(time.RFC3339Nano),
-		Type:    e.Type,
-		Actor:   e.Actor,
-		Action:  e.Action,
-		Details: e.Details,
+		Type:    validUTF8(e.Type),
+		Actor:   validUTF8(e.Actor),
+		Action:  validUTF8(e.Action),
+		Details: details,
 		Prev:    l.lastHash,
 	}
 	if l.empty {
@@ -293,6 +304,12 @@ type VerifyResult struct {
 	// BrokenSeq and Reason identify the first broken link when !OK.
 	BrokenSeq uint64 `json:"broken_seq,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+	// UnvouchedRecords is how many records sit past the last out-of-band
+	// anchor. No anchor vouches for them, so they can be deleted or
+	// fabricated without either verifier noticing — "OK" means "intact up to
+	// the last anchor". Normally 0..AnchorEvery-1; a large number means the
+	// sidecar has stopped being written.
+	UnvouchedRecords int `json:"unvouched_records,omitempty"`
 }
 
 // Verify walks records in order and reports the first broken link: a seq
@@ -339,7 +356,10 @@ func Verify(records []Record) VerifyResult {
 // from its first record). What it does not cover: an attacker who edits *both*
 // files, since the sidecar sits beside the log with the same owner and mode —
 // trimming the anchors to match a truncated log still verifies. Nor does it
-// see the last (AnchorEvery-1) records, which no anchor vouches for yet.
+// see the last (AnchorEvery-1) records, which no anchor vouches for yet: those
+// can be deleted, and arbitrary records appended in their place, and both
+// verifiers still say OK. That window is reported as UnvouchedRecords rather
+// than left silent — "OK" means "intact up to the last anchor".
 // ponytail: closing that needs the sidecar somewhere this service cannot
 // rewrite (object-locked S3 or a separate writer identity), which is what the
 // package doc's "external notary" means.
@@ -364,6 +384,13 @@ func VerifyExport(records []Record, anchors []Anchor, anchorErr error) VerifyRes
 		}
 		if r.Hash != last.HeadHash {
 			return VerifyResult{Records: len(records), BrokenSeq: r.Seq, Reason: "anchor hash mismatch"}
+		}
+		// Report the size of the blind spot rather than leaving it silent:
+		// everything past the last anchor is chain-consistent but unvouched.
+		for _, r := range records {
+			if r.Seq > last.HeadSeq {
+				res.UnvouchedRecords++
+			}
 		}
 		return res
 	}

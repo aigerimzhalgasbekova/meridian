@@ -19,6 +19,7 @@ jobs:
       portal: ${{ steps.filter.outputs.portal }}
       console-web: ${{ steps.filter.outputs.console-web }}
       python: ${{ steps.filter.outputs.python }}
+      site: ${{ steps.filter.outputs.site }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -43,6 +44,9 @@ jobs:
               - '.github/workflows/ci.yml'
             python:
               - 'sentinel/tools/compliance/**'
+              - '.github/workflows/ci.yml'
+            site:
+              - 'site/**'
               - '.github/workflows/ci.yml'
 
   # One job for all Go modules: keysmith changes ripple into idp/bridge via
@@ -214,6 +218,35 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
+  site:
+    needs: changes
+    if: needs.changes.outputs.site == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      # The build is the only gate on this module, so assert the two things it
+      # cannot catch on its own: the object CloudFront's custom_error_response
+      # points at exists, and the "demos are pending" callout is not shipped
+      # while src/config.ts lists live demo URLs.
+      - name: build output invariants
+        run: |
+          test -f dist/404.html || { echo "no dist/404.html — CloudFront custom_error_response points at nothing"; exit 1; }
+          grep -q 'live demo' dist/index.html || { echo "no live demo links — src/config.ts demoUrls regressed"; exit 1; }
+          if grep -q 'pending an AWS account' dist/index.html; then
+            echo "stale 'demos are pending' callout shipped alongside live demo links"; exit 1
+          fi
+
   python:
     needs: changes
     if: needs.changes.outputs.python == 'true'
@@ -306,4 +339,7 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
       - name: console-web
         working-directory: console/web
+        run: npm audit --omit=dev --audit-level=high
+      - name: site
+        working-directory: site
         run: npm audit --omit=dev --audit-level=high

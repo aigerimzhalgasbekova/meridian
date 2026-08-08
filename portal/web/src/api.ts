@@ -1,7 +1,14 @@
 // Fetch wrapper: JSON bodies, cookie session, CSRF header on mutations.
 
 export interface Me {
-  user: { email: string; emailVerified: boolean; pendingEmail: string | null; totpEnabled: boolean };
+  user: {
+    email: string;
+    emailVerified: boolean;
+    pendingEmail: string | null;
+    totpEnabled: boolean;
+    /** 0 when TOTP is off. Surfaced so the last code is not spent unnoticed. */
+    recoveryCodesRemaining: number;
+  };
   csrfToken: string;
   mfaPending: boolean;
 }

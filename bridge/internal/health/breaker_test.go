@@ -67,6 +67,30 @@ func TestBreaker(t *testing.T) {
 		}
 	})
 
+	// Allow latches probing = true and only Record clears it, so a panicking
+	// guarded call that never reaches Record wedges the breaker rejecting
+	// every caller forever — net/http recovers per connection, so nothing
+	// restarts the process to unwedge it.
+	t.Run("panicking probe does not wedge the breaker", func(t *testing.T) {
+		b := New(1, time.Minute, now)
+		b.Do(func() error { return fail })
+		clock = clock.Add(time.Minute)
+		func() {
+			defer func() { recover() }()
+			b.Do(func() error { panic("upstream parser blew up") })
+		}()
+		// The panic counts as a failure, so the breaker re-opened: after
+		// another cooldown it must admit a probe again.
+		clock = clock.Add(time.Minute)
+		if err := b.Allow(); err != nil {
+			t.Fatalf("breaker wedged after a panicking probe: %v", err)
+		}
+		b.Record(nil)
+		if got := b.State(); got != Closed {
+			t.Fatalf("state = %s, want closed", got)
+		}
+	})
+
 	t.Run("half-open admits only one probe", func(t *testing.T) {
 		b := New(1, time.Minute, now)
 		b.Do(func() error { return fail })

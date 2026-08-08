@@ -25,8 +25,10 @@
 {{if .Collisions}}
 <h2>Possible duplicate identities</h2>
 <p>Other identities here share your email address. Bridge never merges accounts
-automatically — if one of these is you, sign in to it and link your providers
-explicitly.</p>
+automatically, and these two cannot be joined now: each upstream account is
+already tied to an identity, and an upstream account belongs to exactly one.
+Linking has to happen <em>before</em> the second provider is used to sign in —
+from the identity you want to keep, using “Link another provider” above.</p>
 <ul>
 {{range .Collisions}}<li><code>{{.ID}}</code> — {{.Email}}</li>{{end}}
 </ul>

@@ -64,7 +64,12 @@ const (
 	webAppSecret     = "web-app-secret-value"
 )
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvOpts(t, true) }
+
+// newEnvOpts builds the environment with InsecureDev configurable: httptest
+// serves plain HTTP so tests want dev mode, but the cookie-hardening test needs
+// the production cookie shape.
+func newEnvOpts(t *testing.T, insecureDev bool) *env {
 	t.Helper()
 	ck := &clock{t: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)}
 
@@ -117,7 +122,7 @@ func newEnv(t *testing.T) *env {
 		Keysmith:          ks,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		RegistrationToken: "test-registration-token",
-		InsecureDev:       true, // httptest is plain HTTP
+		InsecureDev:       insecureDev, // httptest is plain HTTP
 		Now:               ck.Now,
 	})
 	if err != nil {

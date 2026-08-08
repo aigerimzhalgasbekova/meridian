@@ -27,11 +27,14 @@ func (c *clock) advance(d time.Duration) {
 }
 
 var testPolicy = Policy{
-	Threshold:  3,
-	BaseLock:   time.Minute,
-	AccountCap: 4 * time.Minute,
-	IPCap:      time.Hour,
-	FailWindow: time.Hour,
+	Threshold: 3,
+	// Same as Threshold so the two-dimension tests below stay readable; the
+	// production default is 10x Threshold (see Policy.IPThreshold).
+	IPThreshold: 3,
+	BaseLock:    time.Minute,
+	AccountCap:  4 * time.Minute,
+	IPCap:       time.Hour,
+	FailWindow:  time.Hour,
 }
 
 func failN(t *Tracker, account, ip string, n int) {
@@ -145,6 +148,121 @@ func TestSuccessResetsOnlyWhenUnlocked(t *testing.T) {
 	d := tr.Check("alice", "1.1.1.1")
 	if !d.Locked || d.RetryAfter != time.Minute {
 		t.Fatalf("escalation not reset by success: %+v", d)
+	}
+}
+
+// A sprayer used to reset their own IP counter by logging into an account
+// they control: Success deleted the whole IP entry, so the IP dimension —
+// the one ADR 0002 added to catch "one host, many accounts" — never reached
+// its threshold no matter how many victims were walked.
+func TestIPDimensionSurvivesInterleavedSuccess(t *testing.T) {
+	c := newClock()
+	tr := New(testPolicy, c.now)
+
+	for i := 0; i < 10; i++ {
+		tr.Fail(fmt.Sprintf("victim-%d", i), "10.0.0.1")
+		tr.Success("attacker-own-account", "10.0.0.1")
+	}
+	if d := tr.Check("someone-else", "10.0.0.1"); !d.Locked || d.Dimension != IP {
+		t.Fatalf("sprayed IP not locked after interleaved successes: %+v", d)
+	}
+}
+
+// The flip side: an office NAT where real users occasionally fumble a
+// password must not lock its whole egress. The IP threshold is 10x the
+// account one for exactly this reason.
+func TestSharedEgressDoesNotSelfLock(t *testing.T) {
+	c := newClock()
+	policy := Policy{Threshold: 5} // IPThreshold defaults to 50
+	tr := New(policy, c.now)
+
+	// 40 users, one fumbled password each, each followed by a success.
+	for i := 0; i < 40; i++ {
+		acct := fmt.Sprintf("employee-%d", i)
+		tr.Fail(acct, "198.51.100.7")
+		tr.Success(acct, "198.51.100.7")
+	}
+	if d := tr.Check("employee-41", "198.51.100.7"); d.Locked {
+		t.Fatalf("shared egress locked itself out on normal traffic: %+v", d)
+	}
+}
+
+// The IP counter is never cleared by a success, so it stays bounded only if
+// the counting window actually rolls. Keying the reset off `touched` — which
+// every failure refreshes — makes it monotonic instead: an office NAT that
+// fumbles 40 passwords an hour crosses IPThreshold (50) partway through the
+// second hour and, since lockLevel never decays either, escalates to a 24h
+// lock and stays there. Sustained sub-threshold traffic must never lock.
+func TestSharedEgressSurvivesSustainedTraffic(t *testing.T) {
+	c := newClock()
+	tr := New(Policy{Threshold: 5}, c.now) // IPThreshold 50, FailWindow 1h
+	const perHour = 40                     // below IPThreshold, sustained forever
+
+	for hour := 0; hour < 72; hour++ {
+		for i := 0; i < perHour; i++ {
+			acct := fmt.Sprintf("employee-%d", i)
+			tr.Fail(acct, "198.51.100.7")
+			tr.Success(acct, "198.51.100.7")
+			c.advance(time.Hour / perHour)
+			if d := tr.Check("employee-0", "198.51.100.7"); d.Locked {
+				t.Fatalf("shared egress locked itself out at hour %d: %+v", hour, d)
+			}
+		}
+	}
+
+	// Escalation decays with the window too — on the IP dimension, the only
+	// one the window governs: an IP that keeps seeing traffic (so it is never
+	// swept as stale) but goes a full window without locking starts over at
+	// BaseLock, instead of resuming yesterday's exponent. Every failure below
+	// uses a fresh account so only the IP counter is under test.
+	c2 := newClock()
+	tr2 := New(testPolicy, c2.now) // IPThreshold 3, BaseLock 1m, FailWindow 1h
+	n := 0
+	failIP := func() { n++; tr2.Fail(fmt.Sprintf("acct-%d", n), "1.1.1.1") }
+
+	for i := 0; i < testPolicy.IPThreshold; i++ {
+		failIP()
+	}
+	if d := tr2.Check("bystander", "1.1.1.1"); d.Dimension != IP || d.RetryAfter != time.Minute {
+		t.Fatalf("first IP lock = %+v, want IP for 1m", d)
+	}
+	for i := 0; i < 4; i++ { // 2h of one failure per 30m: sub-threshold, never stale
+		c2.advance(30 * time.Minute)
+		failIP()
+		if d := tr2.Check("bystander", "1.1.1.1"); d.Locked {
+			t.Fatalf("sub-threshold trickle locked the IP: %+v", d)
+		}
+	}
+	for i := 0; i < testPolicy.IPThreshold; i++ {
+		failIP()
+	}
+	if d := tr2.Check("bystander", "1.1.1.1"); !d.Locked || d.RetryAfter != testPolicy.BaseLock {
+		t.Fatalf("IP escalation did not decay after a quiet window: %+v", d)
+	}
+}
+
+// The account dimension exists to catch a distributed attacker guessing ONE
+// victim's password from many IPs (package doc). Windowing the account counter
+// hands that attacker a free bypass: pace guesses so no single FailWindow ever
+// accumulates Threshold failures — 3/h against the shipped defaults — and the
+// account never locks, while the constant traffic keeps the entry fresh so
+// nothing sweeps it either. Neither of the other brakes applies: Success never
+// fires (the attacker never guesses right) and the rate limiters are per-minute.
+// A sustained sub-threshold-per-window trickle must still lock the account.
+func TestSlowDistributedGuessingLocksAccount(t *testing.T) {
+	c := newClock()
+	tr := New(testPolicy, c.now) // Threshold 3, FailWindow 1h
+
+	// One guess every 40m from a fresh IP: never Threshold inside a window,
+	// never idle for a whole one.
+	for i := 0; i < testPolicy.Threshold; i++ {
+		if i > 0 {
+			c.advance(40 * time.Minute)
+		}
+		tr.Fail("victim", fmt.Sprintf("203.0.113.%d", i))
+	}
+	if d := tr.Check("victim", "203.0.113.250"); !d.Locked || d.Dimension != Account {
+		t.Fatalf("slow distributed guessing never locked the account: %+v", d)
 	}
 }
 
@@ -300,5 +418,31 @@ func TestSweepKeepsStillLockedEntries(t *testing.T) {
 	}
 	if d := tr.Check("victim", "9.9.9.9"); !d.Locked || d.Dimension != Account {
 		t.Error("still-locked account stopped being locked after a sweep")
+	}
+}
+
+// Pins the one attacker-forced path that clears a below-threshold account
+// counter, which Policy.Threshold's doc now names: MaxKeys pressure. A paced
+// guesser sitting one failure under the threshold gets their victim's count
+// wiped by an unrelated username flood, so the next guess does not lock.
+// This is the accepted trade (a locked entry is never evicted — see
+// TestEvictionNeverDropsALockedEntry); it is documented, not fixed here.
+func TestReclaimClearsBelowThresholdAccountCounter(t *testing.T) {
+	c := newClock()
+	policy := testPolicy
+	policy.MaxKeys = 64
+	policy.IPThreshold = 1000 // isolate the account dimension
+	tr := New(policy, c.now)
+
+	failN(tr, "victim", "10.0.0.1", policy.Threshold-1)
+
+	for i := 0; i < 20*policy.MaxKeys; i++ {
+		tr.Fail(fmt.Sprintf("flood-%d", i), "10.0.0.3")
+	}
+
+	tr.Fail("victim", "10.0.0.1")
+	if d := tr.Check("victim", "10.0.0.1"); d.Locked {
+		t.Fatal("victim locked: the flood no longer clears the account counter — " +
+			"Policy.Threshold's doc claims it does, update the doc")
 	}
 }

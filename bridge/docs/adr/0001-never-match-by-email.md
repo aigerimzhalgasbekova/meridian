@@ -40,7 +40,16 @@ Consequences we accept and design for:
 
 - The same human arriving via two providers gets **two identities**. bridge
   surfaces the collision on the account page (`IdentitiesByEmail` exists for
-  this hint and nothing else) and offers explicit linking.
+  this hint and nothing else).
+- Linking is available **before** the second provider has ever been used to
+  sign in, and only then. Once a login via provider B has JIT-provisioned its
+  own identity, `(B, subject)` is spoken for and `AddLink` refuses it in both
+  directions — so a collision that is already visible on the account page is,
+  by construction, no longer resolvable. The account page says so rather than
+  offering a remedy that would 409. There is deliberately no merge, unlink or
+  delete-identity operation: moving links between identities is a multi-step
+  mutation with its own takeover surface, and it wants the audit trail before
+  it wants the feature.
 - Linking is a deliberate act requiring fresh authentication to **both**
   sides: a live session whose last upstream auth is under 5 minutes old, plus
   a full auth-code flow to the provider being linked. Session possession alone

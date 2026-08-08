@@ -47,8 +47,10 @@ func (s *Server) handleJWKS(w http.ResponseWriter, r *http.Request) {
 }
 
 type signRequest struct {
-	// Claims is the flat claims object to sign. exp/iat are set by the
-	// server; supplying them is an error (they would silently lie).
+	// Claims is the flat claims object to sign. exp/iat/nbf are set by the
+	// server; supplying them is an error (they would silently lie — a
+	// client-chosen nbf can land after the server-set exp, minting a
+	// credential that is never valid).
 	Claims json.RawMessage `json:"claims"`
 	// TTLSeconds bounds the token lifetime; capped by MaxTokenTTL.
 	TTLSeconds int64 `json:"ttl_seconds"`
@@ -78,8 +80,8 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "claims: "+err.Error())
 		return
 	}
-	if claims.ExpiresAt != 0 || claims.IssuedAt != 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "exp and iat are set by the server")
+	if claims.ExpiresAt != 0 || claims.IssuedAt != 0 || claims.NotBefore != 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "exp, iat and nbf are set by the server")
 		return
 	}
 	if req.TTLSeconds <= 0 {
@@ -252,6 +254,36 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "not_pending", err.Error())
 	case errors.Is(err, keystore.ErrDwellNotElapsed):
 		writeError(w, http.StatusConflict, "dwell_not_elapsed", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "internal", "")
+	}
+}
+
+// handleRevoke is the key-compromise lever. Promotion (even forced) only stops
+// a key signing new legitimate tokens; the key stays published for the whole
+// retire window, which is exactly the runway of an attacker who holds its
+// private half. Revocation unpublishes it now.
+func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "reason required")
+		return
+	}
+	id := r.PathValue("id")
+	err := s.manager.Revoke(r.Context(), id, req.Reason)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": id})
+	case errors.Is(err, keystore.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "")
+	case errors.Is(err, keystore.ErrAlreadyRetired):
+		writeError(w, http.StatusConflict, "already_retired", err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal", "")
 	}

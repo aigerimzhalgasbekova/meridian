@@ -83,10 +83,10 @@ func TestAuthCodeConsumeIsSingleUse(t *testing.T) {
 	if err := s.AuthCodes().Create(ctx, code); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.AuthCodes().Consume(ctx, "hash1", now); err != nil {
+	if _, err := s.AuthCodes().Consume(ctx, "test", "hash1", now); err != nil {
 		t.Fatalf("first consume: %v", err)
 	}
-	_, err := s.AuthCodes().Consume(ctx, "hash1", now)
+	_, err := s.AuthCodes().Consume(ctx, "test", "hash1", now)
 	if err != storage.ErrConsumed {
 		t.Fatalf("second consume: %v, want ErrConsumed", err)
 	}
@@ -133,7 +133,7 @@ func TestSweepDeletesExpired(t *testing.T) {
 		t.Fatalf("swept %d rows, want 3", n)
 	}
 	// The valid code survives.
-	if _, err := s.AuthCodes().Consume(ctx, "valid", now); err != nil {
+	if _, err := s.AuthCodes().Consume(ctx, "test", "valid", now); err != nil {
 		t.Fatalf("valid code was swept: %v", err)
 	}
 	// A second sweep with nothing expired is a no-op.
@@ -160,7 +160,7 @@ func TestAuthCodeConsumeConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := s.AuthCodes().Consume(ctx, "race", now)
+			_, err := s.AuthCodes().Consume(ctx, "test", "race", now)
 			successes[i] = err == nil
 		}(i)
 	}

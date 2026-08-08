@@ -17,10 +17,10 @@ type Store struct {
 	mu sync.Mutex
 
 	realms   map[string]storage.Realm
-	clients  map[string]storage.Client // key: realm/clientID
-	users    map[string]storage.User   // key: realm/id
-	byUser   map[string]string         // key: realm/username(lower) → realm/id
-	codes    map[string]storage.AuthCode
+	clients  map[string]storage.Client       // key: realm/clientID
+	users    map[string]storage.User         // key: realm/id
+	byUser   map[string]string               // key: realm/username(lower) → realm/id
+	codes    map[string]storage.AuthCode     // key: realm/codeHash
 	refresh  map[string]storage.RefreshToken // key: realm/hash
 	consents map[string]storage.Consent      // key: realm/user/client
 	devices  map[string]storage.DeviceCode   // key: realm/deviceHash
@@ -216,24 +216,36 @@ type codes Store
 func (s *codes) Create(_ context.Context, c storage.AuthCode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.codes[c.CodeHash]; ok {
+	k := key(c.RealmName, c.CodeHash)
+	if _, ok := s.codes[k]; ok {
 		return storage.ErrDuplicate
 	}
-	s.codes[c.CodeHash] = c
+	s.codes[k] = c
 	return nil
 }
 
-func (s *codes) Consume(_ context.Context, codeHash string, now time.Time) (storage.AuthCode, error) {
+func (s *codes) Get(_ context.Context, realm, codeHash string) (storage.AuthCode, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.codes[codeHash]
+	c, ok := s.codes[key(realm, codeHash)]
+	if !ok {
+		return storage.AuthCode{}, storage.ErrNotFound
+	}
+	return c, nil
+}
+
+func (s *codes) Consume(_ context.Context, realm, codeHash string, now time.Time) (storage.AuthCode, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := key(realm, codeHash)
+	c, ok := s.codes[k]
 	if !ok {
 		return storage.AuthCode{}, storage.ErrNotFound
 	}
 	// Retain used codes until well past expiry for replay detection, then
 	// garbage-collect opportunistically.
 	if now.After(c.ExpiresAt.Add(24 * time.Hour)) {
-		delete(s.codes, codeHash)
+		delete(s.codes, k)
 		return storage.AuthCode{}, storage.ErrNotFound
 	}
 	if c.Used {
@@ -243,19 +255,20 @@ func (s *codes) Consume(_ context.Context, codeHash string, now time.Time) (stor
 		return storage.AuthCode{}, storage.ErrNotFound
 	}
 	c.Used = true
-	s.codes[codeHash] = c
+	s.codes[k] = c
 	return c, nil
 }
 
-func (s *codes) MarkFamily(_ context.Context, codeHash, familyID string) error {
+func (s *codes) MarkFamily(_ context.Context, realm, codeHash, familyID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.codes[codeHash]
+	k := key(realm, codeHash)
+	c, ok := s.codes[k]
 	if !ok {
 		return storage.ErrNotFound
 	}
 	c.IssuedFamilyID = familyID
-	s.codes[codeHash] = c
+	s.codes[k] = c
 	return nil
 }
 
@@ -412,7 +425,7 @@ func (s *devices) GetByUserCode(_ context.Context, realm, userCode string) (stor
 	return s.devices[k], nil
 }
 
-func (s *devices) SetStatus(_ context.Context, realm, hash string, status storage.DeviceCodeStatus, userID string) error {
+func (s *devices) SetStatus(_ context.Context, realm, hash string, status storage.DeviceCodeStatus, userID string, authTime time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := key(realm, hash)
@@ -425,6 +438,7 @@ func (s *devices) SetStatus(_ context.Context, realm, hash string, status storag
 	}
 	d.Status = status
 	d.UserID = userID
+	d.AuthTime = authTime
 	s.devices[k] = d
 	return nil
 }

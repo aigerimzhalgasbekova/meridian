@@ -247,6 +247,37 @@ resource "aws_ecs_service" "this" {
   deployment_minimum_healthy_percent = var.stop_before_start ? 0 : 100
   deployment_maximum_percent         = var.stop_before_start ? 100 : 200
 
+  # stop_before_start removes the "old task keeps serving" safety net, so a bad
+  # image is a hard outage that ECS retries forever. The breaker puts a stop
+  # back in its place — but only where a failed launch actually means a bad
+  # image. Requires the default ECS deployment controller, which this module
+  # uses.
+  #
+  # It is OFF for services holding an exclusive EFS file. Their flock is
+  # LOCK_NB (fail fast), and a SIGKILLed predecessor leaves its NFSv4 lock lease
+  # alive on the EFS server for ~90s: every replacement launched in that window
+  # exits instantly, and at desired_count = 1 three of them hit the breaker's
+  # floor of 3 — condemning a perfectly good image. Neither breaker outcome is
+  # acceptable there: rollback = true runs an image nobody shipped, and
+  # rollback = false parks the platform's only signer at zero tasks with no
+  # automatic recovery. With the breaker off ECS just keeps retrying, the lease
+  # expires, and the image the operator shipped starts. A genuinely bad image
+  # retries visibly and the deploy job is what times out.
+  deployment_circuit_breaker {
+    # ponytail: the real cure is a blocking LOCK_EX under a ~120s deadline in
+    # keysmith/keystore and sentinel/audit; enable this unconditionally once it
+    # lands. rollback tracks enable — ECS ignores it while the breaker is off.
+    enable   = var.efs == null
+    rollback = var.efs == null
+  }
+
+  # idp migrates its schema before it can answer /healthz, and the target group
+  # marks a target unhealthy ~45s after registration (15s x 3). Without a grace
+  # period a slow migration — a cold RDS after resume.sh, a lock wait — gets the
+  # task killed mid-migration and the replacement starts the same one over.
+  # Only valid on load-balanced services; ECS rejects it otherwise.
+  health_check_grace_period_seconds = var.alb == null ? null : 120
+
   network_configuration {
     subnets          = var.subnet_ids
     security_groups  = [aws_security_group.this.id]
@@ -268,7 +299,20 @@ resource "aws_ecs_service" "this" {
 
   lifecycle {
     # CI deploys new task definition revisions; don't fight it on apply.
-    ignore_changes = [task_definition]
+    # desired_count is runtime-owned too: autoscaling writes it continuously,
+    # and scripts/pause.sh sets it to 0 — without this, the next apply silently
+    # un-pauses the stack (services resume against a stopped RDS and bill).
+    ignore_changes = [task_definition, desired_count]
+
+    # An EFS-mounted task holds an exclusive file (keysmith flocks its
+    # keystore, sentinel its audit chain). On the default 100/200 deploy the
+    # replacement starts while the old task still holds the lock: a
+    # crash-looping deploy at best, a lost write at worst. Fail the plan
+    # rather than let a new EFS service be added without the pairing.
+    precondition {
+      condition     = var.efs == null || var.stop_before_start
+      error_message = "A service mounting EFS holds an exclusive file and must set stop_before_start = true."
+    }
   }
 }
 
@@ -280,6 +324,11 @@ resource "aws_appautoscaling_target" "this" {
   scalable_dimension = "ecs:service:DesiredCount"
   min_capacity       = var.min_count
   max_capacity       = var.max_count
+
+  lifecycle {
+    # scripts/pause.sh drops the floor to 0; an apply must not raise it back.
+    ignore_changes = [min_capacity]
+  }
 }
 
 resource "aws_appautoscaling_policy" "cpu" {

@@ -27,10 +27,14 @@ AWS-0164
 AWS-0095
 
 # ALB is internet-facing. That is the point — it fronts the public IdP, SSO,
-# portal, and console. WAFv2 and drop-invalid-header-fields are attached.
+# portal, and console. `drop_invalid_header_fields` is always on; WAFv2
+# attaches in the prod profile only (`count = local.cheap ? 0 : 1`).
 AWS-0053
 
 # S3 buckets (ALB access logs, site) use SSE-S3 (AES256) rather than a customer
-# managed key. SSE-S3 is adequate for these non-sensitive objects; CMK adds
-# key-management cost and is deferred to prod hardening.
+# managed key. Access-log records carry request lines, so "non-sensitive" has to
+# be earned rather than asserted: portal's one-time tokens are mailed in the URL
+# fragment and never reach a request line, and bridge's ?code= is spent inside
+# the request that carries it. What lands here is IPs, paths and user agents.
+# CMK adds key-management cost and is deferred to prod hardening.
 AWS-0132

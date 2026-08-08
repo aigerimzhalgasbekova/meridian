@@ -181,16 +181,23 @@ func (s *authCodeStore) Create(ctx context.Context, c storage.AuthCode) error {
 	return mapErr(err)
 }
 
+const authCodeCols = `code_hash, realm_name, client_id, user_id, redirect_uri, scopes, nonce, code_challenge, auth_time, session_id, used, issued_family_id, expires_at, created_at`
+
+func (s *authCodeStore) Get(ctx context.Context, realm, codeHash string) (storage.AuthCode, error) {
+	return scanAuthCode(s.pool.QueryRow(ctx,
+		`SELECT `+authCodeCols+` FROM auth_codes WHERE realm_name=$1 AND code_hash=$2`, realm, codeHash))
+}
+
 // Consume flips used=false→true in one statement. The UPDATE ... WHERE used=false
 // with RETURNING makes redemption atomic: the DB row lock guarantees exactly
 // one caller sees used=false. A second caller updates zero rows and we then
 // read back the (used) record to signal replay.
-func (s *authCodeStore) Consume(ctx context.Context, codeHash string, now time.Time) (storage.AuthCode, error) {
+func (s *authCodeStore) Consume(ctx context.Context, realm, codeHash string, now time.Time) (storage.AuthCode, error) {
 	row := s.pool.QueryRow(ctx,
 		`UPDATE auth_codes SET used=true
-		 WHERE code_hash=$1 AND used=false AND expires_at > $2
-		 RETURNING code_hash, realm_name, client_id, user_id, redirect_uri, scopes, nonce, code_challenge, auth_time, session_id, used, issued_family_id, expires_at, created_at`,
-		codeHash, now)
+		 WHERE realm_name=$1 AND code_hash=$2 AND used=false AND expires_at > $3
+		 RETURNING `+authCodeCols,
+		realm, codeHash, now)
 	c, err := scanAuthCode(row)
 	if err == nil {
 		return c, nil
@@ -200,8 +207,7 @@ func (s *authCodeStore) Consume(ctx context.Context, codeHash string, now time.T
 	}
 	// No row updated: either unknown/expired, or already used (replay).
 	c, err = scanAuthCode(s.pool.QueryRow(ctx,
-		`SELECT code_hash, realm_name, client_id, user_id, redirect_uri, scopes, nonce, code_challenge, auth_time, session_id, used, issued_family_id, expires_at, created_at
-		 FROM auth_codes WHERE code_hash=$1`, codeHash))
+		`SELECT `+authCodeCols+` FROM auth_codes WHERE realm_name=$1 AND code_hash=$2`, realm, codeHash))
 	if err != nil {
 		return storage.AuthCode{}, err // ErrNotFound
 	}
@@ -211,8 +217,9 @@ func (s *authCodeStore) Consume(ctx context.Context, codeHash string, now time.T
 	return storage.AuthCode{}, storage.ErrNotFound // expired
 }
 
-func (s *authCodeStore) MarkFamily(ctx context.Context, codeHash, familyID string) error {
-	tag, err := s.pool.Exec(ctx, `UPDATE auth_codes SET issued_family_id=$2 WHERE code_hash=$1`, codeHash, familyID)
+func (s *authCodeStore) MarkFamily(ctx context.Context, realm, codeHash, familyID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE auth_codes SET issued_family_id=$3 WHERE realm_name=$1 AND code_hash=$2`, realm, codeHash, familyID)
 	if err != nil {
 		return err
 	}
@@ -355,7 +362,7 @@ func (s *consentStore) Delete(ctx context.Context, realm, userID, clientID strin
 
 type deviceStore struct{ pool *pgxpool.Pool }
 
-const deviceCols = `device_code_hash, user_code, realm_name, client_id, scopes, status, user_id, interval_secs, expires_at, last_polled_at, created_at`
+const deviceCols = `device_code_hash, user_code, realm_name, client_id, scopes, status, user_id, auth_time, interval_secs, expires_at, last_polled_at, created_at`
 
 func (s *deviceStore) Create(ctx context.Context, d storage.DeviceCode) error {
 	_, err := s.pool.Exec(ctx,
@@ -370,11 +377,12 @@ func scanDevice(row pgx.Row) (storage.DeviceCode, error) {
 	var d storage.DeviceCode
 	var scopes []string
 	var status string
-	var lastPolled *time.Time
+	var lastPolled, authTime *time.Time
 	err := row.Scan(&d.DeviceCodeHash, &d.UserCode, &d.RealmName, &d.ClientID, &scopes,
-		&status, &d.UserID, &d.Interval, &d.ExpiresAt, &lastPolled, &d.CreatedAt)
+		&status, &d.UserID, &authTime, &d.Interval, &d.ExpiresAt, &lastPolled, &d.CreatedAt)
 	d.Scopes = oauth.Scopes(scopes)
 	d.Status = storage.DeviceCodeStatus(status)
+	d.AuthTime = orZero(authTime)
 	d.LastPolledAt = orZero(lastPolled)
 	return d, mapErr(err)
 }
@@ -389,11 +397,17 @@ func (s *deviceStore) GetByUserCode(ctx context.Context, realm, userCode string)
 		`SELECT `+deviceCols+` FROM device_codes WHERE realm_name=$1 AND user_code=$2`, realm, userCode))
 }
 
-func (s *deviceStore) SetStatus(ctx context.Context, realm, hash string, status storage.DeviceCodeStatus, userID string) error {
+func (s *deviceStore) SetStatus(ctx context.Context, realm, hash string, status storage.DeviceCodeStatus, userID string, authTime time.Time) error {
+	// A zero authTime is stored as NULL so grantDeviceCode can tell "never
+	// recorded" apart from a real instant instead of asserting the epoch.
+	var at *time.Time
+	if !authTime.IsZero() {
+		at = &authTime
+	}
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE device_codes SET status=$3, user_id=$4
+		`UPDATE device_codes SET status=$3, user_id=$4, auth_time=$5
 		 WHERE realm_name=$1 AND device_code_hash=$2 AND status='pending'`,
-		realm, hash, string(status), userID)
+		realm, hash, string(status), userID, at)
 	if err != nil {
 		return err
 	}

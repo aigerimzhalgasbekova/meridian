@@ -175,6 +175,10 @@ type DeviceCode struct {
 	Status    DeviceCodeStatus
 	// UserID is set on approval.
 	UserID string
+	// AuthTime is when the approving user last actively authenticated (their
+	// browser session's AuthenticatedAt), not when the device polled. Zero on
+	// pending codes and on rows approved before this field existed.
+	AuthTime time.Time
 	// Interval is the minimum polling interval in seconds.
 	Interval     int
 	ExpiresAt    time.Time

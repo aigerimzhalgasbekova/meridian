@@ -1,0 +1,5 @@
+# The root .gitignore sweeps .terraform.lock.hcl in with tfstate/tfplan/tfvars.
+# Those really do leak account ids and secrets; the lock file is the opposite —
+# provider versions and SHA256 checksums, designed to be committed, and this
+# root's only defence against a substituted provider binary. Un-ignore it here.
+!.terraform.lock.hcl

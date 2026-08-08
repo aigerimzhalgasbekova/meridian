@@ -286,6 +286,68 @@ func TestCheckFailsClosedWhenAuditFails(t *testing.T) {
 	}
 }
 
+// An audit outage must not be fail-open: the caller still gets a 500 (and a
+// retry double-counts toward lockout — the safe direction), but the lockout
+// counters see every failure. Skipping them would suspend brute-force lockout
+// for exactly as long as the audit store is unwritable.
+func TestReportAuthResultStillCountsWhenAuditFails(t *testing.T) {
+	e := newEnv(t)
+	log, err := audit.New(failStore{}, audit.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.srv.cfg.Audit = log
+	for i := 0; i < 10; i++ {
+		w := e.do(t, "POST", "/v1/report-auth-result", testToken,
+			`{"account":"dave","ip":"203.0.113.20","success":false}`)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("report with failing audit: status %d, want 500", w.Code)
+		}
+	}
+	if d := e.srv.cfg.Lockouts.Check("dave", "203.0.113.20"); !d.Locked {
+		t.Fatalf("failures during an audit outage did not lock the account: %+v", d)
+	}
+}
+
+// countingStore counts full-chain reads, which is what VerifyAll costs.
+type countingStore struct {
+	*audit.MemStore
+	reads *int
+}
+
+func (c countingStore) Records() ([]audit.Record, error) {
+	*c.reads++
+	return c.MemStore.Records()
+}
+
+// VerifyAll re-reads and re-hashes the whole log while holding the store
+// mutex, blocking every audit append and therefore every decision. Polling the
+// endpoint must not turn log size into service-wide stall time.
+func TestAuditVerifyIsCached(t *testing.T) {
+	e := newEnv(t)
+	reads := 0
+	log, err := audit.New(countingStore{MemStore: audit.NewMemStore(), reads: &reads}, audit.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.srv.cfg.Audit = log
+	reads = 0
+	for i := 0; i < 20; i++ {
+		if w := e.do(t, "GET", "/v1/audit/verify", testToken, ""); w.Code != http.StatusOK {
+			t.Fatalf("verify: %d %s", w.Code, w.Body)
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("20 verify calls re-read the chain %d times, want 1 (cached)", reads)
+	}
+	// Past the TTL it must re-verify, not serve a stale verdict forever.
+	e.clock = e.clock.Add(verifyCacheTTL + time.Second)
+	e.do(t, "GET", "/v1/audit/verify", testToken, "")
+	if reads != 2 {
+		t.Fatalf("chain read %d times after the TTL expired, want 2", reads)
+	}
+}
+
 func hasPrefix(ss []string, prefix string) bool {
 	for _, s := range ss {
 		if strings.HasPrefix(s, prefix) {

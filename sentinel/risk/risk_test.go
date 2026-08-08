@@ -248,3 +248,39 @@ func TestAccountMapIsBounded(t *testing.T) {
 		t.Error("eviction dropped an account with a trusted-device baseline first")
 	}
 }
+
+// Past MaxAccounts the map used to evict real users' baselines at random with
+// nothing recording the loss: the next attempt from an evicted account scored
+// 0 for impossible_travel and new_device and was allowed, indistinguishably
+// from a genuinely clean login. Idle baselines must expire first, and a
+// capacity eviction of a live one must be counted.
+func TestBaselineEvictionExpiresFirstAndIsReported(t *testing.T) {
+	fill := func(e *Engine, at time.Time) {
+		for i := range 100 {
+			e.Observe(Attempt{Account: fmt.Sprintf("user-%d", i), IP: "198.51.100.4",
+				DeviceID: "dev", At: at}, true)
+		}
+	}
+
+	// Idle baselines: the expiry pass reclaims them, so nothing live is lost.
+	idle := New(Config{MaxAccounts: 100})
+	fill(idle, t0)
+	idle.Observe(Attempt{Account: "newcomer", IP: "198.51.100.4", At: t0.Add(baselineTTL + time.Hour)}, true)
+	idle.mu.Lock()
+	lost, n := idle.evictedBaselines, len(idle.accounts)
+	idle.mu.Unlock()
+	if lost != 0 {
+		t.Errorf("evicted %d live baselines when %d idle ones were expirable", lost, n)
+	}
+
+	// Live baselines: eviction is unavoidable, but it must not be silent.
+	live := New(Config{MaxAccounts: 100})
+	fill(live, t0)
+	live.Observe(Attempt{Account: "newcomer", IP: "198.51.100.4", At: t0.Add(time.Minute)}, true)
+	live.mu.Lock()
+	lost = live.evictedBaselines
+	live.mu.Unlock()
+	if lost == 0 {
+		t.Error("dropped live device/geo baselines without counting them")
+	}
+}

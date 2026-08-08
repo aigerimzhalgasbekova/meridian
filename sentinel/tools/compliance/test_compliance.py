@@ -81,7 +81,7 @@ class ReportTest(unittest.TestCase):
         self.records = verify_chain.load(FIXTURE)
 
     def test_report_sections_and_counts(self):
-        md, ok = report.build_report(self.records, (True, None))
+        md, ok = report.build_report(self.records, (True, None, 0))
         self.assertTrue(ok)
         self.assertIn("Chain integrity: **INTACT**", md)
         for section in ("# Sentinel compliance report", "## Decisions",
@@ -103,7 +103,7 @@ class ReportTest(unittest.TestCase):
         self.assertIn("chain broken at seq", md)
 
     def test_report_on_empty_log(self):
-        md, ok = report.build_report([], (True, None))
+        md, ok = report.build_report([], (True, None, 0))
         self.assertTrue(ok)
         self.assertIn("Records: **0**", md)
 
@@ -139,21 +139,31 @@ class AnchorTest(unittest.TestCase):
 
     def test_matching_anchor_ok(self):
         anchors = [self._anchor_for(self.records[-1])]
-        ok, reason = verify_chain.check_anchors(self.records, anchors)
+        ok, reason, _ = verify_chain.check_anchors(self.records, anchors)
         self.assertTrue(ok, reason)
 
     def test_truncation_detected_by_anchor(self):
         # Anchor vouches for the current head; drop the tail below it.
         anchors = [self._anchor_for(self.records[-1])]
         truncated = self.records[:-3]
-        ok, reason = verify_chain.check_anchors(truncated, anchors)
+        ok, reason, _ = verify_chain.check_anchors(truncated, anchors)
         self.assertFalse(ok)
         self.assertIn("truncated", reason)
+
+    def test_unvouched_tail_is_reported(self):
+        # Only the LAST anchor is cross-checked, so records past it are a blind
+        # spot: an attacker can delete them and append fabricated ones, and the
+        # verifier still says OK. The size of that window must be reported
+        # rather than swallowed.
+        anchors = [self._anchor_for(self.records[-4])]
+        ok, reason, unvouched = verify_chain.check_anchors(self.records, anchors)
+        self.assertTrue(ok, reason)
+        self.assertEqual(unvouched, 3)
 
     def test_empty_anchors_fails_closed(self):
         # An emptied sidecar is indistinguishable from an attacker deleting the
         # evidence, so it must not verify as intact.
-        ok, reason = verify_chain.check_anchors(self.records, [])
+        ok, reason, _ = verify_chain.check_anchors(self.records, [])
         self.assertFalse(ok)
         self.assertIn("empty", reason)
 

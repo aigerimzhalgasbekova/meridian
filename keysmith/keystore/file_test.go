@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"os"
@@ -37,12 +38,20 @@ func TestFileStorePersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	k, err := newKey(jose.AlgEdDSA, 2048, time.Now().UTC())
+	// Deliberately a local wall clock with a monotonic reading, as the daemon
+	// uses: the timestamps are inside the AEAD now, so encode and decode must
+	// agree on their canonical form across the JSON round trip and the zone.
+	k, err := newKey(jose.AlgEdDSA, 2048, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	k.State = StateActive
 	if err := s1.Put(ctx, k); err != nil {
+		t.Fatal(err)
+	}
+	// The store holds an exclusive lock for its lifetime; a reopen in the same
+	// process is a second writer just like a second process.
+	if err := s1.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,6 +127,9 @@ func TestFileStoreWrongKEKFailsClosed(t *testing.T) {
 	if err := s.Put(ctx, k); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("different KEK id", func(t *testing.T) {
 		other := testKEK(t)
@@ -163,6 +175,9 @@ func TestFileStoreTamperDetection(t *testing.T) {
 	if err := s.Put(ctx, k2); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Swap the two records' encrypted blobs: the AAD (key ID) must catch it.
 	raw, err := os.ReadFile(path)
@@ -203,6 +218,9 @@ func TestFileStorePublicKeyTamperRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.Put(ctx, k); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -246,6 +264,9 @@ func TestFileStorePublicKeyTamperRejected(t *testing.T) {
 	if !got.Public.(ed25519.PublicKey).Equal(k.Public.(ed25519.PublicKey)) {
 		t.Fatal("attacker public_jwk was published under legitimate kid: forgery possible")
 	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// A kid that does not match the thumbprint of the private key is rejected.
 	doc.Keys[0].ID = "sha256:not-the-real-thumbprint"
@@ -259,6 +280,346 @@ func TestFileStorePublicKeyTamperRejected(t *testing.T) {
 	if _, err := OpenFileStore(ctx, path, kek); err == nil {
 		t.Fatal("kid/thumbprint mismatch went undetected")
 	}
+}
+
+func readDoc(t *testing.T, path string) fileDoc {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc fileDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+func writeDoc(t *testing.T, path string, doc fileDoc) {
+	t.Helper()
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFileStoreLifecycleTamperRejected is KS-P0's other half: the thumbprint
+// check proves the key *material* is genuine but says nothing about its
+// lifecycle *position*. With state and timestamps outside the AEAD, an
+// attacker with file write access and no KEK could flip a retired key back to
+// active — resurrecting a key whose private half they stole — or backdate
+// created_at to walk straight through the pending dwell.
+func TestFileStoreLifecycleTamperRejected(t *testing.T) {
+	ctx := context.Background()
+	kek := testKEK(t)
+	now := time.Now().UTC()
+
+	mutations := []struct {
+		name string
+		edit func(*fileRecord)
+	}{
+		{"state retired → active", func(r *fileRecord) { r.State = string(StateActive) }},
+		{"created_at backdated", func(r *fileRecord) { r.CreatedAt = r.CreatedAt.Add(-48 * time.Hour) }},
+		{"promoted_at forward-dated", func(r *fileRecord) { r.PromotedAt = now.Add(48 * time.Hour) }},
+		{"retiring_at zeroed", func(r *fileRecord) { r.RetiringAt = time.Time{} }},
+		{"retired_at zeroed", func(r *fileRecord) { r.RetiredAt = time.Time{} }},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "keys.json")
+			s, err := OpenFileStore(ctx, path, kek)
+			if err != nil {
+				t.Fatal(err)
+			}
+			k, err := newKey(jose.AlgEdDSA, 2048, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			k.State, k.PromotedAt, k.RetiringAt, k.RetiredAt = StateRetired, now, now, now
+			if err := s.Put(ctx, k); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			doc := readDoc(t, path)
+			tc.edit(&doc.Keys[0])
+			writeDoc(t, path, doc)
+
+			s2, err := OpenFileStore(ctx, path, kek)
+			if err == nil {
+				s2.Close()
+				t.Fatal("lifecycle metadata edited in plaintext went undetected")
+			}
+		})
+	}
+}
+
+// TestFileStoreRecordReplayRejected: binding the lifecycle into each record's
+// AAD is not enough on its own. Every record is sealed independently, so an
+// authentic record kept from while the key was active can be spliced over its
+// retired successor — a resurrection with no KEK and no forged bytes. The
+// document generation in the AAD is what stops records from different writes
+// being mixed.
+func TestFileStoreRecordReplayRejected(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "keys.json")
+	kek := testKEK(t)
+	now := time.Now().UTC()
+
+	s, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k1, err := newKey(jose.AlgEdDSA, 2048, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k2, err := newKey(jose.AlgEdDSA, 2048, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k1.State, k1.PromotedAt = StateActive, now
+	if err := s.Put(ctx, k1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, k2); err != nil {
+		t.Fatal(err)
+	}
+	// The attacker's snapshot of the file, taken while k1 was still active.
+	snapshot := readDoc(t, path)
+
+	k1.State, k1.RetiringAt, k1.RetiredAt = StateRetired, now, now
+	if err := s.Update(ctx, k1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		gen  int // document generation the attacker claims
+	}{
+		{"record from an earlier generation", 0},
+		{"generation rolled back with it", snapshot.Generation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := readDoc(t, path)
+			doc.Keys[0] = snapshot.Keys[0] // verbatim, exactly as keysmith sealed it
+			if tc.gen != 0 {
+				doc.Generation = tc.gen
+			}
+			writeDoc(t, path, doc)
+
+			s2, err := OpenFileStore(ctx, path, kek)
+			if err == nil {
+				got, _ := s2.Get(ctx, k1.ID)
+				s2.Close()
+				t.Fatalf("record replay resurrected a retired key as %q", got.State)
+			}
+		})
+	}
+}
+
+// TestFileStoreV1LoadsAndUpgrades pins the migration: an existing v1 keystore
+// must open with no env var and no operator step (bricking the platform's only
+// signer on deploy is worse than the residual hole), and must be rewritten at v2
+// so the old, forgeable form does not survive the start that read it.
+func TestFileStoreV1LoadsAndUpgrades(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "keys.json")
+	kek := testKEK(t)
+	now := time.Now().UTC()
+
+	k, err := newKey(jose.AlgEdDSA, 2048, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k.State, k.PromotedAt = StateActive, now
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(k.Private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, wrapped, err := envelopeSeal(ctx, kek, pkcs8, aad(k.ID, k.Alg)) // v1 AAD
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubJWK, err := jose.PublicJWK(k.VerificationKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDoc(t, path, fileDoc{Version: 1, Keys: []fileRecord{{
+		ID: k.ID, Alg: string(k.Alg), State: string(k.State),
+		CreatedAt: k.CreatedAt, PromotedAt: k.PromotedAt,
+		KEKID: kek.ID(), WrappedDEK: wrapped, PrivateCT: ct, PublicJWK: pubJWK,
+	}}})
+
+	s, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatalf("v1 keystore does not open — this bricks live deployments: %v", err)
+	}
+	got, err := s.Get(ctx, k.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateActive || !got.PromotedAt.Equal(k.PromotedAt) {
+		t.Fatalf("v1 metadata lost on upgrade: %+v", got)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if v := readDoc(t, path).Version; v != fileVersion {
+		t.Fatalf("document left at version %d, want %d", v, fileVersion)
+	}
+	// And now the lifecycle fields are authenticated.
+	doc := readDoc(t, path)
+	doc.Keys[0].State = string(StateRetired)
+	writeDoc(t, path, doc)
+	if s2, err := OpenFileStore(ctx, path, kek); err == nil {
+		s2.Close()
+		t.Fatal("state edit accepted after the v2 upgrade")
+	}
+}
+
+// TestPersistDoesNotReuseAGenerationAfterDirSyncFailure: persist renames the new
+// document into place and only then fsyncs the directory. If that fsync fails,
+// the write is reported as an error and Put/Update roll their in-memory mutation
+// back — but the document carrying generation `next` is already on disk. Leaving
+// the counter behind seals the next, *different* record set under that same
+// generation, and two documents sharing a generation re-open the record splice
+// the generation was added to prevent.
+func TestPersistDoesNotReuseAGenerationAfterDirSyncFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the fsync cannot be made to fail")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	kek := testKEK(t)
+	s, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	mkKey := func() Key {
+		t.Helper()
+		k, err := newKey(jose.AlgEdDSA, 2048, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	if err := s.Put(ctx, mkKey()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write and execute but not read: CreateTemp and Rename still work,
+	// os.Open(dir) for the fsync does not.
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if err := s.Put(ctx, mkKey()); err == nil {
+		t.Fatal("directory fsync failure was not reported to the caller")
+	}
+	orphan := readDoc(t, path).Generation
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Put(ctx, mkKey()); err != nil {
+		t.Fatal(err)
+	}
+	if got := readDoc(t, path).Generation; got == orphan {
+		t.Fatalf("generation %d reused: the orphaned document and the live one carry the same generation, "+
+			"so a record from one splices into the other with a matching AAD", got)
+	}
+}
+
+func TestOpenFileStoreRejectsCorruptDocuments(t *testing.T) {
+	ctx := context.Background()
+	kek := testKEK(t)
+
+	newStore := func(t *testing.T) (string, fileDoc) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "keys.json")
+		s, err := OpenFileStore(ctx, path, kek)
+		if err != nil {
+			t.Fatal(err)
+		}
+		k, err := newKey(jose.AlgEdDSA, 2048, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		k.State = StateActive
+		if err := s.Put(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return path, readDoc(t, path)
+	}
+
+	t.Run("duplicate record", func(t *testing.T) {
+		// A duplicated record yields a one-entry map with a two-entry order,
+		// so List returns the key twice and every VerificationSet call fails
+		// on a duplicate kid — permanently, and across restarts.
+		path, doc := newStore(t)
+		doc.Keys = append(doc.Keys, doc.Keys[0])
+		writeDoc(t, path, doc)
+		s, err := OpenFileStore(ctx, path, kek)
+		if err == nil {
+			s.Close()
+			t.Fatal("duplicate key record accepted")
+		}
+		if !errors.Is(err, ErrDuplicate) {
+			t.Errorf("want ErrDuplicate, got %v", err)
+		}
+	})
+
+	t.Run("unknown document version", func(t *testing.T) {
+		path, doc := newStore(t)
+		doc.Version = fileVersion + 1
+		writeDoc(t, path, doc)
+		s, err := OpenFileStore(ctx, path, kek)
+		if err == nil {
+			s.Close()
+			t.Fatal("future document version accepted")
+		}
+	})
+}
+
+func TestFileStoreRefusesASecondWriter(t *testing.T) {
+	// Two writers against one file is silent key loss: each persist() replays
+	// that process's whole in-memory snapshot over the other's writes.
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "keys.json")
+	kek := testKEK(t)
+	s1, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+	if s2, err := OpenFileStore(ctx, path, kek); err == nil {
+		s2.Close()
+		t.Fatal("a second writer opened the same keystore")
+	}
+	// Released on Close, so a restart is not locked out by its own predecessor.
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s3, err := OpenFileStore(ctx, path, kek)
+	if err != nil {
+		t.Fatalf("lock not released on Close: %v", err)
+	}
+	s3.Close()
 }
 
 func TestLocalKEKValidation(t *testing.T) {
@@ -295,6 +656,9 @@ func TestManagerOnFileStore(t *testing.T) {
 	}
 
 	// "Restart": new store + manager over the same file and clock.
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
 	s2, err := OpenFileStore(ctx, path, kek)
 	if err != nil {
 		t.Fatal(err)

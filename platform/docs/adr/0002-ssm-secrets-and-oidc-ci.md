@@ -26,29 +26,28 @@ of one service leaks that service's secrets only.
 OIDC (`permissions: id-token: write`). There are no `AWS_ACCESS_KEY_ID`
 repository secrets to leak, rotate, or gitleaks-scan for.
 
-One-time setup:
+Setup:
 
-1. IAM → Identity providers → add `token.actions.githubusercontent.com`
-   (audience `sts.amazonaws.com`).
-2. Role `meridian-ci`, trust policy:
+1. The OIDC provider (`token.actions.githubusercontent.com`, audience
+   `sts.amazonaws.com`), the `meridian-ci` role, its trust policy and its
+   permissions are **all created by `terraform/envs/dev/ci.tf`** — that file is
+   the only source of truth for them, so this ADR deliberately does not repeat
+   the JSON for someone to paste and drift from.
 
-   ```json
-   {
-     "Effect": "Allow",
-     "Principal": { "Federated": "arn:aws:iam::<acct>:oidc-provider/token.actions.githubusercontent.com" },
-     "Action": "sts:AssumeRoleWithWebIdentity",
-     "Condition": {
-       "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-       "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<owner>/portfolio:ref:refs/tags/*" }
-     }
-   }
-   ```
+   The trust policy's `sub` condition is a `StringLike` on
+   `repo:${var.github_repository}:ref:refs/tags/*` — tag pushes on this
+   repository, nothing else. `var.github_repository` defaults to the real
+   repository in `envs/dev/variables.tf`; the branch subject is deliberately
+   absent, because release.yml is the only consumer and it triggers on tags.
 
    Permissions: ECR push to `meridian/*` repos; `ecs:DescribeTaskDefinition`,
    `ecs:RegisterTaskDefinition`, `ecs:UpdateService`, `ecs:DescribeServices`
    on the `meridian-dev` cluster; `iam:PassRole` restricted to the
-   `meridian-dev-*-task` / `-execution` roles.
-3. Repo **secrets** `AWS_ROLE_ARN` and `ECR_REGISTRY`; repo **variable**
+   `meridian-dev-*-task` / `-execution` roles (the two suffixes
+   `modules/service` creates — not the bare environment prefix, which would
+   enrol every future role in the account into what CI may pass).
+2. Repo **secrets** `AWS_ROLE_ARN` (`terraform output ci_role_arn`) and
+   `ECR_REGISTRY`; repo **variable**
    `AWS_REGION`. The first two embed the AWS account id, and repository
    variables are interpolated into workflow logs verbatim while secrets are
    masked — on a public repo that is the difference between publishing the

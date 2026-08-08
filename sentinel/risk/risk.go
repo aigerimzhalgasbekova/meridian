@@ -27,11 +27,18 @@ package risk
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"sync"
 	"time"
 )
+
+// baselineTTL is how long an idle account keeps its device/geo baseline.
+// Expiry has to do the ordinary reclamation work so that capacity eviction —
+// which destroys exactly the history impossible_travel and new_device need —
+// stays the rare last resort rather than the steady state above MaxAccounts.
+const baselineTTL = 30 * 24 * time.Hour
 
 // Action is the decision band a score falls into.
 type Action string
@@ -140,6 +147,10 @@ type Engine struct {
 	retention time.Duration
 	// maxAccounts bounds the account map (default 50k).
 	maxAccounts int
+	// evictedBaselines counts histories dropped by the last-resort pass of
+	// reclaim — accounts whose device/geo signals are now blind. Non-zero
+	// means MaxAccounts is undersized for the user base.
+	evictedBaselines uint64
 }
 
 // Config assembles an Engine.
@@ -158,6 +169,13 @@ type Config struct {
 	// usernames — so without a cap a stuffing run walking fresh usernames is
 	// an OOM, and sentinel restarting loses every rate-limit window and
 	// lockout it holds. Mirrors lockout.Policy.MaxKeys.
+	//
+	// Sizing rule: in a healthy deployment the steady state is one entry per
+	// real user active within baselineTTL, so set this above your active-user
+	// count. Below it, eviction starts destroying live device/geo baselines —
+	// blinding impossible_travel and new_device for a rotating 10% of
+	// accounts. That is logged ("evicted histories with a live device/geo
+	// baseline"); a non-zero count means this value is too small.
 	MaxAccounts int
 }
 
@@ -273,9 +291,11 @@ func (e *Engine) snapshot(account string, now time.Time) History {
 // walks a fresh username per attempt, so every entry is young and a time-based
 // sweep reclaims nothing until the burst is long over. Histories with nothing
 // left in the retention window go first, then those that never saw a
-// successful login — those are bare failure counters. A history with a
-// device/geo baseline is what the signals actually need, so it goes last, and
-// only because an unbounded map is the worse failure.
+// successful login — those are bare failure counters, then baselines idle
+// past baselineTTL. A live baseline is what the signals actually need, so it
+// goes last, and only because an unbounded map is the worse failure — and it
+// is counted and logged, because a decision made blind must not look like a
+// decision made clean.
 //
 // Reclaiming to a low-water mark rather than to one free slot amortizes the
 // O(n) scan over the headroom it frees, as in lockout.reclaim.
@@ -284,19 +304,31 @@ func (e *Engine) reclaim(now time.Time) {
 		return
 	}
 	lowWater := e.maxAccounts - e.maxAccounts/10
-	for _, pass := range []func(*History) bool{
+	passes := []func(*History) bool{
 		func(h *History) bool { e.prune(h, now); return len(h.Attempts) == 0 && h.LastSeen.IsZero() },
 		func(h *History) bool { return h.LastSeen.IsZero() },
+		func(h *History) bool { return !h.LastSeen.IsZero() && now.Sub(h.LastSeen) > baselineTTL },
 		func(*History) bool { return true },
-	} {
+	}
+	lost := 0
+done:
+	for i, pass := range passes {
 		for k, h := range e.accounts {
 			if len(e.accounts) <= lowWater {
-				return
+				break done
 			}
 			if pass(h) {
 				delete(e.accounts, k)
+				if i == len(passes)-1 {
+					lost++
+				}
 			}
 		}
+	}
+	if lost > 0 {
+		e.evictedBaselines += uint64(lost)
+		slog.Warn("risk: account map at capacity, evicted histories with a live device/geo baseline",
+			"evicted", lost, "total", e.evictedBaselines, "max_accounts", e.maxAccounts)
 	}
 }
 

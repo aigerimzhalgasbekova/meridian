@@ -3,8 +3,10 @@ terraform {
 
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.80"
+      source = "hashicorp/aws"
+      # Matches the committed .terraform.lock.hcl (5.100.0). The lock is the
+      # real control — this constraint just keeps the two from diverging.
+      version = "~> 5.100"
     }
   }
 

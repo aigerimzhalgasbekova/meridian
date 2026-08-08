@@ -14,7 +14,11 @@
 // construction: no "none", no HMAC, mandatory kid, the key set (never the
 // token) decides the algorithm. On top of that this package enforces the
 // RP-side checks OIDC Core §3.1.3.7 demands: exact issuer match, audience
-// contains our client_id, expiry, and nonce binding to the login flow.
+// contains our client_id, azp naming us whenever it is present or aud is
+// multi-valued (rules 4-5), expiry, and nonce binding to the login flow. A
+// token with no sub is refused outright — (provider, subject) is the whole
+// identity model, so an absent subject is not a degraded login, it is a
+// cross-account merge waiting to happen.
 // The algorithm allowlist for upstream tokens is RS256 and ES256 — what
 // Google and Entra ID actually sign with.
 //
@@ -125,6 +129,8 @@ var (
 	ErrNonceMismatch   = errors.New("provider: ID token nonce does not match the login flow")
 	ErrTenantRejected  = errors.New("provider: token tenant is not in the allowed tenant list")
 	ErrKeysUnavailable = errors.New("provider: no JWKS available and refresh failed")
+	ErrMissingSubject  = errors.New("provider: ID token has no sub claim")
+	ErrAzpMismatch     = errors.New("provider: ID token azp does not name this client")
 )
 
 // upstreamAlgs is the signature-algorithm allowlist for upstream ID tokens.
@@ -425,8 +431,16 @@ func (p *Provider) Exchange(ctx context.Context, code, codeVerifier, redirectURI
 			return err
 		}
 		if resp.StatusCode != http.StatusOK {
+			// The body goes into an error that gets logged. A real IdP sends a
+			// few bytes of JSON; a proxy or captive portal in front of a dead
+			// token endpoint sends an HTML page, and maxBody is 1 MiB — so keep
+			// only enough to diagnose, per failed callback.
+			body := strings.TrimSpace(string(raw))
+			if len(body) > 512 {
+				body = strings.ToValidUTF8(body[:512], "") + "…"
+			}
 			return fmt.Errorf("provider %s: token exchange: %s: %s",
-				p.cfg.Name, resp.Status, strings.TrimSpace(string(raw)))
+				p.cfg.Name, resp.Status, body)
 		}
 		var out struct {
 			IDToken string `json:"id_token"`
@@ -470,6 +484,23 @@ func (p *Provider) VerifyIDToken(ctx context.Context, idToken, nonce string) (jo
 	}
 	if err := p.checkIssuer(claims); err != nil {
 		return jose.Claims{}, err
+	}
+	// OIDC Core §3.1.3.7 rules 4-5: when aud carries more than one value, azp
+	// must be present and name us; when azp is present at all it must name us,
+	// whatever aud's arity. jose.Expect{Audience} is membership only, so
+	// without this a token minted for another client that merely *lists* us in
+	// aud would pass.
+	if azp, present := claims.Extra["azp"]; present || len(claims.Audience) > 1 {
+		if s, _ := azp.(string); s != p.cfg.ClientID {
+			return jose.Claims{}, fmt.Errorf("%w: azp %v", ErrAzpMismatch, azp)
+		}
+	}
+	// The whole identity model keys on (provider, subject). OIDC Core §2
+	// guarantees sub exists and is stable, but a non-conformant or
+	// misconfigured upstream that omits it would collapse every one of its
+	// users onto the single identity holding the empty subject.
+	if claims.Subject == "" {
+		return jose.Claims{}, ErrMissingSubject
 	}
 	got, _ := claims.Extra["nonce"].(string)
 	if nonce == "" || got != nonce {

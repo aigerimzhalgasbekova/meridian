@@ -105,6 +105,73 @@ func TestParseJWKSRejectsBadKeys(t *testing.T) {
 			t.Error("duplicate kid accepted")
 		}
 	})
+
+	t.Run("oversized RSA modulus", func(t *testing.T) {
+		// Unbounded above is remote CPU exhaustion: modular exponentiation
+		// cost grows superlinearly and the document stays tiny.
+		n := make([]byte, (MaxRSABits/8)+1)
+		n[0] = 0xff
+		doc, _ := json.Marshal(JWKS{Keys: []JWK{{
+			Kty: "RSA", Kid: "huge", Alg: string(AlgRS256),
+			N: b64.EncodeToString(n),
+			E: b64.EncodeToString([]byte{1, 0, 1}),
+		}}})
+		if _, err := ParseJWKS(doc); err == nil {
+			t.Errorf("RSA key above %d bits accepted", MaxRSABits)
+		}
+	})
+}
+
+func TestParseJWKSKeepsUsableKeys(t *testing.T) {
+	// A key set is heterogeneous by nature and comes from providers we do not
+	// control: one key this profile cannot use must not discard the rest.
+	_, vk := newEdKey(t, "good-1")
+	good, err := PublicJWK(vk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noAlg := good // RFC 7517 makes `alg` optional
+	noAlg.Kid, noAlg.Alg = "no-alg", ""
+	unsupported := good // e.g. an upstream rotating in P-384
+	unsupported.Kid, unsupported.Crv = "p384", "P-384"
+
+	doc, err := json.Marshal(JWKS{Keys: []JWK{noAlg, good, unsupported}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := ParseJWKS(doc)
+	if err != nil {
+		t.Fatalf("one unusable key discarded the whole set: %v", err)
+	}
+	if set.Len() != 1 {
+		t.Errorf("set has %d keys, want 1", set.Len())
+	}
+	if _, err := set.VerificationKey("good-1"); err != nil {
+		t.Errorf("usable key missing: %v", err)
+	}
+	for _, kid := range []string{"no-alg", "p384"} {
+		if _, err := set.VerificationKey(kid); err == nil {
+			t.Errorf("unusable key %q was accepted", kid)
+		}
+	}
+
+	// Zero survivors is still an error: a genuinely broken provider must show.
+	doc, err = json.Marshal(JWKS{Keys: []JWK{noAlg, unsupported}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseJWKS(doc); err == nil {
+		t.Error("a document with no usable keys parsed cleanly")
+	}
+}
+
+func TestPublicJWKRejectsAlgKeyTypeMismatch(t *testing.T) {
+	// The encoder must not emit a JWK its own decoder refuses.
+	_, vk := newEdKey(t, "ed-1")
+	vk.Alg = AlgRS256
+	if _, err := PublicJWK(vk); err == nil {
+		t.Error("Ed25519 key emitted with alg RS256")
+	}
 }
 
 func mustB64(t *testing.T, s string) []byte {

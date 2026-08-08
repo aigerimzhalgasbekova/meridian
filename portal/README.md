@@ -20,7 +20,9 @@ TypeScript throughout: Express API + polling job worker, React/Vite frontend.
   defense (an accepted time-step can never be accepted again); 10 single-use
   recovery codes shown once and stored hashed. ([ADR 0002](docs/adr/0002-hand-rolled-totp.md))
 - **Postgres as a job queue** — `SELECT … FOR UPDATE SKIP LOCKED` claiming,
-  exponential backoff, dead-lettering, idempotent handlers. The in-memory
+  exponential backoff, dead-lettering, owned claims that expire (so a crashed
+  worker's job is reclaimed without a startup requeue that would steal a live
+  one from the second worker every rolling deploy). The in-memory
   implementation mirrors the claim semantics exactly, so the whole pipeline is
   tested without a database. ([ADR 0001](docs/adr/0001-postgres-job-queue.md))
 - **Boring, correct session auth** — httpOnly SameSite=Lax cookies (hashed
@@ -58,7 +60,9 @@ in-code placeholder key must never protect a real database:
 Re-applying `schema.sql` also lower-cases `users.email` and adds the check
 constraint that keeps it that way. If the backfill trips the unique index, two
 accounts differ only by case: keep one, migrate its data, delete the other,
-re-run.
+re-run. It also adds `jobs.claimed_at` and widens the claim index on existing
+installs; rows already `running` keep a null `claimed_at` and are reaped via
+`COALESCE(claimed_at, run_at)`, so nothing is stranded mid-upgrade.
 
 ```sh
 psql "$DATABASE_URL" -f server/schema.sql
@@ -92,7 +96,10 @@ SKIP LOCKED concurrency) is skipped when `TEST_DATABASE_URL` is unset.
 ## Seams left for the platform
 
 - **Mail:** `MailTransport` is one method; production drops in an SES (or SMTP)
-  implementation keyed the same way — handlers stay idempotent per job id.
+  implementation. Idempotency does *not* come free with it: today it is the dev
+  outbox overwriting `outbox/<job-id>.json`, so a real transport must carry its
+  own (see [ADR 0001](docs/adr/0001-postgres-job-queue.md)) or a retry is a
+  second token-bearing email.
 - **Rate limiting:** the in-memory fixed-window limiter is per-process; the
   platform's `sentinel` decision API replaces that middleware for distributed
   limiting.

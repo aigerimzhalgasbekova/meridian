@@ -26,13 +26,13 @@ data "aws_iam_policy_document" "ci_trust" {
       values   = ["sts.amazonaws.com"]
     }
     condition {
-      # Tags and main only — a PR from a fork can never assume this role.
+      # Tags only — release.yml is the sole consumer and triggers on tag push,
+      # so nothing needs a branch subject. Keeping refs/heads/main here would
+      # silently hand deploy rights to any future main-triggered workflow that
+      # adds `id-token: write`.
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values = [
-        "repo:${var.github_repository}:ref:refs/tags/*",
-        "repo:${var.github_repository}:ref:refs/heads/main",
-      ]
+      values   = ["repo:${var.github_repository}:ref:refs/tags/*"]
     }
   }
 }
@@ -72,10 +72,19 @@ data "aws_iam_policy_document" "ci_permissions" {
     }
   }
   statement {
-    # Task-definition re-registration passes the existing roles through.
-    sid       = "PassTaskRoles"
-    actions   = ["iam:PassRole"]
-    resources = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.name}-*"]
+    # Task-definition re-registration passes the existing roles through — the
+    # exact roles modules/service creates for the services in local.services,
+    # named individually rather than wildcarded. `${local.name}-*-task` would
+    # still auto-enrol any future task role (a migration runner, a backup job)
+    # into what CI may pass, with no policy change and no review signal.
+    sid     = "PassTaskRoles"
+    actions = ["iam:PassRole"]
+    resources = flatten([
+      for s in local.services : [
+        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.name}-${s}-task",
+        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.name}-${s}-execution",
+      ]
+    ])
     condition {
       test     = "StringEquals"
       variable = "iam:PassedToService"

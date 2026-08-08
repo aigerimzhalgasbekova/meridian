@@ -38,12 +38,22 @@ sessiond), never end users or the public internet.
 - Whole-file rewrite is detectable only via external anchoring: anchor
   records are the mount point for KMS/WORM/RFC 3161 notarization (documented,
   not wired — no cloud account in this environment).
+- Residual, narrower than a whole-file rewrite: only the *last* anchor is
+  cross-checked, so records after it are unvouched — an attacker with write
+  access to the log can delete them and append fabricated ones, and both
+  verifiers still report the chain intact. The window is `AnchorEvery`
+  records wide (100 in production) and is now reported as
+  `unvouched_records` / a "NOTE:" line rather than left silent. External
+  anchoring closes it; nothing in-process can, because the chain is unkeyed
+  and the sidecar shares the log's owner and mode.
 
 ### Denial of service
 - **Against victims via lockout** — the signature abuse case. Account lockout
-  is capped at 15m; unbounded escalation lives only in the attacker-owned IP
-  dimension; ChallengeHook seam moves repeat offenses to CAPTCHA/step-up
-  instead of longer locks (ADR 0002).
+  is capped at 15m; the long 24h escalation lives only in the IP dimension,
+  which is mostly but not only the attacker's own address — a shared egress is
+  kept out of it by a 10x threshold counted per hour rather than cumulatively
+  (ADR 0002); ChallengeHook seam moves repeat offenses to CAPTCHA/step-up
+  instead of longer locks.
 - **Against sentinel itself** — O(1) state per rate-limit key, amortized
   sweeping of stale keys, 1 MiB request-body cap, read/write timeouts.
   Residual: unbounded distinct-key cardinality from a spoofed-IP flood is
@@ -54,6 +64,9 @@ sessiond), never end users or the public internet.
 - Denied requests still count toward limits (no free retries).
 - Success during an active lockout does not unlock — a stolen password does
   not convert a lockout into a free pass.
+- Success never clears the IP counter, locked or not: a sprayer must not be
+  able to wipe it by logging into an account they control. The hourly window
+  roll bounds it instead.
 - Unknown rate-limit class is a hard error, not "unlimited" (typo-safe).
 
 ### Evading risk signals

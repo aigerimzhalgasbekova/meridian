@@ -91,9 +91,19 @@ hardened set costed above. Everything else in the stack is identical.
 | AWS Budgets alert | **created in both** | **created in both** |
 
 Dropping the NAT/WAF/Insights puts the running `dev` footprint near ~$130/mo;
-the largest remaining line is Fargate, tunable via `desired_count`. A monthly
-AWS Budget (`monthly_budget_usd`, default 200) emails `alarm_email` at 80% and
-100% actual and 100% forecast spend, in both profiles.
+the largest remaining line is Fargate, sized by `desired_count`/`min_count`.
+Both are in `ignore_changes` (see day-2 pause/resume), so editing them in
+tfvars is a **no-op on apply** — resize the running stack directly:
+
+```sh
+aws ecs update-service --cluster meridian-dev --service <name> --desired-count N
+aws application-autoscaling register-scalable-target --service-namespace ecs \
+  --resource-id "service/meridian-dev/<name>" \
+  --scalable-dimension ecs:service:DesiredCount --min-capacity N
+```
+
+A monthly AWS Budget (`monthly_budget_usd`, default 200) emails `alarm_email`
+at 80% and 100% actual and 100% forecast spend, in both profiles.
 
 > **State is per-directory, not per-`environment`.** This directory (`envs/dev`)
 > holds the dev state (backend key `envs/dev/terraform.tfstate`). Do **not**
@@ -148,7 +158,14 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
    aws ssm put-parameter --type SecureString --name $P/bridge/BRIDGE_GOOGLE_CLIENT_ID     --value "<from Google console>"
    aws ssm put-parameter --type SecureString --name $P/bridge/BRIDGE_GOOGLE_CLIENT_SECRET --value "<from Google console>"
    aws ssm put-parameter --type SecureString --name $P/console/CONSOLE_HS256_KEY       --value "$(openssl rand -hex 32)"
+   # 32 decoded bytes: portal refuses to start against a real database without it.
+   aws ssm put-parameter --type SecureString --name $P/portal/PORTAL_TOTP_KEK        --value "$(openssl rand -base64 32)"
    ```
+
+   > Every parameter a task definition names must exist before that service can
+   > start — ECS fails the task with `ResourceInitializationError: unable to
+   > pull secrets` before the image ever runs. When you add a `secrets` entry in
+   > `envs/dev/main.tf`, add its `put-parameter` here in the same change.
 
 4. **Apply** — `cd terraform/envs/dev && terraform init -backend-config=backend.hcl
    && terraform plan && terraform apply`. Tasks will crash-loop until steps 5–7 complete; ECS keeps
@@ -162,10 +179,9 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
    > `aws ecs update-service --cluster meridian-dev --service <name> --task-definition meridian-dev-<name> --force-new-deployment`
    > (naming the family without a revision picks the latest).
 5. **Database bootstrap** — read the master password from the Secrets Manager
-   ARN in `terraform output postgres_master_secret_arn`, then (via a bastion
-   task or `aws ecs execute-command` helper container):
-   `CREATE DATABASE portal;` and apply `portal/server/schema.sql` to it
-   (idp migrates its own database on boot). Write the DSNs:
+   ARN in `terraform output postgres_master_secret_arn`, write both DSNs, then
+   create the `portal` database and apply its schema (idp migrates its own
+   database on boot).
 
    > This database and its schema live **outside Terraform state**. Only `idp`
    > is a managed `db_name`; nothing detects drift on `portal`, and replacing
@@ -184,10 +200,42 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
      --value "postgres://meridian:<pw>@<postgres_endpoint>:5432/portal?sslmode=require"
    ```
 
-6. **CI federation** — create the GitHub OIDC provider + `meridian-ci` role
-   (see `docs/adr/0002-ssm-secrets-and-oidc-ci.md`), set repo secrets
-   `AWS_ROLE_ARN` and `ECR_REGISTRY` (both embed the account id, so they are
-   secrets rather than variables) and repo variable `AWS_REGION`.
+   RDS is not publicly accessible and its security group admits only the idp
+   and portal task SGs, so there is no path to it from a laptop and no bastion
+   to build. Run one throwaway task off the portal task definition instead —
+   the portal image already carries `node`, `pg` and `server/schema.sql`, and
+   the portal SG is already permitted to reach 5432. From `terraform/envs/dev`:
+
+   ```sh
+   BOOT='const pg=require("pg"),fs=require("fs");
+   const u=new URL(process.env.DATABASE_URL),db=u.pathname.slice(1);u.pathname="/postgres";
+   (async()=>{const a=new pg.Client({connectionString:u.href});await a.connect();
+   try{await a.query(`CREATE DATABASE ${db}`)}catch(e){if(e.code!=="42P04")throw e}
+   await a.end();const b=new pg.Client({connectionString:process.env.DATABASE_URL});
+   await b.connect();await b.query(fs.readFileSync("server/schema.sql","utf8"));
+   await b.end();console.log("portal database ready")})()'
+
+   aws ecs run-task --cluster meridian-dev --launch-type FARGATE \
+     --task-definition meridian-dev-portal \
+     --network-configuration "$(terraform output -raw portal_run_task_network)" \
+     --overrides "$(jq -n --arg s "$BOOT" \
+       '{containerOverrides:[{name:"portal",command:["node","-e",$s]}]}')"
+   ```
+
+   Safe to re-run after an RDS replacement: `42P04` (database exists) is
+   swallowed, and against an already-populated database the schema apply aborts
+   on `42P07` (`jobs_claim_idx` exists) inside its implicit transaction, so it
+   changes nothing. Check the result in the task's log stream under
+   `/ecs/meridian-dev-portal`. The portal service crash-loops until this
+   succeeds and then comes up on its own retry — no manual roll needed.
+
+6. **CI federation** — `terraform/envs/dev/ci.tf` already created the GitHub
+   OIDC provider and the `meridian-ci` role in step 4; do not hand-build them.
+   All that remains is wiring GitHub to it: set repo secrets `AWS_ROLE_ARN`
+   (`terraform output ci_role_arn`) and `ECR_REGISTRY` (both embed the account
+   id, so they are secrets rather than variables) and repo variable
+   `AWS_REGION`. The trust policy is built from `var.github_repository` — see
+   `docs/adr/0002-ssm-secrets-and-oidc-ci.md` for why.
 7. **First release** — `git tag v0.1.0 && git push --tags`. release.yml builds
    and pushes all seven images (`:v0.1.0` + `:dev`) and rolls the services.
 8. **DNS records** — CNAME `idp/sso/portal/console.meridian.example.com` to
@@ -206,9 +254,19 @@ verified — what remains is the out-of-band setup Terraform can't do for you.
   sizing); paused it drops to ~$1.5-2/day (ALB, Redis, WAF and storage keep
   billing) while the CloudFront site stays up.
   `scripts/pause.sh` scales all seven services to 0 (autoscaling floor first,
-  or it fights back) and stops RDS; `scripts/resume.sh` brings it all back in
-  ~5 min. AWS auto-restarts a stopped RDS after 7 days — re-run `pause.sh`
-  weekly if idle longer.
+  or it fights back), silences the `*-no-healthy-hosts` alarms (they page
+  on missing data by design, which a pause would trip continuously) and stops
+  RDS; `scripts/resume.sh` reverses all three in ~5 min. AWS auto-restarts a
+  stopped RDS after 7 days — re-run `pause.sh` weekly if idle longer.
+  `terraform apply` will not undo a pause: the service module holds
+  `desired_count` and the autoscaling `min_capacity` in `ignore_changes`, and
+  the observability module does the same for the down-detectors'
+  `actions_enabled`, precisely so an unrelated apply cannot silently resume the
+  bill or re-arm the alarms mid-pause. The flip side is that editing
+  `desired_count`/`min_count` in tfvars is a no-op — see the sizing note above.
+  `resume.sh` bounces those alarms to `INSUFFICIENT_DATA` after re-arming them,
+  because CloudWatch only invokes an action on a state *transition*: a stack
+  that never came back is already in ALARM and would page nobody.
 - **Smoke after any change** — `MERIDIAN_DOMAIN=<domain> scripts/live-smoke.sh`.
 - **Rolling a service after Terraform env/secret changes** — the service
   module sets `ignore_changes = [task_definition]` so CI releases don't fight

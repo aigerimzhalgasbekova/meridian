@@ -40,6 +40,8 @@ verifier through the same one-method interface. This is documented, not hidden.
 |---|---|
 | Privilege escalation via role creation | `roles:write` demanded at **global** scope; realm-admins denied (tested) |
 | Realm-admin escaping their realm | Assignment writes checked at the scope being granted; user/session ops checked at the target's realm (tested) |
+| Reading another realm's privilege map | List routes filter results, not just the gate: `/v1/users` by realm, `/v1/assignments` by readable scope, `/v1/authz/explain` drops out-of-scope trace entries (tested) |
+| Cross-realm target enumeration (403 vs 404 oracle) | The realm-derived scope forces lookup-before-check, so a miss answers 404 only to a caller authorized for *every* target: allowed at global **and** not carved out by a realm-scoped deny in any realm they hold (a global allow alone is not enough — deny > allow, and a realm assignment does not cover a global check, so a carve-out holder would 404 on a miss and 403 on a hit in that realm). Everyone else gets a 403 whose body names neither the scope nor the decision, so a miss and a cross-realm hit are byte-identical, and the probe is audited (tested). The denial event records a fixed `global` scope rather than the scope checked, for the same reason: the carve-out holder routed into the 403 branch usually holds `audit:read` globally, so a per-branch scope would hand her back the distinction (and the target's realm) in her own rows — the event's `target` still names the probed id. These three routes are the only ones that give up the explanation trace — it *is* the oracle here. **Residual**: `GET /v1/users/{id}/sessions` is a read, so its denials are not audited — a scan confined to that route leaves no trail |
 | Deny bypass via a second role/assignment | Deny > allow across all assignments and chains (tested) |
 | Inheritance cycle → evaluation hang | Cycles rejected at definition time; evaluation never detects, it assumes |
 | Wildcard over-grant (`*:read`) | Pattern rejected at validation; queries must be concrete |
@@ -50,7 +52,8 @@ verifier through the same one-method interface. This is documented, not hidden.
 
 | Threat | Mitigation / residual risk |
 |---|---|
-| Denied attempts invisible | Both outcomes of every mutation are appended |
+| Denied attempts invisible | Every mutation appends its outcome — the denial at the gate, including probes at targets that do not exist. **Residual**: an *authorized* attempt that then fails appends nothing at all — a probe that 404s, a target that vanishes before the write, an unknown role (400), a built-in role deletion (409). Nothing happened, so the trail is silent; it records outcomes, not intents. A caller who is already authorized learns nothing from these that the read routes would not tell them |
+| Trail says "allowed" for a mutation that never landed | The denial is recorded at the gate; the success only after the store reports the change landed, so `allowed: true` means it took effect — including when the target vanishes between the lookup and the write. Role writes carry their grants/denies in `detail` |
 | Trail tampering | **Residual in dev**: in-memory slice, no integrity. Production seam is sentinel's hash-chained store |
 | Trail exhaustion (memory) | Residual: unbounded slice in dev; acceptable for demo, bounded/offloaded in production |
 
@@ -59,15 +62,21 @@ verifier through the same one-method interface. This is documented, not hidden.
 - JSON bodies capped at 1 MiB (`http.MaxBytesReader`), unknown fields rejected.
 - Error envelope never echoes internals; store errors map to generic 500s.
 - `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy:
-  no-referrer`, `Cache-Control: no-store` on every response.
-- Panics are recovered, logged with a request ID, and answered 500 without a stack.
+  no-referrer`, `Cache-Control: no-store`, and a `Content-Security-Policy` on every
+  response — API *and* SPA assets: `cmd/consoled` wraps the composed handler, because
+  the SPA file server does not route through the API's middleware.
+- Panics are recovered, logged with a request ID, and answered 500 without a stack. If
+  the response was already committed the body is left intact rather than having an
+  error envelope appended to it — the client keeps the status it saw.
 
 ### SPA
 
 - No secrets at build time; token entered/selected at runtime, held in
   `localStorage`. Residual risk: XSS in the SPA could read it — mitigated by React's
-  default escaping and zero use of `dangerouslySetInnerHTML`; accepted for an admin
-  tool on a trusted origin.
+  default escaping and zero use of `dangerouslySetInnerHTML`, with a restrictive CSP
+  (`default-src 'self'`, no inline script/style, `object-src`/`base-uri`/
+  `frame-ancestors 'none'`) behind it so source-code discipline is not the only
+  control; residual risk accepted for an admin tool on a trusted origin.
 - `/v1/dev/tokens` exists **only** when `CONSOLE_DEV_MODE=1`; it is the documented
   demo backdoor and must never be set in production.
 

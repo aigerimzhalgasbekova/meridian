@@ -55,27 +55,44 @@ function generateRecoveryCodes(): { raw: string[]; hashes: string[] } {
   return { raw, hashes: raw.map(hashToken) };
 }
 
-function meBody(user: User, session: Session) {
-  return {
-    user: {
-      email: user.email,
-      emailVerified: user.emailVerified,
-      pendingEmail: user.pendingEmail,
-      totpEnabled: user.totpSecret !== null,
-    },
-    csrfToken: session.csrfToken,
-    mfaPending: session.mfaPending,
-  };
-}
-
 export function createApp(ctx: AppContext): Express {
   const { store, queue, config } = ctx;
+
+  async function meBody(user: User, session: Session) {
+    return {
+      user: {
+        email: user.email,
+        emailVerified: user.emailVerified,
+        pendingEmail: user.pendingEmail,
+        totpEnabled: user.totpSecret !== null,
+        // Without this the last recovery code is spent silently and the account
+        // is only discovered to be unrecoverable at the moment it matters.
+        recoveryCodesRemaining: user.totpSecret ? await store.recoveryCodes.countUnused(user.id) : 0,
+      },
+      csrfToken: session.csrfToken,
+      mfaPending: session.mfaPending,
+    };
+  }
+
   const app = express();
   // Trust exactly one hop, so `req.ip` is the address the load balancer
   // observed rather than the balancer itself — otherwise the rate limiter
   // buckets the whole internet together. Everything left of that last hop
   // is client-supplied and stays untrusted.
   if (config.trustProxy) app.set('trust proxy', 1);
+  // Mailed tokens live in the fragment, which a browser never puts in a
+  // Referer anyway; this covers the rest (a stray link on /security leaking
+  // the path a session was on). Mirrors idp/internal/server/middleware.go.
+  // X-Frame-Options because /security hosts state-changing forms (session
+  // revoke, email change); a framed click is a nuisance rather than a takeover
+  // since every destructive action re-authenticates, but DENY is one line.
+  // ponytail: no CSP — the SPA bundle needs its own audit first.
+  app.use((_req, res, next) => {
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    next();
+  });
   app.get('/healthz', (_req, res) => {
     res.json({ ok: true });
   });
@@ -99,6 +116,12 @@ export function createApp(ctx: AppContext): Express {
     return session;
   }
 
+  // All three mailed links below carry the token in the URL FRAGMENT, never
+  // the query string. A fragment is not transmitted to the server, so it
+  // cannot reach the ALB access log (platform/terraform/envs/dev/main.tf) or a
+  // Referer header. That matters most for /reset: the token is still live when
+  // the page loads — it is spent later, by POST /api/auth/reset — so a logged
+  // query string is a 15-minute account-takeover window.
   async function sendVerifyEmail(userId: string, address: string): Promise<void> {
     const { token, hash } = newToken();
     await store.tokens.create({
@@ -111,7 +134,7 @@ export function createApp(ctx: AppContext): Express {
     await queue.enqueue(SEND_EMAIL, {
       to: address,
       subject: `Verify your ${config.issuer} email address`,
-      text: `Confirm this address by opening:\n\n${config.baseUrl}/verify-email?token=${token}\n\nThis link expires in ${Math.round(config.verifyTokenTtlMs / 3_600_000)} hours.`,
+      text: `Confirm this address by opening:\n\n${config.baseUrl}/verify-email#token=${token}\n\nThis link expires in ${Math.round(config.verifyTokenTtlMs / 3_600_000)} hours.`,
     }, { runAt: ctx.now() });
   }
 
@@ -127,7 +150,51 @@ export function createApp(ctx: AppContext): Express {
     await queue.enqueue(SEND_EMAIL, {
       to: address,
       subject,
-      text: `${lead}\n\n${config.baseUrl}/reset?token=${token}\n\nThis link expires in ${Math.round(config.resetTokenTtlMs / 60_000)} minutes and can be used once.`,
+      text: `${lead}\n\n${config.baseUrl}/reset#token=${token}\n\nThis link expires in ${Math.round(config.resetTokenTtlMs / 60_000)} minutes and can be used once.`,
+    }, { runAt: ctx.now() });
+  }
+
+  /**
+   * Sent the moment a second factor is activated. Password re-auth on /setup
+   * only stops an attacker who stole the cookie alone; one who phished or
+   * stuffed the *password* passes it, enrolls their own authenticator, and the
+   * owner's own remedy (reset the password, log in) then lands on an
+   * mfaPending session — which requireAuth rejects, so /totp/disable is out of
+   * reach and the account is gone. This link is the escape: it lives in the
+   * inbox, and an inbox-only attacker gains nothing from it (revoking a factor
+   * is never satisfying one).
+   */
+  async function sendUndoTotpEmail(userId: string, address: string): Promise<void> {
+    const { token, hash } = newToken();
+    await store.tokens.create({
+      userId,
+      purpose: 'undo_totp',
+      tokenHash: hash,
+      payload: null,
+      // ponytail: reuses the verify-email TTL (24h) rather than adding a knob.
+      expiresAt: new Date(ctx.now().getTime() + config.verifyTokenTtlMs),
+    });
+    await queue.enqueue(SEND_EMAIL, {
+      to: address,
+      subject: `Two-factor authentication was enabled on your ${config.issuer} account`,
+      text: `If this was you, nothing to do — keep your recovery codes safe.\n\nIf it was not, turn the second factor off and then change your password:\n\n${config.baseUrl}/undo-totp#token=${token}\n\nThis link expires in ${Math.round(config.verifyTokenTtlMs / 3_600_000)} hours and can be used once.`,
+    }, { runAt: ctx.now() });
+  }
+
+  /**
+   * Mailed to the address a confirmed change moves *away from*, so the move is
+   * never silent. Deliberately carries no token: a link that restores the login
+   * address is a full account-recovery capability, and mailing it to an address
+   * the account has just stopped using — one that may never have proved receipt
+   * in the first place — hands that capability to whoever reads that inbox. The
+   * remedy for "that was not me" is out-of-band, because by then the password is
+   * known to someone else too.
+   */
+  async function sendEmailChangedNotice(oldAddress: string, newAddress: string): Promise<void> {
+    await queue.enqueue(SEND_EMAIL, {
+      to: oldAddress,
+      subject: `The sign-in address on your ${config.issuer} account was changed`,
+      text: `This account now signs in as ${newAddress} and no longer uses this address.\n\nIf that was not you, whoever did it also knows your password — contact support, because this address can no longer sign in or reset it.`,
     }, { runAt: ctx.now() });
   }
 
@@ -149,6 +216,11 @@ export function createApp(ctx: AppContext): Express {
     await withMinDuration(config.uniformDelayMs, async () => {
       const existing = await store.users.findByEmail(email);
       if (existing) {
+        // withMinDuration is a floor, not a budget: the new-account branch pays
+        // an Argon2id hash and this one would not, so under CPU pressure the
+        // hash outruns the floor and the two branches separate. Pay it on both.
+        // (Not decoyHash(): that memoises and costs nothing after the first call.)
+        await hashPassword(password);
         await sendResetEmail(existing.id, existing.email,
           `Someone tried to create a ${config.issuer} account with your email`,
           'You already have an account with this address. If that was you, sign in — or reset your password by opening:');
@@ -179,7 +251,7 @@ export function createApp(ctx: AppContext): Express {
       return;
     }
     const session = await startSession(res, user.id, user.totpSecret !== null);
-    res.json(meBody(user, session));
+    res.json(await meBody(user, session));
   }));
 
   // TOTP step-up: 6-digit code or a recovery code completes the MFA-pending session.
@@ -206,7 +278,7 @@ export function createApp(ctx: AppContext): Express {
       }
     }
     await store.sessions.update(session.idHash, { mfaPending: false });
-    res.json(meBody(user, { ...session, mfaPending: false }));
+    res.json(await meBody(user, { ...session, mfaPending: false }));
   }));
 
   app.post('/api/auth/logout', requireSession, requireCsrf, wrap(async (req, res) => {
@@ -215,9 +287,9 @@ export function createApp(ctx: AppContext): Express {
     res.json({ ok: true });
   }));
 
-  app.get('/api/me', requireSession, (req, res) => {
-    res.json(meBody(req.user!, req.session!));
-  });
+  app.get('/api/me', requireSession, wrap(async (req, res) => {
+    res.json(await meBody(req.user!, req.session!));
+  }));
 
   // ---- Password reset (enumeration-safe) -------------------------------------
 
@@ -246,7 +318,16 @@ export function createApp(ctx: AppContext): Express {
       return;
     }
     await store.tokens.revokeAllForUser(record.userId, 'password_reset');
-    await store.users.update(record.userId, { passwordHash: await hashPassword(password) });
+    // A reset is the documented remedy for a compromised account, so it must
+    // also kill the capabilities an attacker extracted while holding a session.
+    // A queued email change is one: verify-email needs no session, so an
+    // outstanding change token would still flip the login address to theirs
+    // (24h TTL) long after the reset destroyed their session. Clearing
+    // pendingEmail is what cancels it — /verify-email rejects a payload that
+    // matches neither users.email nor pendingEmail. Revoking the whole
+    // verify_email purpose here instead would also burn the signup token, and
+    // there is no resend route, so an unverified account could never verify.
+    await store.users.update(record.userId, { passwordHash: await hashPassword(password), pendingEmail: null });
     await store.sessions.deleteAllForUser(record.userId);
     res.json({ ok: true });
   }));
@@ -257,39 +338,50 @@ export function createApp(ctx: AppContext): Express {
     const { token } = req.body ?? {};
     if (typeof token !== 'string' || token.length === 0) return badRequest(res, 'token required');
     const record = await store.tokens.findActiveByHash(hashToken(token), 'verify_email', ctx.now());
-    if (!record || !(await store.tokens.markUsed(record.id, ctx.now()))) {
+    const user = record ? await store.users.findById(record.userId) : null;
+    const address = record?.payload;
+    // Token for an address that is no longer pending (superseded change) is
+    // genuinely invalid; burning it below is the point.
+    if (!record || !user || !address || (address !== user.email && address !== user.pendingEmail)) {
       res.status(400).json({ error: 'invalid or expired token' });
       return;
     }
-    const user = await store.users.findById(record.userId);
-    const address = record.payload;
-    if (!user || !address) {
+    // Someone else registered the address during the 24h window: a recoverable
+    // conflict, not an attack, so check it *before* spending the single-use
+    // token — otherwise the user's only route out is to restart the change.
+    if (address === user.pendingEmail && (await store.users.findByEmail(address))) {
+      res.status(409).json({ error: 'that email is already in use' });
+      return;
+    }
+    // markUsed is atomic: a concurrent double-submit loses here (single use).
+    if (!(await store.tokens.markUsed(record.id, ctx.now()))) {
       res.status(400).json({ error: 'invalid or expired token' });
       return;
     }
     if (address === user.email) {
       await store.users.update(user.id, { emailVerified: true });
-    } else if (address === user.pendingEmail) {
-      // Email change confirmed: only now does the old address stop being the login.
-      if (await store.users.findByEmail(address)) {
-        res.status(409).json({ error: 'that email is already in use' });
-        return;
-      }
-      await store.users.update(user.id, { email: address, pendingEmail: null, emailVerified: true });
     } else {
-      // Token for an address that is no longer pending (superseded change).
-      res.status(400).json({ error: 'invalid or expired token' });
-      return;
+      // Email change confirmed: only now does the old address stop being the login.
+      const previous = user.email; // read before the update, not after
+      await store.users.update(user.id, { email: address, pendingEmail: null, emailVerified: true });
+      await sendEmailChangedNotice(previous, address);
     }
     res.json({ ok: true, email: address });
   }));
 
   // ---- Account ----------------------------------------------------------------
 
-  app.post('/api/account/email', requireAuth, requireCsrf, wrap(async (req, res) => {
+  // `limited` matters here as much as on /api/auth/*: the 409 below is a
+  // clean account-existence oracle, and one throwaway account buys unlimited
+  // probes without it.
+  app.post('/api/account/email', limited, requireAuth, requireCsrf, wrap(async (req, res) => {
     const user = req.user!;
     const { email: rawEmail } = req.body ?? {};
     if (!isEmail(rawEmail)) return badRequest(res, 'valid email required');
+    // Moving the login address is a credential change, not a profile edit: it
+    // is the root of /forgot and of every mailed notice, so without the
+    // password a stolen cookie relocates it and then simply asks for a reset.
+    if (!(await reauthenticated(req, res))) return;
     const email = normalizeEmail(rawEmail);
     if (email === user.email) return badRequest(res, 'that is already your email');
     if (await store.users.findByEmail(email)) {
@@ -305,8 +397,25 @@ export function createApp(ctx: AppContext): Express {
 
   // ---- Security: TOTP enrollment ------------------------------------------------
 
-  app.post('/api/security/totp/setup', requireAuth, requireCsrf, wrap(async (req, res) => {
+  /**
+   * Re-authenticate with the account password before changing the second
+   * factor or the login address. A session cookie alone is not enough: a hijacked 24h session
+   * could otherwise enroll the attacker's authenticator on an account with no
+   * MFA, and /api/auth/reset deliberately does not clear TOTP — so the owner
+   * would be locked out permanently with no route back.
+   */
+  async function reauthenticated(req: express.Request, res: express.Response): Promise<boolean> {
+    const { password } = req.body ?? {};
+    if (typeof password !== 'string' || !(await verifyPassword(req.user!.passwordHash, password))) {
+      res.status(401).json({ error: 'password required' });
+      return false;
+    }
+    return true;
+  }
+
+  app.post('/api/security/totp/setup', limited, requireAuth, requireCsrf, wrap(async (req, res) => {
     const user = req.user!;
+    if (!(await reauthenticated(req, res))) return;
     if (user.totpSecret) {
       res.status(409).json({ error: 'TOTP is already enabled' });
       return;
@@ -319,7 +428,10 @@ export function createApp(ctx: AppContext): Express {
     res.json({ secret: base32, otpauthUri: uri, qrSvg });
   }));
 
-  app.post('/api/security/totp/activate', requireAuth, requireCsrf, wrap(async (req, res) => {
+  // No password re-auth here: the pending secret can only have been created by
+  // /setup, which already required it, and activating it only ever enables the
+  // authenticator the caller of /setup scanned.
+  app.post('/api/security/totp/activate', limited, requireAuth, requireCsrf, wrap(async (req, res) => {
     const user = req.user!;
     const { code } = req.body ?? {};
     if (!user.totpPendingSecret) return badRequest(res, 'no enrollment in progress');
@@ -338,7 +450,57 @@ export function createApp(ctx: AppContext): Express {
       totpPendingSecret: null,
       totpLastCounter: counter.toString(),
     });
+    // Only the newest undo link stays live.
+    await store.tokens.revokeAllForUser(user.id, 'undo_totp');
+    await sendUndoTotpEmail(user.id, user.email);
     // Recovery codes are returned exactly once; only hashes are stored.
+    res.json({ ok: true, recoveryCodes: raw });
+  }));
+
+  // The inbox-side counterpart to /totp/disable, authorized by the mailed token
+  // alone (like /reset and /verify-email) because the owner reaching for it is
+  // by definition locked out of the session that /disable requires.
+  app.post('/api/auth/undo-totp', limited, wrap(async (req, res) => {
+    const { token } = req.body ?? {};
+    if (typeof token !== 'string' || token.length === 0) return badRequest(res, 'token required');
+    const record = await store.tokens.findActiveByHash(hashToken(token), 'undo_totp', ctx.now());
+    // markUsed is atomic: a concurrent double-submit loses here (single use).
+    if (!record || !(await store.tokens.markUsed(record.id, ctx.now()))) {
+      res.status(400).json({ error: 'invalid or expired token' });
+      return;
+    }
+    await store.users.update(record.userId, { totpSecret: null, totpPendingSecret: null, totpLastCounter: null });
+    await store.recoveryCodes.replaceForUser(record.userId, []);
+    // The enrolling session is the one being undone, so it must not survive —
+    // and every other session was stepped up against a factor that no longer
+    // exists. The owner logs back in with the password and resets it from there.
+    await store.sessions.deleteAllForUser(record.userId);
+    res.json({ ok: true });
+  }));
+
+  // The way out. Without it enrollment is a one-way door: a lost authenticator
+  // plus ten spent recovery codes is an account no one can reach, and reset
+  // deliberately does not clear TOTP. Requires a *fully* authenticated session
+  // (the step-up already passed) plus the password, so it is not an MFA bypass.
+  app.post('/api/security/totp/disable', limited, requireAuth, requireCsrf, wrap(async (req, res) => {
+    const user = req.user!;
+    if (!(await reauthenticated(req, res))) return;
+    await store.users.update(user.id, { totpSecret: null, totpPendingSecret: null, totpLastCounter: null });
+    await store.recoveryCodes.replaceForUser(user.id, []);
+    // Nothing left to undo, so the mailed undo link stops being a live way to
+    // sign every session out.
+    await store.tokens.revokeAllForUser(user.id, 'undo_totp');
+    res.json({ ok: true });
+  }));
+
+  app.post('/api/security/totp/recovery-codes', limited, requireAuth, requireCsrf, wrap(async (req, res) => {
+    const user = req.user!;
+    if (!(await reauthenticated(req, res))) return;
+    if (!user.totpSecret) return badRequest(res, 'TOTP is not enabled');
+    const { raw, hashes } = generateRecoveryCodes();
+    // Replaces every old code, used or not: a regenerate must not leave a
+    // previously-issued code live.
+    await store.recoveryCodes.replaceForUser(user.id, hashes);
     res.json({ ok: true, recoveryCodes: raw });
   }));
 

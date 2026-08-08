@@ -4,7 +4,7 @@ chapter: 9
 summary: The deployed stack — ECS Fargate, RDS, ElastiCache, CloudWatch on a real AWS account — CI security gates, and what is honestly still pending.
 ---
 
-Seven services exist and pass their suites. This chapter covers how they're designed to run in production, what runs today, and — honestly — what's blocked on an AWS account that doesn't exist yet.
+Seven services exist and pass their suites. This chapter covers how they're designed to run in production, what runs today on a laptop and on the deployed AWS account, and — honestly — what's still pending.
 
 ## What runs today
 

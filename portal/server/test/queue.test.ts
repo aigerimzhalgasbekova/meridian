@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import type { Pool } from 'pg';
 import { memoryQueue } from '../src/queue/memory.js';
-import { backoffMs } from '../src/queue/types.js';
+import { postgresQueue } from '../src/queue/postgres.js';
+import { backoffMs, STALE_CLAIM_MS } from '../src/queue/types.js';
 import { Worker } from '../src/queue/worker.js';
 import { runQueueContract } from './contract/queue.js';
 
@@ -17,6 +19,39 @@ describe('backoffMs', () => {
 // contract is what holds it to that. postgres runs the same suite in pg.test.ts.
 describe('memory queue', () => {
   runQueueContract(() => memoryQueue());
+});
+
+describe('postgres queue polling cost', () => {
+  it('only issues the dead-letter sweep when the claim found nothing', async () => {
+    // The sweep's `COALESCE(claimed_at, run_at) < $1` is not sargable against
+    // jobs_claim_idx, so running it ahead of every claim put a scan of every
+    // pending+running row on the hot path: one per poll interval forever, and
+    // N+1 of them inside a tick() that drains N jobs.
+    const statements: string[] = [];
+    let claimResult: Record<string, unknown>[] = [];
+    const isSweep = (s: string): boolean => s.includes("SET status = 'dead'");
+    const pool = {
+      query: async (text: string) => {
+        statements.push(text);
+        return { rows: isSweep(text) ? [] : claimResult };
+      },
+    };
+    const q = postgresQueue(pool as unknown as Pool);
+    const now = new Date();
+
+    claimResult = [{
+      id: 'j1', type: 't', payload: {}, status: 'running', attempts: 1, max_attempts: 5,
+      run_at: now, claimed_at: now, last_error: null, created_at: now,
+    }];
+    expect((await q.claim(now))?.id).toBe('j1');
+    expect(statements.filter(isSweep)).toHaveLength(0);
+
+    // Idle poll: nothing was claimable, so the sweep gets its turn and a
+    // stale-but-exhausted row still reaches the dead-letter state.
+    claimResult = [];
+    expect(await q.claim(now)).toBeNull();
+    expect(statements.filter(isSweep)).toHaveLength(1);
+  });
 });
 
 describe('memory queue claim semantics', () => {
@@ -132,19 +167,43 @@ describe('worker retry / dead-letter', () => {
     expect(new Set(seen).size).toBe(20);
     expect(await q.listByStatus('done')).toHaveLength(20);
   });
+  it('a failed complete() is not treated as a handler failure, and the job self-heals', async () => {
+    // complete() rejecting (pg pool timeout, RDS failover) inside the handler's
+    // try was caught and routed into fail(), which reschedules a job whose
+    // side effect already happened — a second email. And with nothing
+    // reclaiming a stranded 'running' row while the process stays up, the
+    // alternative was losing the job until a restart.
+    const q = memoryQueue();
+    const clock = new Date('2026-01-01T00:00:00Z');
+    const errors: unknown[] = [];
+    let runs = 0;
+    const failing = { ...q, complete: async () => { throw new Error('pg pool timeout'); } };
+    const worker = new Worker(
+      failing as typeof q,
+      { work: async () => { runs++; } },
+      { now: () => clock, onError: (_j, e) => void errors.push(e) },
+    );
+    const job = await q.enqueue('work', {}, { runAt: clock });
+
+    await expect(worker.tick()).rejects.toThrow('pg pool timeout');
+    expect(errors).toHaveLength(0); // bookkeeping failure, not a handler failure
+    expect((await q.get(job.id))?.status).toBe('running');
+    expect(await q.claim(clock)).toBeNull(); // still held, not double-run immediately
+
+    const later = new Date(clock.getTime() + STALE_CLAIM_MS + 1000);
+    expect((await q.claim(later))?.id).toBe(job.id); // reaped without a restart
+    expect(runs).toBe(1);
+  });
+
   it('survives a database that is not up yet instead of crash-looping', async () => {
-    // recover() rejecting on a cold boot (or a tick rejecting mid-run) used to
-    // be an unhandled rejection, which under Node's default
-    // --unhandled-rejections=throw kills the process. index.ts calls start()
-    // unconditionally, so that turns a transient blip into a crash-loop.
+    // A tick rejecting mid-run used to be an unhandled rejection, which under
+    // Node's default --unhandled-rejections=throw kills the process. index.ts
+    // calls start() unconditionally, so that turns a transient blip into a
+    // crash-loop.
     const q = memoryQueue();
     let up = false;
     const failing = {
       ...q,
-      recover: async () => {
-        if (!up) throw new Error('ECONNREFUSED');
-        return q.recover();
-      },
       claim: async (now: Date) => {
         if (!up) throw new Error('ECONNREFUSED');
         return q.claim(now);

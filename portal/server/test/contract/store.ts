@@ -179,7 +179,12 @@ export function runStoreContract(makeStore: () => Store): void {
     expect(await store.tokens.markUsed(randomUUID(), now)).toBe(false);
   });
 
-  it('tokens: revokeAllForUser only burns the named purpose', async () => {
+  it('tokens: revokeAllForUser only burns the named purpose, across every purpose', async () => {
+    // Every purpose is created here on purpose: postgres CHECKs the column, so
+    // a purpose the schema's constraint predates fails at INSERT — and the API
+    // tests all run on memory, where the constraint does not exist. Without
+    // this the undo_totp escape hatch could be 500ing in production with the
+    // suite fully green.
     const store = makeStore();
     const user = await newUser(store);
     const now = new Date();
@@ -187,11 +192,16 @@ export function runStoreContract(makeStore: () => Store): void {
     await store.tokens.create({ userId: user.id, purpose: 'password_reset', tokenHash: 'r1', payload: null, expiresAt: exp });
     await store.tokens.create({ userId: user.id, purpose: 'password_reset', tokenHash: 'r2', payload: null, expiresAt: exp });
     await store.tokens.create({ userId: user.id, purpose: 'verify_email', tokenHash: 'v1', payload: null, expiresAt: exp });
+    await store.tokens.create({ userId: user.id, purpose: 'undo_totp', tokenHash: 'u1', payload: null, expiresAt: exp });
 
     await store.tokens.revokeAllForUser(user.id, 'password_reset');
     expect(await store.tokens.findActiveByHash('r1', 'password_reset', now)).toBeNull();
     expect(await store.tokens.findActiveByHash('r2', 'password_reset', now)).toBeNull();
     expect(await store.tokens.findActiveByHash('v1', 'verify_email', now)).not.toBeNull();
+    expect(await store.tokens.findActiveByHash('u1', 'undo_totp', now)).not.toBeNull();
+
+    await store.tokens.revokeAllForUser(user.id, 'undo_totp');
+    expect(await store.tokens.findActiveByHash('u1', 'undo_totp', now)).toBeNull();
     await expect(store.tokens.revokeAllForUser(randomUUID(), 'password_reset')).resolves.toBeUndefined();
   });
 

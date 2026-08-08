@@ -30,6 +30,51 @@ resource "aws_cloudfront_origin_access_control" "site" {
   signing_protocol                  = "sigv4"
 }
 
+# The apex is the only host that can assert HSTS for the whole *.<domain>
+# family; the four ALB-backed services set their own headers in application
+# middleware. idp (idp/internal/server/middleware.go) and console
+# (console/internal/server/server.go) set the full set; portal
+# (portal/server/src/app.ts) sets everything except CSP, which its SPA bundle
+# needs an audit for. bridge (bridge/internal/server/server.go) sets
+# Referrer-Policy only: it serves script-free server-rendered templates with no
+# authenticated state-changing UI, so framing and sniffing buy an attacker
+# nothing there.
+resource "aws_cloudfront_response_headers_policy" "site" {
+  count = local.site_enabled ? 1 : 0
+  name  = "${local.name}-site-security-headers"
+
+  security_headers_config {
+    content_security_policy {
+      # ponytail: 'unsafe-inline' for script/style is deliberate — Base.astro
+      # ships two FOUC-blocking inline scripts and Astro's default
+      # inlineStylesheets: "auto" inlines small stylesheets, so hashes would
+      # have to be regenerated on every content edit. Upgrade path: emit
+      # sha256 hashes from dist/**/*.html in the CI site job once the deploy
+      # itself runs from CI. The site takes no user input and has no cookies.
+      content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+      override                = true
+    }
+    content_type_options {
+      override = true
+    }
+    frame_options {
+      frame_option = "DENY"
+      override     = true
+    }
+    referrer_policy {
+      referrer_policy = "no-referrer"
+      override        = true
+    }
+    # No `preload`: preloading is irrevocable for the entire zone, and nothing
+    # has been submitted to the preload list.
+    strict_transport_security {
+      access_control_max_age_sec = 63072000
+      include_subdomains         = true
+      override                   = true
+    }
+  }
+}
+
 resource "aws_cloudfront_distribution" "site" {
   count = local.site_enabled ? 1 : 0
 
@@ -51,7 +96,8 @@ resource "aws_cloudfront_distribution" "site" {
     cached_methods         = ["GET", "HEAD"]
     compress               = true
     # AWS managed CachingOptimized policy.
-    cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
+    cache_policy_id            = "658327ea-f89d-4fab-a63d-7e88639e58f6"
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.site[0].id
 
     # Astro emits directory-style routes (/guide/ -> /guide/index.html); the
     # function rewrites those so S3 finds the object.
@@ -61,8 +107,16 @@ resource "aws_cloudfront_distribution" "site" {
     }
   }
 
+  # Served from site/src/pages/404.astro, which the Astro build emits as
+  # dist/404.html (asserted in the `site` CI job).
   custom_error_response {
     error_code         = 403 # S3 returns 403 for missing keys behind OAC
+    response_code      = 404
+    response_page_path = "/404.html"
+  }
+
+  custom_error_response {
+    error_code         = 404
     response_code      = 404
     response_page_path = "/404.html"
   }

@@ -252,7 +252,29 @@ func authCodeContract(t *testing.T, s storage.Store, now time.Time) {
 	mustNoErr(t, "Create", acs.Create(ctx, code))
 	mustErr(t, "Create duplicate", acs.Create(ctx, code), storage.ErrDuplicate)
 
-	got, err := acs.Consume(ctx, "c1", now)
+	// Get reads without consuming, so the caller can validate and sign first.
+	peek, err := acs.Get(ctx, realm, "c1")
+	mustNoErr(t, "Get", err)
+	if peek.Used || peek.ClientID != "web" {
+		t.Errorf("Get: %+v", peek)
+	}
+	_, err = acs.Get(ctx, realm, "nope")
+	mustErr(t, "Get missing", err, storage.ErrNotFound)
+
+	// Auth codes are realm-scoped like every other table: another realm can
+	// neither read nor burn this code.
+	_, err = acs.Get(ctx, "other", "c1")
+	mustErr(t, "Get cross-realm", err, storage.ErrNotFound)
+	_, err = acs.Consume(ctx, "other", "c1", now)
+	mustErr(t, "Consume cross-realm", err, storage.ErrNotFound)
+	mustErr(t, "MarkFamily cross-realm", acs.MarkFamily(ctx, "other", "c1", "fam"), storage.ErrNotFound)
+	stillThere, err := acs.Get(ctx, realm, "c1")
+	mustNoErr(t, "Get after cross-realm Consume", err)
+	if stillThere.Used {
+		t.Error("Consume from another realm burned the code")
+	}
+
+	got, err := acs.Consume(ctx, realm, "c1", now)
 	mustNoErr(t, "Consume", err)
 	if got.ClientID != "web" || got.UserID != "u1" || got.RedirectURI != "https://x/cb" ||
 		got.Nonce != "n" || got.CodeChallenge != "cc" || got.SessionID != "sess" {
@@ -262,36 +284,36 @@ func authCodeContract(t *testing.T, s storage.Store, now time.Time) {
 	sameTime(t, "Consume AuthTime", got.AuthTime, now)
 
 	// Replay returns the consumed record so the caller can revoke what it minted.
-	replay, err := acs.Consume(ctx, "c1", now)
+	replay, err := acs.Consume(ctx, realm, "c1", now)
 	mustErr(t, "Consume replay", err, storage.ErrConsumed)
 	if !replay.Used || replay.CodeHash != "c1" {
 		t.Errorf("Consume replay: want the used record, got %+v", replay)
 	}
 
 	// Replay is still detectable after expiry (before any sweep).
-	replay, err = acs.Consume(ctx, "c1", now.Add(time.Hour))
+	replay, err = acs.Consume(ctx, realm, "c1", now.Add(time.Hour))
 	mustErr(t, "Consume replay after expiry", err, storage.ErrConsumed)
 	if !replay.Used {
 		t.Error("Consume replay after expiry: want the used record")
 	}
 
-	mustNoErr(t, "MarkFamily", acs.MarkFamily(ctx, "c1", "fam1"))
-	replay, err = acs.Consume(ctx, "c1", now)
+	mustNoErr(t, "MarkFamily", acs.MarkFamily(ctx, realm, "c1", "fam1"))
+	replay, err = acs.Consume(ctx, realm, "c1", now)
 	mustErr(t, "Consume after MarkFamily", err, storage.ErrConsumed)
 	if replay.IssuedFamilyID != "fam1" {
 		t.Errorf("MarkFamily: got %q, want fam1", replay.IssuedFamilyID)
 	}
-	mustErr(t, "MarkFamily missing", acs.MarkFamily(ctx, "nope", "f"), storage.ErrNotFound)
+	mustErr(t, "MarkFamily missing", acs.MarkFamily(ctx, realm, "nope", "f"), storage.ErrNotFound)
 
 	// An unused code past expiry is gone, not consumed.
 	mustNoErr(t, "Create expiring", acs.Create(ctx, storage.AuthCode{
 		CodeHash: "c2", RealmName: realm, ClientID: "web", UserID: "u1",
 		RedirectURI: "https://x/cb", AuthTime: now, ExpiresAt: now.Add(time.Minute), CreatedAt: now,
 	}))
-	_, err = acs.Consume(ctx, "c2", now.Add(time.Hour))
+	_, err = acs.Consume(ctx, realm, "c2", now.Add(time.Hour))
 	mustErr(t, "Consume expired", err, storage.ErrNotFound)
 
-	_, err = acs.Consume(ctx, "nope", now)
+	_, err = acs.Consume(ctx, realm, "nope", now)
 	mustErr(t, "Consume unknown", err, storage.ErrNotFound)
 }
 
@@ -446,15 +468,17 @@ func deviceContract(t *testing.T, s storage.Store, now time.Time) {
 	_, err = ds.TouchPoll(ctx, realm, "nope", now)
 	mustErr(t, "TouchPoll missing", err, storage.ErrNotFound)
 
-	mustErr(t, "SetStatus missing", ds.SetStatus(ctx, realm, "nope", storage.DeviceStatusApproved, "u1"), storage.ErrNotFound)
-	mustNoErr(t, "SetStatus approve", ds.SetStatus(ctx, realm, "d1", storage.DeviceStatusApproved, "u1"))
+	mustErr(t, "SetStatus missing", ds.SetStatus(ctx, realm, "nope", storage.DeviceStatusApproved, "u1", now), storage.ErrNotFound)
+	mustNoErr(t, "SetStatus approve", ds.SetStatus(ctx, realm, "d1", storage.DeviceStatusApproved, "u1", now))
 	got, err = ds.GetByDeviceCode(ctx, realm, "d1")
 	mustNoErr(t, "Get after SetStatus", err)
 	if got.Status != storage.DeviceStatusApproved || got.UserID != "u1" {
 		t.Errorf("SetStatus: %+v", got)
 	}
+	// The approving session's authentication time rides along to redemption.
+	sameTime(t, "SetStatus AuthTime", got.AuthTime, now)
 	// Only pending → approved/denied is allowed; the transition is single-use.
-	mustErr(t, "SetStatus twice", ds.SetStatus(ctx, realm, "d1", storage.DeviceStatusDenied, "u2"), storage.ErrConsumed)
+	mustErr(t, "SetStatus twice", ds.SetStatus(ctx, realm, "d1", storage.DeviceStatusDenied, "u2", now), storage.ErrConsumed)
 
 	mustNoErr(t, "Delete", ds.Delete(ctx, realm, "d1"))
 	mustErr(t, "Delete missing", ds.Delete(ctx, realm, "d1"), storage.ErrNotFound)

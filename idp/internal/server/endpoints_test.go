@@ -373,6 +373,35 @@ func TestDynamicRegistration(t *testing.T) {
 			t.Fatalf("scope = %q, want %q", got, "openid email")
 		}
 	})
+	t.Run("the advertised refresh_token grant is actually reachable", func(t *testing.T) {
+		// The 201 response defaults grant_types to include refresh_token, but
+		// offline_access was outside the registration allowlist — so a
+		// registered client was rejected if it asked for it and got no refresh
+		// token if it did not. Advertising a grant the server cannot honour.
+		e := newEnv(t)
+		status, body := registerClient(t, e, map[string]any{
+			"client_name":   "Refreshy",
+			"redirect_uris": []string{"https://refreshy.example/cb"},
+			"scope":         "openid offline_access",
+		})
+		if status != http.StatusCreated {
+			t.Fatalf("registration: %d %v", status, body)
+		}
+		clientID, secret := str(body, "client_id"), str(body, "client_secret")
+		code := e.obtainCode(map[string]string{
+			"client_id":    clientID,
+			"redirect_uri": "https://refreshy.example/cb",
+			"scope":        "openid offline_access",
+		})
+		status, body = e.tokenRequest(clientID, secret, url.Values{
+			"grant_type":   {"authorization_code"},
+			"code":         {code},
+			"redirect_uri": {"https://refreshy.example/cb"},
+		})
+		if status != http.StatusOK || str(body, "refresh_token") == "" {
+			t.Fatalf("registered client got no refresh token: %d %v", status, body)
+		}
+	})
 	t.Run("wrong token rejected", func(t *testing.T) {
 		e := newEnv(t)
 		req, _ := http.NewRequest("POST", e.idp.URL+"/realms/test/register",

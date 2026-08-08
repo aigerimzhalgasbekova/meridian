@@ -16,21 +16,30 @@
 //	BRIDGE_GOOGLE_CLIENT_ID / BRIDGE_GOOGLE_CLIENT_SECRET
 //	BRIDGE_ENTRA_TENANT / BRIDGE_ENTRA_CLIENT_ID / BRIDGE_ENTRA_CLIENT_SECRET
 //	BRIDGE_ENTRA_ALLOWED_TENANTS   comma-separated tid allowlist (multi-tenant)
+//	BRIDGE_APPS            relying applications, comma-separated
+//	                       id=https://app.example.com/callback pairs. Assertions
+//	                       go only to these exact URLs; a malformed entry fails
+//	                       startup rather than surfacing as a 400 on ?app= the
+//	                       day someone tries to integrate.
 //
 // The assertion signer here is the local ephemeral one; a deployment that
 // wants centrally managed keys injects a keysmith-backed Signer instead (see
 // internal/server.Signer — keysmith/client's Sign already has the right
-// shape).
+// shape). Either way the verification key is published at
+// /.well-known/jwks.json so relying apps can verify assertions without an
+// out-of-band key exchange.
 package main
 
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -41,6 +50,7 @@ import (
 	"github.com/aikazzh/portfolio/bridge/internal/fakeidp"
 	"github.com/aikazzh/portfolio/bridge/internal/provider"
 	"github.com/aikazzh/portfolio/bridge/internal/server"
+	"github.com/aikazzh/portfolio/keysmith/jose"
 )
 
 func main() {
@@ -103,6 +113,10 @@ func run() error {
 		apps["demo"] = server.App{Name: "Demo App", CallbackURL: baseURL + "/dev/app-callback"}
 	}
 
+	if err := parseApps(os.Getenv("BRIDGE_APPS"), apps); err != nil {
+		return err
+	}
+
 	if cid := os.Getenv("BRIDGE_GOOGLE_CLIENT_ID"); cid != "" {
 		p, err := provider.New(provider.Google(cid, os.Getenv("BRIDGE_GOOGLE_CLIENT_SECRET")))
 		if err != nil {
@@ -130,7 +144,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	signer, _, err := server.NewLocalSigner()
+	signer, verKey, err := server.NewLocalSigner()
+	if err != nil {
+		return err
+	}
+	jwks, err := jose.PublicJWK(verKey)
 	if err != nil {
 		return err
 	}
@@ -146,6 +164,12 @@ func run() error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", srv)
+	// Assertions are worthless to a relying app that cannot verify them, and
+	// the signing key is generated per process — publish the public half.
+	mux.HandleFunc("GET /.well-known/jwks.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/jwk-set+json")
+		json.NewEncoder(w).Encode(jose.JWKS{Keys: []jose.JWK{jwks}})
+	})
 	if dev {
 		mux.HandleFunc("GET /dev/app-callback", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -185,6 +209,36 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpSrv.Shutdown(shutdownCtx)
+}
+
+// parseApps reads BRIDGE_APPS ("id=https://host/cb,id2=https://…") into apps.
+// Validation is at startup on purpose: an unregistered app id is a silent 400
+// on /login/{p}?app=X at request time, which is a miserable thing to discover
+// during someone else's integration.
+func parseApps(spec string, apps map[string]server.App) error {
+	if spec == "" {
+		return nil
+	}
+	for entry := range strings.SplitSeq(spec, ",") {
+		id, raw, ok := strings.Cut(strings.TrimSpace(entry), "=")
+		if !ok || id == "" {
+			return fmt.Errorf("BRIDGE_APPS: %q is not id=callback-url", entry)
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("BRIDGE_APPS: app %q: %w", id, err)
+		}
+		// An assertion is a bearer credential; https and an absolute URL are
+		// the floor. Dev mode's demo app is registered directly, not here.
+		if u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("BRIDGE_APPS: app %q: callback %q must be an absolute https URL", id, raw)
+		}
+		if _, dup := apps[id]; dup {
+			return fmt.Errorf("BRIDGE_APPS: duplicate app id %q", id)
+		}
+		apps[id] = server.App{Name: id, CallbackURL: u.String()}
+	}
+	return nil
 }
 
 func envOr(key, def string) string {

@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { totp } from '../src/crypto/totp.js';
 import { base32Decode } from '../src/crypto/base32.js';
+import { hashPassword } from '../src/crypto/password.js';
 import { sessionCookieOf, testApp, type TestApp } from './helpers.js';
+import { linkToken } from '../../web/src/token.js';
 
 const EMAIL = 'ada@example.com';
 const PASSWORD = 'correct horse battery';
@@ -48,6 +50,28 @@ describe('signup and login', () => {
     expect((await request(t.app).post('/api/auth/signup').send({ email: 'x@y.io', password: 'short' })).status).toBe(400);
   });
 
+  it('signup pays the Argon2 cost on the taken branch too, so the floor is not the only cover', async () => {
+    // withMinDuration is max(floor, work), not a fixed budget: the new-account
+    // branch hashes a password and the taken branch did not. On the deployed
+    // 0.25 vCPU task the hash outruns the 100ms floor under load, and the two
+    // branches separate into an email-existence oracle. Timing the branches
+    // against each other is load-dependent and flaky; timing the taken branch
+    // against one real hash is not.
+    const t = testApp();
+    t.ctx.config.uniformDelayMs = 0; // strip the floor so the branch's own cost shows
+    await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD }).expect(202);
+
+    const hashStart = Date.now();
+    await hashPassword(PASSWORD);
+    const hashMs = Date.now() - hashStart;
+
+    const takenStart = Date.now();
+    await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD }).expect(202);
+    const takenMs = Date.now() - takenStart;
+
+    expect(takenMs).toBeGreaterThanOrEqual(hashMs / 2);
+  });
+
   it('signup on a taken address emails the owner a reset link, not silence', async () => {
     const t = testApp();
     await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD }).expect(202);
@@ -56,7 +80,7 @@ describe('signup and login', () => {
     // One verification mail for the real signup, one notice for the taken retry.
     expect(mails).toHaveLength(2);
     expect(mails[1]!.to).toBe(EMAIL);
-    expect(mails[1]!.text).toContain('/reset?token=');
+    expect(mails[1]!.text).toContain('/reset#token=');
     // The notice must not become a password-change oracle: the reset link is a
     // token, and the attacker's chosen password was never applied.
     await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: 'a-different-password' }).expect(401);
@@ -155,6 +179,52 @@ describe('password reset', () => {
     await request(t.app).post('/api/auth/reset').send({ token, password: 'another password' }).expect(400);
   });
 
+  it('cancels a pending email change, so takeover does not survive the remediation', async () => {
+    // verify-email needs no session at all — the token is the whole
+    // authorization, for 24h. An attacker who queued a change to their own
+    // address while holding a session would otherwise still own the login
+    // afterwards: reset kills their session and changes the password, then
+    // their old link flips users.email to them and /forgot does the rest.
+    const t = testApp();
+    const { cookie, csrf } = await signup(t);
+    await request(t.app)
+      .post('/api/account/email')
+      .set('Cookie', cookie)
+      .set('x-csrf-token', csrf)
+      .send({ email: 'attacker@example.com', password: PASSWORD })
+      .expect(202);
+    const changeToken = await t.lastToken();
+
+    await request(t.app).post('/api/auth/forgot').send({ email: EMAIL }).expect(202);
+    const resetToken = await t.lastToken();
+    const newPassword = 'brand new password';
+    await request(t.app).post('/api/auth/reset').send({ token: resetToken, password: newPassword }).expect(200);
+
+    await request(t.app).post('/api/auth/verify-email').send({ token: changeToken }).expect(400);
+    const login = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: newPassword }).expect(200);
+    expect(login.body.user.email).toBe(EMAIL);
+    expect(login.body.user.pendingEmail).toBeNull();
+  });
+
+  it('does not strand an unverified signup: the original verification link still works after a reset', async () => {
+    // Cancelling an attacker's queued address change was done by revoking the
+    // whole verify_email purpose, which also burned the token minted at signup
+    // — and there is no resend route, so an account that resets before opening
+    // its first verification link could never verify. Clearing pendingEmail is
+    // what cancels a change; the signup token is not a change.
+    const t = testApp();
+    await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD }).expect(202);
+    const verifyToken = await t.lastToken();
+
+    await request(t.app).post('/api/auth/forgot').send({ email: EMAIL }).expect(202);
+    const newPassword = 'brand new password';
+    await request(t.app).post('/api/auth/reset').send({ token: await t.lastToken(), password: newPassword }).expect(200);
+
+    await request(t.app).post('/api/auth/verify-email').send({ token: verifyToken }).expect(200);
+    const login = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: newPassword }).expect(200);
+    expect(login.body.user.emailVerified).toBe(true);
+  });
+
   it('rejects expired tokens', async () => {
     const t = testApp();
     await signup(t);
@@ -197,7 +267,7 @@ describe('email verification and change', () => {
       .post('/api/account/email')
       .set('Cookie', cookie)
       .set('x-csrf-token', csrf)
-      .send({ email: NEW })
+      .send({ email: NEW, password: PASSWORD })
       .expect(202);
 
     // still logs in with the OLD address; new address not active yet
@@ -219,11 +289,98 @@ describe('email verification and change', () => {
     const t = testApp();
     const { cookie, csrf } = await signup(t);
     const change = (email: string) =>
-      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send({ email });
+      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send({ email, password: PASSWORD });
     await change('first@example.com').expect(202);
     const firstToken = await t.lastToken();
     await change('second@example.com').expect(202);
     await request(t.app).post('/api/auth/verify-email').send({ token: firstToken }).expect(400);
+  });
+
+  it('a duplicate-address conflict at confirm time does not burn the token', async () => {
+    // Someone else registering the address during the 24h window is a
+    // recoverable conflict, not an attack. Consuming the single-use token
+    // before that check left the user with a dead link and no way back except
+    // restarting the change.
+    const t = testApp();
+    const { cookie, csrf } = await signup(t);
+    const CONTESTED = 'rival@example.com';
+    await request(t.app)
+      .post('/api/account/email')
+      .set('Cookie', cookie)
+      .set('x-csrf-token', csrf)
+      .send({ email: CONTESTED, password: PASSWORD })
+      .expect(202);
+    const token = await t.lastToken();
+    await request(t.app).post('/api/auth/signup').send({ email: CONTESTED, password: PASSWORD }).expect(202);
+
+    await request(t.app).post('/api/auth/verify-email').send({ token }).expect(409);
+    // Still live: a 400 here would mean the token was spent on the conflict.
+    await request(t.app).post('/api/auth/verify-email').send({ token }).expect(409);
+  });
+
+  it('moving the login address requires the account password, not merely a session', async () => {
+    // The address is the root of every mailed recovery path, so a cookie-only
+    // attacker who could move it reached the password in four calls: change ->
+    // verify (needs no password) -> forgot -> reset, at which point they CHOSE
+    // the password and the "a stolen cookie alone cannot enroll an
+    // authenticator" property of /totp/setup was worth nothing.
+    const t = testApp();
+    const { cookie, csrf } = await signup(t);
+    const move = (body: object) =>
+      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send(body);
+    await move({ email: 'attacker@example.com' }).expect(401);
+    await move({ email: 'attacker@example.com', password: 'not the password' }).expect(401);
+
+    const user = await t.ctx.store.users.findByEmail(EMAIL);
+    expect(user!.pendingEmail).toBeNull();
+    expect(await t.drainMail()).toHaveLength(1); // the signup verification, and nothing else
+  });
+
+  it('the notice to the old inbox is a notification, not a way back into the account', async () => {
+    // It used to carry a single-use token that restored the login address,
+    // cleared TOTP and burned every recovery code — minted on EVERY confirmed
+    // change, including one away from an address that never proved receipt.
+    // Sign up with a typo of a stranger's address, never open the verification
+    // link, fix the typo: the stranger was mailed 24 h of account takeover
+    // (restore, /forgot there, /reset). A notice is not a credential.
+    const t = testApp();
+    const TYPO = 'stranger@example.com';
+    const { cookie, csrf } = await signup(t, TYPO);
+    await request(t.app)
+      .post('/api/account/email')
+      .set('Cookie', cookie)
+      .set('x-csrf-token', csrf)
+      .send({ email: EMAIL, password: PASSWORD })
+      .expect(202);
+    await request(t.app).post('/api/auth/verify-email').send({ token: await t.lastToken() }).expect(200);
+
+    const mails = await t.drainMail();
+    const notice = mails[mails.length - 1]!;
+    expect(notice.to).toBe(TYPO); // the address left behind is told
+    expect(notice.text).toContain(EMAIL);
+    expect(notice.text).not.toMatch(/token=/); // ...and given nothing to redeem
+    await request(t.app).post('/api/auth/undo-email').send({ token: 'x' }).expect(404);
+
+    // The account answers to the new address only, and the old inbox cannot
+    // reach it: /forgot there mails nothing.
+    await request(t.app).post('/api/auth/login').send({ email: TYPO, password: PASSWORD }).expect(401);
+    await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD }).expect(200);
+    await request(t.app).post('/api/auth/forgot').send({ email: TYPO }).expect(202);
+    expect(await t.drainMail()).toHaveLength(mails.length);
+  });
+
+  it('rate-limits the email-change existence oracle', async () => {
+    // 409-vs-202 answers "does this address exist" with no side effect and no
+    // cleanup. Every /api/auth/* route is throttled; this one was not, so one
+    // throwaway account bought the whole user directory at network speed.
+    const t = testApp();
+    const { cookie, csrf } = await signup(t);
+    t.ctx.config.rateLimit = { limit: 2, windowMs: 60_000 };
+    const probe = (email: string) =>
+      request(t.app).post('/api/account/email').set('Cookie', cookie).set('x-csrf-token', csrf).send({ email, password: PASSWORD });
+    await probe('probe-a@example.com').expect(202);
+    await probe('probe-b@example.com').expect(202);
+    await probe('probe-c@example.com').expect(429);
   });
 });
 
@@ -234,6 +391,7 @@ describe('TOTP MFA', () => {
       .post('/api/security/totp/setup')
       .set('Cookie', cookie)
       .set('x-csrf-token', csrf)
+      .send({ password: PASSWORD })
       .expect(200);
     expect(setup.body.otpauthUri).toMatch(/^otpauth:\/\/totp\//);
     expect(setup.body.qrSvg).toContain('<svg');
@@ -257,6 +415,7 @@ describe('TOTP MFA', () => {
       .post('/api/security/totp/setup')
       .set('Cookie', cookie)
       .set('x-csrf-token', csrf)
+      .send({ password: PASSWORD })
       .expect(200);
     const plainBase32 = setup.body.secret as string;
     const user = await t.ctx.store.users.findByEmail(EMAIL);
@@ -363,7 +522,12 @@ describe('TOTP MFA', () => {
   it('activation rejects a wrong code and leaves TOTP disabled', async () => {
     const t = testApp();
     const { cookie, csrf } = await signup(t);
-    await request(t.app).post('/api/security/totp/setup').set('Cookie', cookie).set('x-csrf-token', csrf).expect(200);
+    await request(t.app)
+      .post('/api/security/totp/setup')
+      .set('Cookie', cookie)
+      .set('x-csrf-token', csrf)
+      .send({ password: PASSWORD })
+      .expect(200);
     await request(t.app)
       .post('/api/security/totp/activate')
       .set('Cookie', cookie)
@@ -375,6 +539,100 @@ describe('TOTP MFA', () => {
     // plain login still works without a step-up
     const login = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD }).expect(200);
     expect(login.body.mfaPending).toBe(false);
+  });
+
+  it('enrollment requires the account password, not merely a session', async () => {
+    // A hijacked session could otherwise enroll the attacker's authenticator
+    // on an MFA-less account — and reset deliberately does not clear TOTP, so
+    // the owner's own remediation cannot undo it. Permanent lockout.
+    const t = testApp();
+    const { cookie, csrf } = await signup(t);
+    const setup = (body: object) =>
+      request(t.app).post('/api/security/totp/setup').set('Cookie', cookie).set('x-csrf-token', csrf).send(body);
+    await setup({}).expect(401);
+    await setup({ password: 'not the password' }).expect(401);
+    const user = await t.ctx.store.users.findByEmail(EMAIL);
+    expect(user!.totpPendingSecret).toBeNull();
+  });
+
+  it('TOTP can be disabled and recovery codes regenerated — enrollment is not a one-way door', async () => {
+    const t = testApp();
+    const { cookie, csrf, recoveryCodes } = await enroll(t);
+    const me = await request(t.app).get('/api/me').set('Cookie', cookie).expect(200);
+    expect(me.body.user.recoveryCodesRemaining).toBe(10); // visible before the last one is spent
+
+    const regen = await request(t.app)
+      .post('/api/security/totp/recovery-codes')
+      .set('Cookie', cookie)
+      .set('x-csrf-token', csrf)
+      .send({ password: PASSWORD })
+      .expect(200);
+    expect(regen.body.recoveryCodes).toHaveLength(10);
+    expect(regen.body.recoveryCodes).not.toContain(recoveryCodes[0]);
+
+    const disable = (body: object) =>
+      request(t.app).post('/api/security/totp/disable').set('Cookie', cookie).set('x-csrf-token', csrf).send(body);
+    await disable({ password: 'not the password' }).expect(401);
+    await disable({ password: PASSWORD }).expect(200);
+
+    const login = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: PASSWORD }).expect(200);
+    expect(login.body.mfaPending).toBe(false);
+    expect(login.body.user.totpEnabled).toBe(false);
+    // codes go with the secret; a later re-enrollment must not honour old ones
+    const user = await t.ctx.store.users.findByEmail(EMAIL);
+    expect(await t.ctx.store.recoveryCodes.countUnused(user!.id)).toBe(0);
+  });
+
+  it('the enrollment notice lets the inbox undo a hostile enrollment by someone who knew the password', async () => {
+    // Password re-auth on /setup only stops cookie theft. Against credential
+    // stuffing or phishing the attacker HAS the password: they enroll their own
+    // authenticator, and the owner's documented remedy — forgot + reset, then
+    // log in — lands on an mfaPending session that requireAuth rejects, so
+    // /totp/disable is out of reach and the account is permanently lost.
+    const t = testApp();
+    const attacker = await signup(t); // a session obtained with the stolen password
+    const setup = await request(t.app)
+      .post('/api/security/totp/setup')
+      .set('Cookie', attacker.cookie)
+      .set('x-csrf-token', attacker.csrf)
+      .send({ password: PASSWORD })
+      .expect(200);
+    const secret = base32Decode(setup.body.secret as string);
+    await request(t.app)
+      .post('/api/security/totp/activate')
+      .set('Cookie', attacker.cookie)
+      .set('x-csrf-token', attacker.csrf)
+      .send({ code: totp(secret, t.clock.now.getTime() / 1000) })
+      .expect(200);
+
+    const undoToken = await t.lastToken(); // the notice mailed to the account address
+    expect((await t.drainMail()).at(-1)!.text).toContain('/undo-totp#token='); // fragment, never the request line
+
+    // The owner controls the password and the inbox, and it is still not enough.
+    const NEW_PASSWORD = 'a completely different passphrase';
+    await request(t.app).post('/api/auth/forgot').send({ email: EMAIL }).expect(202);
+    await request(t.app).post('/api/auth/reset').send({ token: await t.lastToken(), password: NEW_PASSWORD }).expect(200);
+    const locked = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: NEW_PASSWORD }).expect(200);
+    expect(locked.body.mfaPending).toBe(true);
+    await request(t.app)
+      .post('/api/security/totp/disable')
+      .set('Cookie', sessionCookieOf(locked))
+      .set('x-csrf-token', locked.body.csrfToken)
+      .send({ password: NEW_PASSWORD })
+      .expect(401);
+
+    // The mailed link is the way back, and takes the attacker's codes and
+    // session with it. An inbox-only attacker gains nothing: it revokes a
+    // factor, it never satisfies one.
+    await request(t.app).post('/api/auth/undo-totp').send({ token: undoToken }).expect(200);
+    const back = await request(t.app).post('/api/auth/login').send({ email: EMAIL, password: NEW_PASSWORD }).expect(200);
+    expect(back.body.mfaPending).toBe(false);
+    expect(back.body.user.totpEnabled).toBe(false);
+    const user = await t.ctx.store.users.findByEmail(EMAIL);
+    expect(await t.ctx.store.recoveryCodes.countUnused(user!.id)).toBe(0);
+    await request(t.app).get('/api/me').set('Cookie', attacker.cookie).expect(401);
+    // single use
+    await request(t.app).post('/api/auth/undo-totp').send({ token: undoToken }).expect(400);
   });
 });
 
@@ -438,7 +696,14 @@ describe('email normalization', () => {
     await request(t.app).post('/api/auth/signup').send({ email: 'ADA@EXAMPLE.COM', password: PASSWORD }).expect(202);
     const again = await request(t.app).post('/api/auth/login').send({ email: 'ada@example.com', password: PASSWORD });
     expect(again.status).toBe(200);
-    expect(again.body.user.id).toBe(res.body.user.id);
+    // meBody carries no user id, so comparing again.body.user.id to
+    // res.body.user.id compared two undefineds and pinned nothing. Observe the
+    // branch instead: the taken-address path mails a reset notice, the
+    // create path mails a verification.
+    const mails = await t.drainMail();
+    expect(mails).toHaveLength(2);
+    expect(mails[1]!.subject).toMatch(/tried to create/);
+    expect(await t.ctx.store.users.findByEmail('ada@example.com')).not.toBeNull();
   });
 });
 
@@ -450,5 +715,54 @@ describe('rate limiting', () => {
       await request(t.app).post('/api/auth/login').send({ email: 'x@y.io', password: 'nope nope' }).expect(401);
     }
     await request(t.app).post('/api/auth/login').send({ email: 'x@y.io', password: 'nope nope' }).expect(429);
+  });
+
+  it('buckets by the matched route, not the spelling of the URL', async () => {
+    // Express routes case-insensitively and ignores a trailing slash by
+    // default, so all of these reach the same handler while reporting a
+    // different req.path. Keyed on req.path that was a fresh bucket per
+    // casing — 2^12 of them on this route — i.e. no limit at all, and the
+    // limiter is the only brute-force control there is (no lockout).
+    const t = testApp();
+    t.ctx.config.rateLimit = { limit: 2, windowMs: 60_000 };
+    const attempt = (path: string) =>
+      request(t.app).post(path).send({ email: 'x@y.io', password: 'nope nope' });
+    await attempt('/api/auth/login').expect(401);
+    await attempt('/api/auth/login').expect(401);
+    await attempt('/api/auth/login').expect(429);
+    await attempt('/API/Auth/LOGIN').expect(429);
+    await attempt('/api/auth/login/').expect(429);
+  });
+});
+
+describe('mailed links keep the token out of the request line', () => {
+  // A reset token is still LIVE when /reset loads — it is spent later, by POST
+  // /api/auth/reset. In the query string it reaches the ALB access log, which
+  // is retained 14 days in an SSE-S3 bucket, so plain s3:GetObject yields a
+  // redeemable token inside its 15-minute window. A fragment is never
+  // transmitted to any server, so it cannot be logged (nor sent as a Referer).
+  it('verify-email and reset links use #token=, never ?token=', async () => {
+    const t = testApp();
+    await request(t.app).post('/api/auth/signup').send({ email: EMAIL, password: PASSWORD }).expect(202);
+    await request(t.app).post('/api/auth/forgot').send({ email: EMAIL }).expect(202);
+    const mails = await t.drainMail();
+    expect(mails).toHaveLength(2);
+    expect(mails[0]!.text).toContain('/verify-email#token=');
+    expect(mails[1]!.text).toContain('/reset#token=');
+    for (const m of mails) expect(m.text).not.toContain('?token=');
+  });
+
+  it('the web reader reads the fragment and refuses a token in the query string', () => {
+    const base = 'https://portal.example.com';
+    expect(linkToken(`${base}/reset#token=fragment-form`)).toBe('fragment-form');
+    expect(linkToken(`${base}/reset?token=query-form`)).toBe('');
+    expect(linkToken(`${base}/reset?token=query#token=fragment`)).toBe('fragment');
+    expect(linkToken(`${base}/reset`)).toBe('');
+  });
+
+  it('sets Referrer-Policy: no-referrer', async () => {
+    const t = testApp();
+    const res = await request(t.app).get('/healthz').expect(200);
+    expect(res.headers['referrer-policy']).toBe('no-referrer');
   });
 });

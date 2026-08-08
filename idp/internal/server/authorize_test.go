@@ -299,7 +299,9 @@ func TestSessionFixationDefense(t *testing.T) {
 	// Plant a cookie before login; after login the session must differ.
 	u, _ := url.Parse(e.idp.URL)
 	e.client.Jar.SetCookies(u, []*http.Cookie{{
-		Name: "idp_session_test", Value: "sid_planted", Path: "/realms/test",
+		// Path "/" is where the server writes it: __Host- mandates that, and it
+		// is what stops a sibling host tossing a longer-path twin.
+		Name: "idp_session_test", Value: "sid_planted", Path: "/",
 	}})
 	_ = e.obtainCode(nil)
 	for _, c := range e.client.Jar.Cookies(u) {
@@ -320,6 +322,75 @@ func TestMaxAgeForcesReauth(t *testing.T) {
 	}))
 	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Sign in") {
 		t.Fatalf("expected re-login, got %d", resp.StatusCode)
+	}
+}
+
+func TestMaxAgeZeroCompletesAfterFreshLogin(t *testing.T) {
+	// max_age=0 is the standard way an RP demands fresh authentication. The
+	// freshness check is `elapsed > max_age`, which at 0 is satisfied by nothing,
+	// so carrying max_age back into the post-login redirect looped the login form
+	// forever. Only the frozen test clock made `0 > 0` false and hid it.
+	e := newEnv(t)
+	params := map[string]string{
+		"client_id": "web-app", "redirect_uri": "https://app.example/callback",
+		"response_type": "code", "scope": "openid", "state": "x", "max_age": "0",
+	}
+	resp, body := e.get(authorizeURL(params))
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "Sign in") {
+		t.Fatalf("expected login form, got %d", resp.StatusCode)
+	}
+	resp, body = e.login(body, "alice", testUserPassword)
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("login: %d %s", resp.StatusCode, firstLine(body))
+	}
+	// Production always has a non-zero gap between the login POST and the
+	// browser's return to /authorize.
+	e.clock.Advance(time.Second)
+	resp, body = e.get(resp.Header.Get("Location"))
+	if resp.StatusCode == http.StatusOK && strings.Contains(body, "requests access") {
+		resp, body = e.consent(body, "allow")
+		if resp.StatusCode != http.StatusSeeOther {
+			t.Fatalf("consent: %d %s", resp.StatusCode, firstLine(body))
+		}
+		e.clock.Advance(time.Second)
+		resp, body = e.get(resp.Header.Get("Location"))
+	}
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("max_age=0 never completes (login loop): %d %s", resp.StatusCode, firstLine(body))
+	}
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc.Query().Get("code") == "" {
+		t.Fatalf("no code in redirect: %s", loc)
+	}
+}
+
+func TestSessionCookiesAreHostLocked(t *testing.T) {
+	// Without the __Host- prefix a sibling subdomain can set a same-named cookie
+	// with Domain=<apex> and a longer path; browsers send longer paths first
+	// (RFC 6265 §5.4.2) and r.Cookie takes the first match, so the tossed cookie
+	// outranks the real one. __Host- forbids Domain and pins Path=/ + Secure.
+	e := newEnvOpts(t, false)
+	resp, _ := e.get(authorizeURL(map[string]string{
+		"client_id": "web-app", "redirect_uri": "https://app.example/callback",
+		"response_type": "code", "scope": "openid",
+	}))
+	var got *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "__Host-idp_csrf_test" {
+			got = c
+		}
+		if strings.HasPrefix(c.Name, "idp_") {
+			t.Errorf("unprefixed cookie %q outside dev mode", c.Name)
+		}
+	}
+	if got == nil {
+		t.Fatalf("no __Host- CSRF cookie: %v", resp.Cookies())
+	}
+	if got.Path != "/" || !got.Secure {
+		t.Errorf("__Host- requires Path=/ and Secure, got path=%q secure=%v", got.Path, got.Secure)
 	}
 }
 

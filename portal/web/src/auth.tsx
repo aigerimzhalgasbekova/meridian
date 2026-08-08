@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, setCsrf, type Me } from './api';
 import { Link, navigate, useSession } from './App';
+import { linkToken } from './token';
 
 function useForm(): {
   error: string;
@@ -119,7 +120,7 @@ export function Forgot() {
 }
 
 export function Reset() {
-  const token = new URLSearchParams(location.search).get('token') ?? '';
+  const token = linkToken(location.href);
   const [password, setPassword] = useState('');
   const [done, setDone] = useState(false);
   const { error, busy, submit } = useForm();
@@ -141,8 +142,34 @@ export function Reset() {
   );
 }
 
+// Reached from the "two-factor was enabled" email. Deliberately reachable
+// while a session is mfaPending: the owner it exists for cannot get past the
+// step-up, which is the whole lockout being undone.
+export function UndoTotp() {
+  const token = linkToken(location.href);
+  const [done, setDone] = useState(false);
+  const { error, busy, submit } = useForm();
+
+  if (done) {
+    return <div className="card"><h1>Two-factor turned off</h1>
+      <p>All sessions were signed out. <Link to="/">Sign in</Link>, then change your password —
+        whoever enabled this knew it.</p></div>;
+  }
+  return (
+    <form className="card" onSubmit={submit(async () => {
+      await api('POST', '/api/auth/undo-totp', { token });
+      setDone(true);
+    })}>
+      <h1>Turn off two-factor authentication</h1>
+      {error && <p className="error">{error}</p>}
+      <p>This removes the authenticator and recovery codes that were just added to your account.</p>
+      <button disabled={busy}>Turn it off</button>
+    </form>
+  );
+}
+
 export function VerifyEmail() {
-  const token = new URLSearchParams(location.search).get('token') ?? '';
+  const token = linkToken(location.href);
   const [state, setState] = useState<'working' | 'ok' | 'error'>('working');
   const [detail, setDetail] = useState('');
 

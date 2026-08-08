@@ -94,7 +94,13 @@ resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
     status = "Enabled"
     filter {}
     expiration {
-      days = 90
+      # Access-log records carry the full request line. Portal's one-time
+      # tokens never appear there: they are mailed in the URL fragment, which
+      # browsers do not transmit (portal/server/src/app.ts), and the reader
+      # accepts nothing else (portal/web/src/token.ts). What is left is
+      # bridge's ?code=, already spent by the time the request completes.
+      # Two weeks is enough for forensics on a dev stack and bounds the window.
+      days = 14
     }
   }
 }
@@ -285,6 +291,12 @@ module "keysmith" {
     KEYSMITH_ADDR       = ":8081"
     KEYSMITH_STORE_PATH = "/data/keys.json"
   }
+  # ONE-WAY DEPLOY: the first v2 keysmith to start rewrites /data/keys.json at
+  # document version 2, and a pre-v2 image refuses to open it ("understands
+  # 1..1"). Downgrading keysmith after that means restoring the keystore from an
+  # EFS recovery point, not `ecs update-service --task-definition <previous>`.
+  # Take one before the upgrade deploy; this service is the platform's only
+  # signer, so a keystore you cannot open is a total token and JWKS outage.
   secrets = {
     KEYSMITH_MASTER_KEY    = "${local.ssm}/keysmith/KEYSMITH_MASTER_KEY"
     KEYSMITH_SIGNER_TOKENS = "${local.ssm}/keysmith/KEYSMITH_SIGNER_TOKENS"
@@ -296,6 +308,13 @@ module "keysmith" {
     access_point_id = module.data.efs_access_point_keysmith
     container_path  = "/data"
   }
+
+  # keysmithd flocks <store>.lock for the process lifetime, so the replacement
+  # task cannot boot while the old one is running: the default 100/200 rolling
+  # deploy would crash-loop every release. (The flock is only cross-host if the
+  # mount forwards locks — Fargate-managed EFS mounts do; no mount option here
+  # sets local_lock, and efs_volume_configuration above exposes none.)
+  stop_before_start = true
 
   # The keystore file assumes a single writer.
   # ponytail: pin to one task; multi-writer needs a shared-store keysmith backend.
@@ -329,8 +348,11 @@ module "idp" {
     # = "append", so the last X-Forwarded-For hop cannot be forged.
     IDP_TRUST_PROXY = "1"
     # Demo deployment: provision the demo realm/users/clients idempotently on
-    # boot so the public instance has something to show. Drop for a real IdP.
-    IDP_SEED_DEMO = "1"
+    # boot so the public instance has something to show. The credentials are
+    # published (scripts/live-smoke.sh), so this is a demonstration surface —
+    # it routes through the profile flag like every other dev/prod difference
+    # rather than being a standalone knob someone must remember to flip.
+    IDP_SEED_DEMO = local.is_prod ? "0" : "1"
   }
   secrets = {
     # IDP_KEYSMITH_TOKEN must be one of keysmith's KEYSMITH_SIGNER_TOKENS.
@@ -436,6 +458,17 @@ module "bridge" {
   env = {
     BRIDGE_ADDR     = ":8080"
     BRIDGE_BASE_URL = "https://sso.${var.domain}"
+    # BRIDGE_APPS ("id=https://host/callback,…") is deliberately UNSET here.
+    # Registering an app makes /login/{provider}?app=id reachable, and
+    # deliverAssertion redirects the browser to that callback with the signed
+    # assertion — subject, email, email_verified, name — in the QUERY STRING.
+    # A placeholder host is therefore not inert: it ships a real user's
+    # identity to whoever operates it, in their access log and every
+    # intermediary's. example.com is IANA-operated and resolves, so it is the
+    # worst possible choice. Unset, every ?app= is a 400 and nothing leaks.
+    # Add this in the same change that brings up the first real relying app,
+    # pointed at a host this account owns. bridged validates it at STARTUP, so
+    # a typo is a crash-loop, not a request-time 400 — review the plan first.
   }
   secrets = {
     BRIDGE_HMAC_KEY             = "${local.ssm}/bridge/BRIDGE_HMAC_KEY"

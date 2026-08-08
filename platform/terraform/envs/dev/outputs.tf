@@ -23,3 +23,17 @@ output "redis_endpoint" {
 output "alarms_sns_topic" {
   value = module.observability.sns_topic_arn
 }
+
+# Runbook step 5 runs one throwaway task off the existing portal task
+# definition to create the portal database; run-task needs the network config
+# the ECS service normally supplies from state.
+output "portal_run_task_network" {
+  description = "--network-configuration argument for the runbook step 5 `aws ecs run-task`."
+  value = jsonencode({
+    awsvpcConfiguration = {
+      subnets        = local.common.subnet_ids
+      securityGroups = [module.portal.security_group_id]
+      assignPublicIp = local.common.assign_public_ip ? "ENABLED" : "DISABLED"
+    }
+  })
+}

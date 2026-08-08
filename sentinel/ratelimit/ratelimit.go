@@ -198,8 +198,14 @@ func (s *MemStore) Hit(key string, start time.Time, window time.Duration) (int64
 	}
 	w.cur++
 
-	// ponytail: amortized sweep every 4096 hits bounds map growth; a Redis
-	// store gets this for free via EXPIRE.
+	// ponytail: the amortized sweep every 4096 hits only reclaims entries
+	// older than 2 windows, so it cannot touch a burst of young ones — unlike
+	// lockout.Policy.MaxKeys and risk.Config.MaxAccounts there is no size cap
+	// here, and a flood of attacker-chosen keys (ip/user/client all come off
+	// the request body) is bounded by peak rps x 2 x Window, not by config.
+	// Accepted residual (THREAT_MODEL.md), and gone entirely under the Redis
+	// store's EXPIRE. Add a MaxKeys low-water eviction here if a single
+	// instance ever has to survive an untrusted flood.
 	s.hits++
 	if s.hits%4096 == 0 {
 		for k, w := range s.m {

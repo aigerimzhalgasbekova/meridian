@@ -298,6 +298,163 @@ func TestConcurrentSigningDuringRotation(t *testing.T) {
 	}
 }
 
+// flakyStore fails the nth Update it sees, to model a full disk / EFS I/O
+// error landing between promoteLocked's two non-transactional writes.
+type flakyStore struct {
+	*MemoryStore
+	failUpdate int // 1-based index of the Update to fail; 0 disables
+	updates    int
+}
+
+func (s *flakyStore) Update(ctx context.Context, k Key) error {
+	s.updates++
+	if s.failUpdate != 0 && s.updates == s.failUpdate {
+		return errors.New("injected I/O error")
+	}
+	return s.MemoryStore.Update(ctx, k)
+}
+
+func TestPromoteRollsBackDemoteOnWriteFailure(t *testing.T) {
+	// Promote demotes the incumbent and persists, then promotes the successor
+	// and persists. If the second write fails, the committed demotion must not
+	// be left standing: that leaves the algorithm with no active key at all —
+	// every sign 503s until a Tick force-promotes, bypassing the dwell.
+	ctx := context.Background()
+	clock := newFakeClock()
+	store := &flakyStore{MemoryStore: NewMemoryStore()}
+	m, err := NewManager(store, testConfig(clock, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Tick(ctx); err != nil { // bootstrap active
+		t.Fatal(err)
+	}
+	k, err := m.Generate(ctx, jose.AlgEdDSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(11 * time.Minute) // past the dwell
+
+	store.updates, store.failUpdate = 0, 2 // fail the promote, not the demote
+	if err := m.Promote(ctx, k.ID, false); err == nil {
+		t.Fatal("Promote reported success despite a failed write")
+	}
+	store.failUpdate = 0
+
+	if _, err := m.SigningKey(ctx, jose.AlgEdDSA); err != nil {
+		t.Fatalf("no active key after a failed promotion: %v", err)
+	}
+	if got := statesByAlg(t, m, jose.AlgEdDSA); got[StateActive] != 1 || got[StateRetiring] != 0 {
+		t.Fatalf("demotion was not rolled back: %v", got)
+	}
+}
+
+func TestRevokeUnpublishesImmediatelyAndKeepsSigning(t *testing.T) {
+	// The compromise response: force-promoting only stops the key signing new
+	// *legitimate* tokens; an attacker holding the private half keeps minting,
+	// and the key stays in the JWKS for the whole RetireAfter window. Revoke is
+	// the only lever that closes that window.
+	ctx := context.Background()
+	clock := newFakeClock()
+	var events []Event
+	m, err := NewManager(NewMemoryStore(), testConfig(clock, &events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stolen, err := m.SigningKey(ctx, jose.AlgEdDSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := jose.Sign([]byte(`{"sub":"root"}`), stolen)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Revoke(ctx, stolen.ID, "private key leaked"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	// Unpublished now, not RetireAfter from now.
+	set, err := m.VerificationSet(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := jose.Verify(token, set, []jose.Algorithm{jose.AlgEdDSA}); err == nil {
+		t.Fatal("a token signed by the revoked key still verifies")
+	}
+	jwks, err := m.JWKS(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range jwks.Keys {
+		if j.Kid == stolen.ID {
+			t.Fatal("revoked key is still published in the JWKS")
+		}
+	}
+
+	// Containment, not an outage: a successor signs.
+	successor, err := m.SigningKey(ctx, jose.AlgEdDSA)
+	if err != nil {
+		t.Fatalf("revoking the active key left no signer: %v", err)
+	}
+	if successor.ID == stolen.ID {
+		t.Fatal("revoked key is still the signer")
+	}
+	var revoked int
+	for _, e := range events {
+		if e.Op == "revoked" && e.KeyID == stolen.ID && e.Detail["reason"] == "private key leaked" {
+			revoked++
+		}
+	}
+	if revoked != 1 {
+		t.Errorf("audit trail has %d revoked events with the reason, want 1", revoked)
+	}
+
+	// Revoking twice is an error, not a silent no-op.
+	if err := m.Revoke(ctx, stolen.ID, "again"); !errors.Is(err, ErrAlreadyRetired) {
+		t.Errorf("want ErrAlreadyRetired, got %v", err)
+	}
+	if err := m.Revoke(ctx, "ghost", "x"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestRevokePrefersAWarmPendingSuccessor(t *testing.T) {
+	// A pending key has already been published, so verifier caches know it —
+	// preferring it over a fresh key is the difference between a seamless
+	// containment and one that depends on every verifier's kid-miss refresh.
+	ctx := context.Background()
+	clock := newFakeClock()
+	m, err := NewManager(NewMemoryStore(), testConfig(clock, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	active, err := m.SigningKey(ctx, jose.AlgEdDSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warm, err := m.Generate(ctx, jose.AlgEdDSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Revoke(ctx, active.ID, "compromise"); err != nil {
+		t.Fatal(err)
+	}
+	sk, err := m.SigningKey(ctx, jose.AlgEdDSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sk.ID != warm.ID {
+		t.Errorf("signer is %q, want the pending key %q", sk.ID, warm.ID)
+	}
+}
+
 func TestNewManagerValidation(t *testing.T) {
 	store := NewMemoryStore()
 	base := func() Config { return testConfig(newFakeClock(), nil) }
