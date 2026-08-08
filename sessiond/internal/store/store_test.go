@@ -1,9 +1,11 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -440,6 +442,9 @@ var damaged = []struct {
 		mr.HDel(k, "uid")
 	}},
 	{"missing realm only", func(mr *miniredis.Miniredis, k string) { mr.HDel(k, "realm") }},
+	// '' is truthy in Lua, so this one passes guards a HDEL'd field fails
+	// unless the scripts normalise it. Same verdict, or the policy is two.
+	{"empty realm string", func(mr *miniredis.Miniredis, k string) { mr.HSet(k, "realm", "") }},
 	{"non-numeric created_ms", func(mr *miniredis.Miniredis, k string) { mr.HSet(k, "created_ms", "n/a") }},
 	{"missing deadline_ms", func(mr *miniredis.Miniredis, k string) { mr.HDel(k, "deadline_ms") }},
 }
@@ -533,6 +538,174 @@ func TestPastDeadlineSessionDoesNotHoldCapSlot(t *testing.T) {
 	}
 	if _, _, err := s.Create(ctx, "acme", "alice", "", ""); err != nil {
 		t.Errorf("create blocked by an invisible past-deadline session: %v", err)
+	}
+}
+
+// TestCorruptRecordDoesNotHoldCapSlot: corrupt is dead on every surface. If the
+// cap counts a record the listing refuses to show, Policy=Reject locks the user
+// out of a session no operator can see or aim revoke-by-id at.
+func TestCorruptRecordDoesNotHoldCapSlot(t *testing.T) {
+	for _, tc := range damaged {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := miniredis.RunT(t)
+			s := testStore(t, mr, newFakeClock(), Config{
+				MaxPerUser: 1, Policy: Reject, CacheTTL: time.Millisecond,
+			})
+			ctx := context.Background()
+
+			_, sess := mustCreate(t, s, "acme", "alice")
+			tc.damage(mr, "sess:"+sess.ID)
+
+			list, err := s.List(ctx, "acme", "alice")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(list) != 0 {
+				t.Errorf("List reports %d corrupt sessions as live, want 0", len(list))
+			}
+			if _, _, err := s.Create(ctx, "acme", "alice", "", ""); err != nil {
+				t.Errorf("create blocked by a corrupt session: %v", err)
+			}
+		})
+	}
+}
+
+// skewedCreate logs a user in twice: once from a node with a correct clock,
+// once from a node 31 minutes fast, i.e. one whose "now" is past the first
+// session's deadline. It returns the good node and the first session's token.
+func skewedCreate(t *testing.T, mr *miniredis.Miniredis) (*Store, string, Session) {
+	t.Helper()
+	cfg := Config{IdleTTL: time.Hour, AbsoluteTTL: 30 * time.Minute, CacheTTL: time.Millisecond}
+	s := testStore(t, mr, newFakeClock(), cfg)
+	tok, sess := mustCreate(t, s, "acme", "alice")
+
+	fast := newFakeClock()
+	fast.advance(31 * time.Minute)
+	if _, _, err := testStore(t, mr, fast, cfg).Create(context.Background(), "acme", "alice", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	return s, tok, sess
+}
+
+// TestCreatePruneDoesNotDeleteOnClockSkew is TestListDoesNotDeleteOnClockSkew
+// for the write path: create's prune runs on the creating node's unvalidated
+// clock and its evictions are not broadcast, so it must never destroy the
+// record other nodes are still serving.
+func TestCreatePruneDoesNotDeleteOnClockSkew(t *testing.T) {
+	mr := miniredis.RunT(t)
+	s, tok, sess := skewedCreate(t, mr)
+
+	if !mr.Exists("sess:" + sess.ID) {
+		t.Error("a fast node's create destroyed a session still live everywhere else")
+	}
+	if _, err := s.Validate(context.Background(), tok); err != nil {
+		t.Fatalf("session killed by a fast node's create: %v", err)
+	}
+}
+
+// TestCreatePruneDoesNotUnlinkOnClockSkew is the same skew, one step quieter:
+// the prune must not UNLINK the live record either. An unlinked session keeps
+// validating on every correctly-clocked node but is gone from the index, so log
+// out everywhere silently misses it. Nothing here may Validate first —
+// touchScript's ZADD NX re-indexes the session and would hide the bug.
+func TestCreatePruneDoesNotUnlinkOnClockSkew(t *testing.T) {
+	mr := miniredis.RunT(t)
+	s, tok, sess := skewedCreate(t, mr)
+	ctx := context.Background()
+
+	n, err := s.RevokeUser(ctx, "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("RevokeUser reported %d revoked, want 2", n)
+	}
+	if mr.Exists("sess:" + sess.ID) {
+		t.Error("session key survived global logout")
+	}
+	if _, err := s.Validate(ctx, tok); !errors.Is(err, ErrNotFound) {
+		t.Errorf("token still validates after global logout: %v", err)
+	}
+}
+
+// TestRotateRefusesEmptyRealmBeforeDestroying: an empty-string realm is truthy
+// in Lua, so it used to pass every script guard and only trip the Go check —
+// after rotateScript had already deleted the old key, written the new one and
+// indexed it under 'usersess::uid:sessions', a key checkNames can never name.
+// The caller got a 500, the user was silently logged out, and the orphan was
+// beyond RevokeUser's reach.
+func TestRotateRefusesEmptyRealmBeforeDestroying(t *testing.T) {
+	mr := miniredis.RunT(t)
+	s := testStore(t, mr, newFakeClock(), Config{CacheTTL: time.Millisecond})
+	ctx := context.Background()
+
+	tok, sess := mustCreate(t, s, "acme", "bob")
+	mr.HSet("sess:"+sess.ID, "realm", "")
+
+	if _, _, err := s.Rotate(ctx, tok, "", ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Rotate on an empty-realm record: got %v, want ErrNotFound", err)
+	}
+	for _, k := range mr.Keys() {
+		if strings.HasPrefix(k, "usersess::") {
+			t.Errorf("rotation indexed a session under an empty realm (%q); RevokeUser can never target it", k)
+		}
+	}
+}
+
+// TestRefusedRotateUnlinksIndexMember: a refused rotation still deletes the old
+// key, so it must unlink the member too — otherwise RevokeUser counts a member
+// that is not a session.
+func TestRefusedRotateUnlinksIndexMember(t *testing.T) {
+	mr := miniredis.RunT(t)
+	clk := newFakeClock()
+	s := testStore(t, mr, clk, Config{
+		IdleTTL: time.Hour, AbsoluteTTL: 30 * time.Minute, CacheTTL: time.Millisecond,
+	})
+	ctx := context.Background()
+
+	tok, _ := mustCreate(t, s, "acme", "alice")
+	clk.advance(31 * time.Minute) // past the deadline; the key TTL still runs
+
+	if _, _, err := s.Rotate(ctx, tok, "", ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Rotate on a past-deadline session: got %v, want ErrNotFound", err)
+	}
+	n, err := s.RevokeUser(ctx, "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("RevokeUser counted %d dangling index members, want 0", n)
+	}
+}
+
+// TestCacheColdIsAnnounced: once the Redis round trip reaches CacheTTL every
+// entry is born expired and the cache stops absorbing load. That is accepted,
+// but it must not be silent — the operator lever is unreachable otherwise.
+func TestCacheColdIsAnnounced(t *testing.T) {
+	mr := miniredis.RunT(t)
+	clk := newFakeClock()
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+	var log bytes.Buffer
+
+	// Every clock reading lands 50ms after the last: a round trip that outlives
+	// the 10ms CacheTTL.
+	s := New(rdb, Config{
+		CacheTTL: 10 * time.Millisecond,
+		Logger:   slog.New(slog.NewTextHandler(&log, nil)),
+		Now: func() time.Time {
+			now := clk.Now()
+			clk.advance(50 * time.Millisecond)
+			return now
+		},
+	})
+
+	tok, _ := mustCreate(t, s, "acme", "alice")
+	if _, err := s.Validate(context.Background(), tok); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(log.String(), "cache cold") {
+		t.Errorf("nothing announced the cache going cold; log was %q", log.String())
 	}
 }
 

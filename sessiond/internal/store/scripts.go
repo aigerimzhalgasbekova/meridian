@@ -25,18 +25,28 @@ import "github.com/redis/go-redis/v9"
 // "LIMIT" when policy=reject and the user is at the cap.
 var createScript = redis.NewScript(`
 local now = tonumber(ARGV[1])
--- Prune index members that are no longer live sessions, using the same test
--- touchScript and List apply — a past-deadline key with a TTL still running
--- (clock skew, restored snapshot) is dead. Counting it would hold a cap slot
--- that List refuses to show and revoke-by-id cannot be aimed at.
+-- Don't COUNT a member that is not a live session, by the same test
+-- touchScript, rotateScript and List apply: past its deadline (clock skew,
+-- restored snapshot) or missing a defining field is dead, and counting one
+-- would hold a cap slot List refuses to show and revoke-by-id cannot be aimed
+-- at. But only UNLINK what Redis already collected. "now" is this node's
+-- unvalidated clock and nothing here is broadcast, so a fast node must not
+-- touch a record still live elsewhere: deleting it kills a live session
+-- fleet-wide, and unlinking alone is worse — it keeps validating but drops out
+-- of RevokeUser's reach. touchScript deletes it, on the node serving it.
+-- Price: a node skewed past a session's deadline neither counts nor collects
+-- it, so the cap is advisory under that much skew — same unvalidated clock,
+-- same direction as RevokeUser's count.
 local members = redis.call('ZRANGE', KEYS[1], 0, -1)
 local live = {}
 for _, m in ipairs(members) do
-  local dl = tonumber(redis.call('HGET', 'sess:' .. m, 'deadline_ms'))
-  if dl and now < dl then
+  local h = redis.call('HMGET', 'sess:' .. m, 'deadline_ms', 'realm', 'uid', 'created_ms')
+  local dl = tonumber(h[1])
+  if h[2] == '' then h[2] = false end -- empty is missing; see touchScript
+  if h[3] == '' then h[3] = false end
+  if dl and h[2] and h[3] and tonumber(h[4]) and now < dl then
     live[#live + 1] = m
-  else
-    redis.call('DEL', 'sess:' .. m)
+  elseif redis.call('EXISTS', 'sess:' .. m) == 0 then
     redis.call('ZREM', KEYS[1], m)
   end
 end
@@ -97,6 +107,15 @@ local deadline = tonumber(redis.call('HGET', KEYS[1], 'deadline_ms'))
 local realm = redis.call('HGET', KEYS[1], 'realm')
 local uid = redis.call('HGET', KEYS[1], 'uid')
 local created = redis.call('HGET', KEYS[1], 'created_ms')
+-- HGET yields false for a missing field but '' for an empty one, and '' is
+-- truthy in Lua: without this an empty realm passes every guard below and then
+-- names the index 'usersess::uid:sessions', which checkNames can never spell,
+-- so RevokeUser can never target it. Empty is missing in every script that
+-- makes a liveness decision. revokeScript is deliberately exempt: it DELs
+-- first regardless, so its ZREM of a wrongly-named index is a harmless no-op
+-- that create's prune collects on the next write.
+if realm == '' then realm = false end
+if uid == '' then uid = false end
 -- One liveness test for every way a record stops being a session: past its
 -- deadline, or missing/unparsable a defining field (partial restore, operator
 -- surgery — a missing field arrives as false). Fail closed and delete: a record
@@ -145,12 +164,18 @@ local deadline = tonumber(redis.call('HGET', KEYS[1], 'deadline_ms'))
 local uid = redis.call('HGET', KEYS[1], 'uid')
 local realm = redis.call('HGET', KEYS[1], 'realm')
 local created = redis.call('HGET', KEYS[1], 'created_ms')
+-- Empty is missing; see touchScript. Before the DEL, so the refusal below is
+-- reached instead of a half-rotated session Go rejects afterwards.
+if realm == '' then realm = false end
+if uid == '' then uid = false end
 redis.call('DEL', KEYS[1])
--- Same liveness test as touchScript. The old ID dies either way; a dead or
--- corrupt record just must not be reborn under a fresh one.
-if not deadline or not realm or not uid or not tonumber(created) or now >= deadline then return {} end
-local userkey = 'usersess:' .. realm .. ':' .. uid .. ':sessions'
-redis.call('ZREM', userkey, ARGV[3])
+-- The old ID dies either way, so unlink it either way — a refused rotation must
+-- not leave a member pointing at nothing for RevokeUser to count.
+local userkey = realm and uid and ('usersess:' .. realm .. ':' .. uid .. ':sessions')
+if userkey then redis.call('ZREM', userkey, ARGV[3]) end
+-- Same liveness test as touchScript: a dead or corrupt record must not be
+-- reborn under a fresh ID.
+if not deadline or not userkey or not tonumber(created) or now >= deadline then return {} end
 
 redis.call('HSET', KEYS[2],
   'uid', uid, 'realm', realm, 'ip', ARGV[5], 'ua', ARGV[6],

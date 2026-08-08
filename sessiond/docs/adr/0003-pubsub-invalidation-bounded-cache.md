@@ -72,7 +72,7 @@ hashes of fresh 256-bit tokens that cannot have been validated before creation.
 - Entry lifetime is measured from when the Redis read was *issued*, so once the
   Redis round trip reaches `CacheTTL` every entry is born expired and the cache
   stops absorbing load — exactly when Redis is slowest. Accepted: honouring the
-  staleness bound wins over shedding load. The operator signal is the existing
-  request log, no new metric: `duration_ms` on `/v1/sessions/validate` at or
-  above `CacheTTL` means the cache is effectively off. The lever is raising
+  staleness bound wins over shedding load. `Validate` warns (rate-limited to
+  once per 30s, since the condition holds for every request while it lasts) when
+  the round trip reaches `CacheTTL`; no new metric. The lever is raising
   `SESSIOND_CACHE_TTL`, which widens the staleness bound explicitly.

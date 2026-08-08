@@ -38,6 +38,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -102,7 +103,15 @@ type Store struct {
 	rdb   redis.UniversalClient
 	cfg   Config
 	cache *cache
+	// coldWarn is the ms timestamp of the last "cache cold" warning; see
+	// Validate. Rate-limiting state, not configuration.
+	coldWarn atomic.Int64
 }
+
+// coldWarnEvery rate-limits the cache-cold warning. It is a per-request
+// condition that only arises while Redis is degraded, i.e. exactly when logging
+// must not amplify the outage.
+const coldWarnEvery = 30 * time.Second
 
 // New builds a Store around an existing Redis client.
 func New(rdb redis.UniversalClient, cfg Config) *Store {
@@ -234,6 +243,17 @@ func (s *Store) Validate(ctx context.Context, token string) (Session, error) {
 	if err != nil {
 		return Session{}, fmt.Errorf("store: validate: %w", err)
 	}
+	// The round trip outlived CacheTTL, so the entry about to be stored is born
+	// expired: the cache is off and every request now goes to a Redis that is
+	// already struggling. Say so, or the operator has to guess before reaching
+	// for the one lever (SESSIOND_CACHE_TTL).
+	if rtt := s.cfg.Now().UnixMilli() - readAt; rtt >= s.cfg.CacheTTL.Milliseconds() {
+		if last := s.coldWarn.Load(); readAt-last >= coldWarnEvery.Milliseconds() &&
+			s.coldWarn.CompareAndSwap(last, readAt) {
+			s.cfg.Logger.Warn("validation cache cold: redis round trip exceeds cache ttl",
+				"rtt_ms", rtt, "cache_ttl_ms", s.cfg.CacheTTL.Milliseconds())
+		}
+	}
 	fields, ok := res.([]any)
 	if !ok || len(fields) == 0 {
 		s.cache.putNegative(id, readAt)
@@ -303,7 +323,13 @@ func (s *Store) RevokeID(ctx context.Context, id string) error {
 }
 
 // RevokeUser revokes every session of (realm, userID) — global logout. It
-// returns the number of sessions revoked.
+// returns index members killed, which is advisory: a record too damaged to name
+// its own realm/uid cannot name its index either, so rotateScript's refusal and
+// revokeScript's ZREM of a wrongly-named index both delete such a key without
+// unlinking the member, and that member is counted here. ponytail: over-count
+// only, every live session is still killed, and it is already surfaced as the
+// `revoked` field on the admin API — count real deletes if a client ever
+// branches on it.
 func (s *Store) RevokeUser(ctx context.Context, realm, userID string) (int, error) {
 	if err := checkNames(realm, userID); err != nil {
 		return 0, err
@@ -348,8 +374,9 @@ func (s *Store) List(ctx context.Context, realm, userID string) ([]Session, erro
 		}
 		sess, err := parseSessionMap(id, m)
 		if err != nil || !sess.AbsDeadline.After(now) {
-			// Corrupt, or past its absolute cap despite a live TTL (clock skew,
-			// restored snapshot). touchScript refuses both, so List — the
+			// Corrupt (missing or unparsable defining field), or past its absolute
+			// cap despite a live TTL (clock skew, restored snapshot). Every script
+			// refuses both, so List — the
 			// surface an operator reads before deciding what to revoke — must
 			// not report either as live. Reporting only: List is a read, and
 			// `now` is this node's unvalidated clock. A node running fast would
@@ -421,6 +448,14 @@ func parseSessionMap(id string, m map[string]string) (Session, error) {
 			return time.Time{}, fmt.Errorf("store: corrupt session %s field %s: %w", id, field, err)
 		}
 		return time.UnixMilli(n), nil
+	}
+	// Same liveness test the scripts apply: a record that cannot name its own
+	// realm/uid is corrupt, and corrupt is dead. Missing and empty are one
+	// verdict here because the scripts normalise '' to false, so a script-backed
+	// caller (Validate, Rotate) fails closed before HGETALL; in practice only
+	// List, which HGETALLs Redis directly, reaches this branch.
+	if m["realm"] == "" || m["uid"] == "" {
+		return Session{}, fmt.Errorf("store: corrupt session %s: missing realm or uid", id)
 	}
 	created, err := ms("created_ms")
 	if err != nil {

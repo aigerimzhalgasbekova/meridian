@@ -11,7 +11,7 @@ import (
 
 func testManager(t *testing.T, now func() time.Time) *Manager {
 	t.Helper()
-	m, err := NewManager([]byte("0123456789abcdef0123456789abcdef"), now)
+	m, err := NewManager([]byte("0123456789abcdef0123456789abcdef"), now, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestConsumeRejects(t *testing.T) {
 	})
 
 	t.Run("forged by other key", func(t *testing.T) {
-		other, err := NewManager([]byte("ffffffffffffffffffffffffffffffff"), nil)
+		other, err := NewManager([]byte("ffffffffffffffffffffffffffffffff"), nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -157,13 +157,15 @@ func TestExpiredFlowsAreSwept(t *testing.T) {
 // so saturation must announce itself or an operator cannot tell a full table
 // from an attack.
 func TestSaturationIsLogged(t *testing.T) {
+	// Through the *configured* logger, not slog.Default(): a service that wires
+	// its own handler must still see this.
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	defer slog.SetDefault(prev)
-
 	clock := time.Now()
-	m := testManager(t, func() time.Time { return clock })
+	m, err := NewManager([]byte("0123456789abcdef0123456789abcdef"),
+		func() time.Time { return clock }, slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < maxFlows; i++ {
 		m.flows[randomToken()] = Flow{Expires: clock.Add(TTL)}
 	}
@@ -187,7 +189,7 @@ func TestChallenge(t *testing.T) {
 }
 
 func TestShortKeyRejected(t *testing.T) {
-	if _, err := NewManager([]byte("short"), nil); err == nil {
+	if _, err := NewManager([]byte("short"), nil, nil); err == nil {
 		t.Fatal("short HMAC key accepted")
 	}
 }

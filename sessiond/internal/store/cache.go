@@ -60,10 +60,9 @@ func (c *cache) get(id string) (sess Session, negative, ok bool) {
 // ponytail: so the cache goes cold exactly when Redis RTT reaches CacheTTL —
 // by construction, since no cached answer can then still be within the ttl
 // staleness bound. Honouring the bound wins over shedding load; the operator
-// lever is raising SESSIOND_CACHE_TTL, which widens the bound explicitly. The
-// signal that it is happening is the request log already emitted per call:
-// duration_ms on /v1/sessions/validate >= CacheTTL. No metric of its own — at
-// the documented CacheTTL=1ms setting one would fire on every request.
+// lever is raising SESSIOND_CACHE_TTL, which widens the bound explicitly.
+// Store.Validate emits a rate-limited warning when it happens, so the lever is
+// reachable without already suspecting the cause.
 func (c *cache) put(id string, sess Session, readAt int64) {
 	c.set(id, cacheEntry{sess: sess, expires: readAt + c.ttl})
 }

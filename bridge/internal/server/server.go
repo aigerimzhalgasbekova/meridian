@@ -87,7 +87,7 @@ func New(cfg Config, reg *provider.Registry, dir directory.Store, signer Signer)
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	rm, err := relay.NewManager(cfg.HMACKey, cfg.Now)
+	rm, err := relay.NewManager(cfg.HMACKey, cfg.Now, cfg.Logger)
 	if err != nil {
 		return nil, err
 	}

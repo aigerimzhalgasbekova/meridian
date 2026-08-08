@@ -113,6 +113,7 @@ const sweepInterval = 30 * time.Second
 type Manager struct {
 	hmacKey []byte
 	now     func() time.Time
+	log     *slog.Logger
 
 	mu        sync.Mutex
 	flows     map[string]Flow
@@ -126,15 +127,20 @@ type Manager struct {
 }
 
 // NewManager builds a Manager. hmacKey must be at least 32 bytes of secret
-// key material; now is injectable for tests (nil = time.Now).
-func NewManager(hmacKey []byte, now func() time.Time) (*Manager, error) {
+// key material; now is injectable for tests (nil = time.Now); log receives the
+// saturation warning and must be the same logger the server audits to
+// (nil = slog.Default()).
+func NewManager(hmacKey []byte, now func() time.Time, log *slog.Logger) (*Manager, error) {
 	if len(hmacKey) < 32 {
 		return nil, errors.New("relay: HMAC key must be at least 32 bytes")
 	}
 	if now == nil {
 		now = time.Now
 	}
-	return &Manager{hmacKey: hmacKey, now: now, flows: make(map[string]Flow)}, nil
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Manager{hmacKey: hmacKey, now: now, log: log, flows: make(map[string]Flow)}, nil
 }
 
 // statePayload is what gets signed into the state parameter.
@@ -173,9 +179,7 @@ func (m *Manager) Begin(provider string, mode Mode, appID, sessionID string) (Fl
 	if now := m.now(); now.Sub(m.lastSweep) >= sweepInterval {
 		m.lastSweep = now
 		if m.evicted > 0 {
-			// ponytail: slog.Default(), not a Manager field — same sink the
-			// server logs to, and nothing to wire through NewManager.
-			slog.Warn("flow table saturated, evicting live flows (their callbacks will log as possible replay)",
+			m.log.Warn("flow table saturated, evicting live flows (their callbacks will log as possible replay)",
 				"evicted", m.evicted, "cap", maxFlows)
 			m.evicted = 0
 		}
