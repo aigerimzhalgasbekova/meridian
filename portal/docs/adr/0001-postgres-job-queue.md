@@ -57,6 +57,23 @@ status as the dead-letter parking lot.
   restart. Ceiling: a job that legitimately runs longer than the window gets a
   concurrent second run and burns an attempt each window until it dead-letters;
   raise it or heartbeat `claimed_at` before adding one.
+- Crash recovery is now delayed and attempt-priced, which the startup
+  `recover()` was neither. This is a different population from the slow handler
+  above: a job interrupted by a crash or a redeploy is an ordinary job whose
+  worker vanished, but it pays the same stale-window cost. It waits up to
+  `STALE_CLAIM_MS` (5 min) before any worker re-hands it out, where the startup
+  requeue picked it up as soon as the process came back — for a password-reset
+  mail, a third of the token's 15-minute TTL spent before the first
+  re-attempt. Each reap also spends an attempt, because attempts increment at
+  claim time and the counter cannot tell a reap from a handler failure, so a job
+  interrupted `DEFAULT_MAX_ATTEMPTS` (5) times across successive deploys is
+  dead-lettered with `STALE_CLAIM_ERROR` and the mail is never sent. Accepted:
+  portal's handlers run for seconds and its redeploys are rare, and the only
+  alternative that removes the delay is the blanket startup requeue whose
+  two-worker bug is the reason it went. Revisit by counting a stale reap
+  separately from a handler failure so a crash does not consume a retry — a
+  smaller change than heartbeating `claimed_at`, and the one to reach for first
+  if a mail is ever lost this way.
 - Handlers must be idempotent: attempts increment at claim time, and a worker
   crash after a side effect re-runs the job. Note that today this is supplied
   entirely by the *dev* transport writing `outbox/<job-id>.json`, where a retry
