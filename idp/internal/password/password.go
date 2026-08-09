@@ -78,15 +78,28 @@ func Verify(plaintext, encoded string) (bool, error) {
 }
 
 // NeedsRehash reports whether the encoded hash uses weaker parameters than p
-// (login paths call this to transparently upgrade hashes over time).
+// (login paths call this to transparently upgrade hashes over time). Weaker
+// means any dimension: cost (m/t/p), salt length, key length, or an outdated
+// argon2 version — Verify accepts all of these, so this is the only place
+// they get caught.
 func NeedsRehash(encoded string, p Params) bool {
 	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 {
+	if len(parts) != 6 || parts[1] != "argon2id" {
+		return true
+	}
+	var version int
+	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
 		return true
 	}
 	var cur Params
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &cur.MemoryKiB, &cur.Iterations, &cur.Parallelism); err != nil {
 		return true
 	}
-	return cur.MemoryKiB < p.MemoryKiB || cur.Iterations < p.Iterations || cur.Parallelism < p.Parallelism
+	salt, err1 := base64.RawStdEncoding.DecodeString(parts[4])
+	key, err2 := base64.RawStdEncoding.DecodeString(parts[5])
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return cur.MemoryKiB < p.MemoryKiB || cur.Iterations < p.Iterations || cur.Parallelism < p.Parallelism ||
+		uint32(len(salt)) < p.SaltLen || uint32(len(key)) < p.KeyLen
 }

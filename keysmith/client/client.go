@@ -62,6 +62,14 @@ type flight struct {
 // kid; only the repeats are throttled.
 const unknownKidInterval = 10 * time.Second
 
+// staleLimit bounds how long a cached JWKS may be served past its freshness
+// window when keysmith is unreachable. Within the bound, verification keeps
+// working through an outage (public keys do not go bad because the server
+// hosting them is down); past it we fail closed — dropping a key out of the
+// JWKS is the only revocation this system has, so a verifier cut off from
+// keysmith must eventually stop honouring keys it can no longer confirm.
+const staleLimit = 24 * time.Hour
+
 // Option configures the client.
 type Option func(*Client)
 
@@ -211,20 +219,20 @@ func (c *Client) refreshOnce(ctx context.Context) (*jose.KeySet, error) {
 }
 
 // keySet returns cached keys, refreshing if stale. Serves stale on refresh
-// failure; fails only if no fetch has ever succeeded.
+// failure up to staleLimit, then verification fails closed.
 func (c *Client) keySet(ctx context.Context) (*jose.KeySet, error) {
 	c.mu.RLock()
 	fresh := c.keys != nil && c.now().Sub(c.fetchedAt) < c.maxAge
-	set := c.keys
+	set, fetchedAt := c.keys, c.fetchedAt
 	c.mu.RUnlock()
 	if fresh {
 		return set, nil
 	}
 	newSet, err := c.refreshOnce(ctx)
 	if err != nil {
-		if set != nil {
+		if set != nil && c.now().Sub(fetchedAt) < staleLimit {
 			c.logStale(err)
-			return set, nil // stale beats broken
+			return set, nil // bounded stale tolerance
 		}
 		return nil, err
 	}

@@ -58,4 +58,17 @@ func TestNeedsRehash(t *testing.T) {
 	if !NeedsRehash("garbage", Default) {
 		t.Error("unparseable hash should need rehash")
 	}
+	shortSalt, _ := Hash("pw", Params{MemoryKiB: Default.MemoryKiB, Iterations: Default.Iterations,
+		Parallelism: Default.Parallelism, SaltLen: 8, KeyLen: Default.KeyLen})
+	if !NeedsRehash(shortSalt, Default) {
+		t.Error("short-salt hash should need rehash")
+	}
+	shortKey, _ := Hash("pw", Params{MemoryKiB: Default.MemoryKiB, Iterations: Default.Iterations,
+		Parallelism: Default.Parallelism, SaltLen: Default.SaltLen, KeyLen: 16})
+	if !NeedsRehash(shortKey, Default) {
+		t.Error("short-key hash should need rehash")
+	}
+	if !NeedsRehash("$argon2id$v=18$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$"+strings.Repeat("A", 43), Default) {
+		t.Error("outdated argon2 version should need rehash")
+	}
 }
