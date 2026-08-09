@@ -178,7 +178,17 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	go srv.RunTicker(ctx, time.Minute)
+	// The ticker writes the keystore, so it must be done before the deferred
+	// fs.Close() releases the single-writer lock and waits on the in-flight
+	// anchor advances — a Close racing a persist can trip a WaitGroup misuse
+	// panic on the way out. Defers run LIFO, so this one precedes fs.Close().
+	tickCtx, stopTicker := context.WithCancel(ctx)
+	tickerDone := make(chan struct{})
+	go func() {
+		defer close(tickerDone)
+		srv.RunTicker(tickCtx, time.Minute)
+	}()
+	defer func() { stopTicker(); <-tickerDone }()
 
 	httpSrv := &http.Server{
 		Addr:              env("KEYSMITH_ADDR", ":8081"),

@@ -351,6 +351,10 @@ module "keysmith" {
 # recovery, environment rebuild), keysmithd refuses to initialize a fresh
 # store while this parameter is non-zero. Accept the fresh start explicitly:
 #   aws ssm put-parameter --name <this parameter> --value 0 --overwrite
+# The value must be a non-negative integer. A negative one (an easy typo on the
+# line above) reads as a corrupt anchor: keysmithd logs it and runs with
+# detection degraded until the next write overwrites it, rather than silently
+# treating every rollback check as satisfied.
 resource "aws_ssm_parameter" "keysmith_generation" {
   name  = "${local.ssm_prefix}/keysmith/generation"
   type  = "String"

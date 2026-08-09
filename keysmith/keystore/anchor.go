@@ -23,7 +23,10 @@ import (
 // keystore; an anchor the same attacker can roll back detects nothing.
 type Anchor interface {
 	// Get returns the anchored generation; 0 if the anchor has never been set,
-	// which permits first-time initialization.
+	// which permits first-time initialization. It must never return a negative
+	// generation — every rollback check is gated on the anchor being positive,
+	// so a negative one disables detection. OpenFileStore rejects it rather
+	// than trusting implementations to hold the line.
 	Get(ctx context.Context) (int, error)
 	// Set records gen as the current generation. Called after the document
 	// carrying gen is durable, never before.
@@ -46,10 +49,12 @@ func NewSSMAnchor(client *ssm.Client, name string) *SSMAnchor {
 func (a *SSMAnchor) Get(ctx context.Context) (int, error) {
 	out, err := a.client.GetParameter(ctx, &ssm.GetParameterInput{
 		Name: aws.String(a.name),
-		// Terraform creates the parameter as String, but tolerate an operator
-		// recreating it as SecureString (every other keysmith parameter is one):
-		// decryption is a no-op for String, and without it a SecureString comes
-		// back as KMS ciphertext that reads as a corrupt generation.
+		// A no-op for the String parameter Terraform creates, and needs no extra
+		// IAM. If an operator recreates it as SecureString (every other keysmith
+		// parameter is one) this is what keeps the value from coming back as KMS
+		// ciphertext that reads as a corrupt generation — but that path also
+		// needs kms:Decrypt, which the task role is not granted, so it surfaces
+		// as an unreadable anchor until the policy is widened.
 		WithDecryption: aws.Bool(true),
 	})
 	var notFound *types.ParameterNotFound

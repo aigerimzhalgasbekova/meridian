@@ -26,11 +26,13 @@ import (
 // open: back-compat on read, upgrade on write, no env var and no operator step.
 // The residual downgrade path — a KEK-less attacker replaying a *retained*
 // pre-upgrade copy whose lifecycle fields are unauthenticated — is closed by
-// the generation Anchor when one is configured: any v1 document under a
-// non-zero anchor is refused outright (its generation field is plaintext the
-// attacker can bump, so it is never compared). An
-// operator-set opt-in did not close it, it only converted the exposure into a
-// way to brick the platform's only signer on deploy. Documented in
+// the generation Anchor when one is configured: a v1 document is refused
+// outright unless the anchor was read and says zero writes (its generation
+// field is plaintext the attacker can bump, so it is never compared, and an
+// unverified anchor cannot clear it either — accepting one degraded would let
+// the upgrade below re-seal the forged lifecycle as an authentic v2 record).
+// An operator-set opt-in did not close it, it only converted the exposure into
+// a way to brick the platform's only signer on deploy. Documented in
 // THREAT_MODEL.md.
 const fileVersion = 2
 
@@ -97,12 +99,17 @@ type fileDoc struct {
 //
 // A non-nil anchor closes the whole-file rollback hole: opening fails if the
 // document's generation is below the anchored one, if the document is v1 while
-// the anchor records writes (every anchored write was v2, and a v1 generation
-// is unauthenticated), or if the file is missing while the anchor says writes
-// happened. All three mean the keystore an attacker (or a bad restore) put in
-// place is older than the one last written — refusing to start is the
-// detection this store otherwise cannot provide. An *unreadable* anchor over
-// an existing file opens degraded (loud log, check re-run before the next
+// the anchor is unverified or records writes (every anchored write was v2, and
+// a v1 generation is unauthenticated), if the document holds no records (one
+// this store never writes, and with no records nothing authenticates its
+// generation — an empty file is otherwise a stand-in for deletion), or if the
+// file is missing while the anchor says writes happened. All four mean the
+// keystore an attacker (or a bad restore) put in place is not the one last
+// written — refusing to start is the detection this store otherwise cannot
+// provide. The anchor is then seeded from the verified document, so detection
+// is live from this start rather than from the first write, which on a healthy
+// store may be a rotation interval away. An *unreadable* anchor over an
+// existing v2 file opens degraded (loud log, check re-run before the next
 // anchor advance) rather than turning an SSM outage into a signing outage.
 // nil skips the check and matches the pre-anchor behavior.
 func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*FileStore, error) {
@@ -126,12 +133,25 @@ func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*F
 	anchored := 0
 	if anchor != nil {
 		gen, err := anchor.Get(ctx)
+		if err == nil && gen < 0 {
+			// Every check below is gated on the anchor being positive, so a
+			// negative value switches rollback detection off *silently* while the
+			// service reports healthy — the worst failure shape a detection
+			// control has. strconv.Atoi accepts "-1" happily, and the documented
+			// reset (`put-parameter --value 0`) is one keystroke away from it.
+			// Treated as an unreadable anchor: loud, and self-healing on the next
+			// advance, which overwrites it with the real generation.
+			err = fmt.Errorf("anchor holds a negative generation %d", gen)
+		}
 		if err != nil {
-			// Fail open, loudly: refusing to start on an anchor outage would turn
-			// any SSM blip, throttle or IAM drift into a platform-wide signing
-			// outage over an intact keystore. The rollback check is skipped for
-			// this start only, and the first write re-reads the anchor before
-			// advancing it, so a rollback masked here is still caught then.
+			// Fail open, loudly, but only for a v2 document (the v1 branch below
+			// refuses): refusing to start on an anchor outage would turn any SSM
+			// blip, throttle or IAM drift into a platform-wide signing outage
+			// over an intact keystore. The generation comparison is skipped for
+			// this start. The seeding advance at the end of this function
+			// re-reads the anchor, so a rollback masked here is *reported* as
+			// soon as SSM answers — but only reported: the process keeps serving
+			// the rolled-back store until an operator acts on the log.
 			slog.Error("keystore: generation anchor unreadable, rollback detection degraded for this start", "err", err)
 		} else {
 			anchored = gen
@@ -170,19 +190,41 @@ func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*F
 		return nil, fmt.Errorf("keystore: %s has document version %d, this build understands 1..%d",
 			path, doc.Version, fileVersion)
 	}
-	if doc.Version < 2 && anchored > 0 {
+	if doc.Version < 2 && anchor != nil && (anchored > 0 || !s.anchorOK) {
 		// Every anchored write was a v2 document (persist always writes
 		// fileVersion), so a v1 file under a non-zero anchor is necessarily a
 		// retained pre-upgrade copy put back — and its generation field is
 		// unauthenticated plaintext (the v1 AAD does not bind it), so the
 		// generation comparison below proves nothing for it. Refuse outright.
+		//
+		// An *unverified* anchor is refused too, and unlike the v2 case this
+		// does not trade away availability for paranoia: opening a v1 document
+		// degraded would accept the forged lifecycle fields the v1 AAD leaves
+		// unauthenticated AND launder them — the upgrade-on-open below re-seals
+		// the forgery as an authentic v2 record and destroys the v1 evidence.
+		// The only start this costs is the first-ever anchored open of a store
+		// still at v1 during an SSM outage; it clears when SSM answers.
 		s.Close()
-		return nil, fmt.Errorf("keystore: %s is a v%d document but the anchor records %d writes at v%d: whole-file rollback detected, refusing to open",
-			path, doc.Version, anchored, fileVersion)
+		return nil, fmt.Errorf("keystore: %s is a v%d document and the anchor (records %d writes at v%d, readable=%t) cannot clear it: whole-file rollback detected, refusing to open",
+			path, doc.Version, anchored, fileVersion, s.anchorOK)
+	}
+	if anchor != nil && len(doc.Keys) == 0 {
+		// persist never writes a zero-record document: the store has no delete,
+		// Put/Update always leave at least one key, and the upgrade path is
+		// guarded on len(s.order) > 0. So an empty document is one this store
+		// never wrote — and it is the deletion check's bypass, because with no
+		// records there is no AEAD binding doc.Generation. Accepting it would
+		// cold-start a fresh key over the real state and then anchor the
+		// attacker's chosen generation, permanently locking out the legitimate
+		// backup. Refused whenever an anchor is configured, including at
+		// anchored == 0, which is exactly when the poisoning is unopposed.
+		s.Close()
+		return nil, fmt.Errorf("keystore: %s holds no key records at generation %d (anchor records %d writes): this store never writes an empty document, refusing to open (to start genuinely fresh, delete %s and reset the anchor parameter to 0)",
+			path, doc.Generation, anchored, path)
 	}
 	if doc.Generation < anchored {
 		s.Close()
-		return nil, fmt.Errorf("keystore: %s carries generation %d but the anchor records %d: whole-file rollback detected, refusing to open",
+		return nil, fmt.Errorf("keystore: %s carries generation %d but the anchor records %d: whole-file rollback detected, refusing to open (if the data volume was replaced on purpose, reset the anchor parameter to 0 to accept this store)",
 			path, doc.Generation, anchored)
 	}
 	s.gen = doc.Generation
@@ -202,6 +244,16 @@ func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*F
 		s.keys[k.ID] = k
 		s.order = append(s.order, k.ID)
 	}
+	// Seed the anchor from the document we just verified. Without this the
+	// anchor is only ever written by persist, and a healthy store rotating on
+	// the default schedule performs no write for weeks after the anchored image
+	// ships — so rollback detection would sit switched off through exactly the
+	// window in which it is believed to be on. Deliberately after the decode
+	// loop: doc.Generation is only trustworthy once the records that bind it
+	// have verified under aadV2. Safe in every direction — advanceAnchor is a
+	// no-op when the anchor is already current, never leads the file, and in the
+	// degraded case re-reads and refuses to lower a higher anchor.
+	s.advanceAnchor(doc.Generation)
 	if doc.Version < fileVersion && len(s.order) > 0 {
 		// Rewrite once at the current version so the lifecycle metadata comes
 		// under the AEAD; after this the old, forgeable form is gone.
