@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
+	"slices"
 )
 
 // JWK is a public JSON Web Key (RFC 7517). This package only ever marshals
@@ -21,6 +23,8 @@ type JWK struct {
 	Kid string `json:"kid"`
 	Use string `json:"use,omitempty"`
 	Alg string `json:"alg,omitempty"`
+	// KeyOps is parsed only to reject non-verification keys; never emitted.
+	KeyOps []string `json:"key_ops,omitempty"`
 
 	// OKP (Ed25519)
 	Crv string `json:"crv,omitempty"`
@@ -82,25 +86,28 @@ func (j JWK) PublicKey() (VerificationKey, error) {
 	if j.Kid == "" {
 		return VerificationKey{}, errors.New("jose: JWK has no kid")
 	}
-	alg := Algorithm(j.Alg)
-	if err := alg.check(); err != nil {
-		return VerificationKey{}, err
+	// RFC 7517 §4.2/§4.3: a key the provider marked for encryption must never
+	// enter a signature-verification set — with alg fixed by kty below, this is
+	// the only gate against key-use confusion (an alg-less use:"enc" RSA key
+	// would otherwise verify ID tokens as RS256).
+	if j.Use != "" && j.Use != "sig" {
+		return VerificationKey{}, fmt.Errorf("jose: JWK has use %q, not a signature key", j.Use)
+	}
+	if len(j.KeyOps) > 0 && !slices.Contains(j.KeyOps, "verify") {
+		return VerificationKey{}, fmt.Errorf("jose: JWK key_ops %v does not permit verify", j.KeyOps)
 	}
 	var pub crypto.PublicKey
+	var alg Algorithm
 	switch {
 	case j.Kty == "OKP" && j.Crv == "Ed25519":
-		if alg != AlgEdDSA {
-			return VerificationKey{}, fmt.Errorf("%w: OKP key with alg %q", ErrAlgMismatch, j.Alg)
-		}
+		alg = AlgEdDSA
 		x, err := b64.DecodeString(j.X)
 		if err != nil || len(x) != ed25519.PublicKeySize {
 			return VerificationKey{}, errors.New("jose: invalid Ed25519 x coordinate")
 		}
 		pub = ed25519.PublicKey(x)
 	case j.Kty == "EC" && j.Crv == "P-256":
-		if alg != AlgES256 {
-			return VerificationKey{}, fmt.Errorf("%w: EC key with alg %q", ErrAlgMismatch, j.Alg)
-		}
+		alg = AlgES256
 		xb, err1 := b64.DecodeString(j.X)
 		yb, err2 := b64.DecodeString(j.Y)
 		if err1 != nil || err2 != nil {
@@ -113,9 +120,7 @@ func (j JWK) PublicKey() (VerificationKey, error) {
 		}
 		pub = &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
 	case j.Kty == "RSA":
-		if alg != AlgRS256 {
-			return VerificationKey{}, fmt.Errorf("%w: RSA key with alg %q", ErrAlgMismatch, j.Alg)
-		}
+		alg = AlgRS256
 		nb, err1 := b64.DecodeString(j.N)
 		eb, err2 := b64.DecodeString(j.E)
 		if err1 != nil || err2 != nil {
@@ -132,6 +137,14 @@ func (j JWK) PublicKey() (VerificationKey, error) {
 		pub = &rsa.PublicKey{N: n, E: int(e.Int64())}
 	default:
 		return VerificationKey{}, fmt.Errorf("jose: unsupported kty/crv %q/%q", j.Kty, j.Crv)
+	}
+	// RFC 7517 makes `alg` optional, and real providers (Microsoft Entra ID)
+	// omit it — so the key type, not the JWK's alg member, fixes the algorithm
+	// here. This package binds exactly one alg per kty/crv, matching its stance
+	// that the key set (never the token) decides the algorithm. When alg *is*
+	// present it must agree, or the JWK is self-contradictory (kty=RSA, alg=ES256).
+	if j.Alg != "" && Algorithm(j.Alg) != alg {
+		return VerificationKey{}, fmt.Errorf("%w: %s key with alg %q", ErrAlgMismatch, j.Kty, j.Alg)
 	}
 	return VerificationKey{ID: j.Kid, Alg: alg, Public: pub}, nil
 }
@@ -170,6 +183,8 @@ func ParseJWKS(doc []byte) (*KeySet, error) {
 		return nil, fmt.Errorf("jose: parse JWKS: %w", err)
 	}
 	keys := make([]VerificationKey, 0, len(set.Keys))
+	seen := make(map[string]string, len(set.Keys)) // kid -> RFC 7638 thumbprint
+	conflicted := make(map[string]bool)
 	var rejected int
 	var firstErr error
 	for _, j := range set.Keys {
@@ -181,10 +196,52 @@ func ParseJWKS(doc []byte) (*KeySet, error) {
 			}
 			continue
 		}
+		tp, err := Thumbprint(k.Public)
+		if err != nil {
+			rejected++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("jose: JWKS key %q: %w", j.Kid, err)
+			}
+			continue
+		}
+		// RFC 7517 §4.5 only says kid SHOULD be distinct, so a JWKS we do not
+		// control may repeat one. A byte-identical duplicate is harmless and
+		// collapses. Different key material under one kid is ambiguous: picking
+		// either half silently is a coin flip that can install a stale key over
+		// the live one, so the kid is dropped entirely — tokens naming it fail
+		// closed with ErrUnknownKey while every other key keeps working.
+		if prev, dup := seen[k.ID]; dup {
+			if prev == tp {
+				continue
+			}
+			conflicted[k.ID] = true
+			if firstErr == nil {
+				firstErr = fmt.Errorf("jose: JWKS key %q: duplicate kid with conflicting key material", k.ID)
+			}
+			continue
+		}
+		seen[k.ID] = tp
 		keys = append(keys, k)
+	}
+	if len(conflicted) > 0 {
+		kept := keys[:0]
+		for _, k := range keys {
+			if conflicted[k.ID] {
+				rejected += 2 // both halves of the conflict are unusable
+				continue
+			}
+			kept = append(kept, k)
+		}
+		keys = kept
 	}
 	if len(keys) == 0 && rejected > 0 {
 		return nil, fmt.Errorf("jose: parse JWKS: no usable keys (%d rejected): %w", rejected, firstErr)
+	}
+	// A partially-rejected document parses fine but must not do so silently:
+	// a conflicted kid means every token signed under it fails until the
+	// upstream fixes its JWKS, and this is the only place that knows why.
+	if rejected > 0 {
+		slog.Warn("jose: JWKS parsed with rejected keys", "rejected", rejected, "kept", len(keys), "err", firstErr)
 	}
 	return NewKeySet(keys...)
 }

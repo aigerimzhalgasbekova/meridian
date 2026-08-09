@@ -265,6 +265,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Guard.RecordSuccess(ctx, realm.Name, username, ip)
+	// Transparent hash upgrade: this is the only moment the plaintext is in
+	// hand, so hashes minted under older (weaker) parameters get rewritten
+	// here. Best-effort — the login proceeds either way.
+	if password.NeedsRehash(user.PasswordHash, password.Default) {
+		if h, err := password.Hash(pass, password.Default); err == nil {
+			user.PasswordHash = h
+			user.UpdatedAt = time.Now()
+			_ = s.cfg.Store.Users().Update(ctx, user)
+		}
+	}
 	if err := s.establishSession(w, r, realm, user.ID); err != nil {
 		s.writePageError(w, http.StatusInternalServerError, "Error", "Could not establish a session.")
 		return

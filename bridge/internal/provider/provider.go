@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -143,6 +144,14 @@ var upstreamAlgs = []jose.Algorithm{jose.AlgRS256, jose.AlgES256}
 // because a key revoked after compromise must eventually stop verifying.
 const jwksStaleLimit = 24 * time.Hour
 
+// metaStaleLimit bounds how long cached discovery metadata may be served past
+// its freshness window when the discovery endpoint is unreachable. Mirrors
+// jwksStaleLimit: endpoints move rarely, so a login should survive a brief
+// outage — but unbounded, a token_endpoint hostname the upstream has since
+// decommissioned or re-registered would keep receiving the client_secret and
+// live authorization codes forever. Past the bound we fail closed.
+const metaStaleLimit = 24 * time.Hour
+
 const (
 	defaultMaxAge = 5 * time.Minute
 	maxBody       = 1 << 20
@@ -167,6 +176,24 @@ type Provider struct {
 	jwksETag    string
 	jwksFetched time.Time
 	jwksMaxAge  time.Duration
+	// warn-once-per-outage flags for the stale-serve paths
+	metaStaleLogged bool
+	jwksStaleLogged bool
+}
+
+// logStale warns once per outage that a cache has stopped refreshing and is
+// being served stale. Stale tolerance is deliberate; doing it *silently* is
+// not — the stale window otherwise ends in a fail-closed login cliff with no
+// leading operator signal.
+func (p *Provider) logStale(flag *bool, what string, fetched time.Time, cause error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if *flag {
+		return
+	}
+	*flag = true
+	slog.Warn("provider: serving stale "+what,
+		"provider", p.cfg.Name, "age", p.now().Sub(fetched), "err", cause)
 }
 
 // Option configures a Provider.
@@ -221,20 +248,27 @@ func (p *Provider) Breaker() *health.Breaker { return p.breaker }
 // Healthy reports whether the breaker currently admits calls.
 func (p *Provider) Healthy() bool { return p.breaker.State() != health.Open }
 
-// Metadata returns the discovery document, from cache when fresh. Stale
-// metadata is served on refresh failure (endpoints move rarely; a login that
-// can proceed on 10-minute-old endpoint URLs should).
+// Metadata returns the discovery document, from cache when fresh. On refresh
+// failure a stale document is served up to metaStaleLimit (endpoints move
+// rarely; a login that can proceed on hours-old endpoint URLs should), then we
+// fail closed rather than POST credentials to an endpoint that may have moved.
 func (p *Provider) Metadata(ctx context.Context) (*Metadata, error) {
 	p.mu.Lock()
 	fresh := p.meta != nil && p.now().Sub(p.metaFetched) < p.maxAgeOr(p.metaMaxAge)
-	meta := p.meta
+	meta, fetched := p.meta, p.metaFetched
 	p.mu.Unlock()
 	if fresh {
 		return meta, nil
 	}
 	if err := p.breaker.Do(func() error { return p.refreshMetadata(ctx) }); err != nil {
-		if meta != nil {
-			return meta, nil // stale beats broken
+		// Re-read under the lock: a concurrent caller may have refreshed
+		// successfully while this one's request failed.
+		p.mu.Lock()
+		meta, fetched = p.meta, p.metaFetched
+		p.mu.Unlock()
+		if meta != nil && p.now().Sub(fetched) < metaStaleLimit {
+			p.logStale(&p.metaStaleLogged, "discovery metadata", fetched, err)
+			return meta, nil // bounded stale tolerance
 		}
 		return nil, err
 	}
@@ -275,6 +309,7 @@ func (p *Provider) refreshMetadata(ctx context.Context) error {
 		}
 		p.metaFetched = p.now()
 		p.metaMaxAge = parseMaxAge(resp.Header.Get("Cache-Control"))
+		p.metaStaleLogged = false
 		return nil
 	case http.StatusOK:
 		var meta Metadata
@@ -296,6 +331,7 @@ func (p *Provider) refreshMetadata(ctx context.Context) error {
 		p.metaETag = resp.Header.Get("ETag")
 		p.metaFetched = p.now()
 		p.metaMaxAge = parseMaxAge(resp.Header.Get("Cache-Control"))
+		p.metaStaleLogged = false
 		return nil
 	default:
 		return fmt.Errorf("provider %s: discovery: %s", p.cfg.Name, resp.Status)
@@ -313,7 +349,13 @@ func (p *Provider) keySet(ctx context.Context) (*jose.KeySet, error) {
 		return set, nil
 	}
 	if err := p.refreshKeys(ctx); err != nil {
+		// Re-read under the lock: a concurrent caller may have refreshed
+		// successfully while this one's request failed.
+		p.mu.Lock()
+		set, fetched = p.keys, p.jwksFetched
+		p.mu.Unlock()
 		if set != nil && p.now().Sub(fetched) < jwksStaleLimit {
+			p.logStale(&p.jwksStaleLogged, "JWKS", fetched, err)
 			return set, nil // bounded stale tolerance
 		}
 		return nil, fmt.Errorf("%w: %v", ErrKeysUnavailable, err)
@@ -353,6 +395,7 @@ func (p *Provider) refreshKeys(ctx context.Context) error {
 			}
 			p.jwksFetched = p.now()
 			p.jwksMaxAge = parseMaxAge(resp.Header.Get("Cache-Control"))
+			p.jwksStaleLogged = false
 			return nil
 		case http.StatusOK:
 			raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
@@ -367,6 +410,7 @@ func (p *Provider) refreshKeys(ctx context.Context) error {
 			p.jwksETag = resp.Header.Get("ETag")
 			p.jwksFetched = p.now()
 			p.jwksMaxAge = parseMaxAge(resp.Header.Get("Cache-Control"))
+			p.jwksStaleLogged = false
 			return nil
 		default:
 			return fmt.Errorf("provider %s: jwks: %s", p.cfg.Name, resp.Status)

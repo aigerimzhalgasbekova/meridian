@@ -180,6 +180,12 @@ func TestClientServesStaleOnOutage(t *testing.T) {
 	if _, err := f.client.Verify(ctx, token, jose.Expect{}); err != nil {
 		t.Fatalf("stale-if-error failed: %v", err)
 	}
+	// Past staleLimit the verifier has lost its revocation coverage for a
+	// full day: fail closed rather than honour keys it can no longer confirm.
+	f.clock.Advance(25 * time.Hour)
+	if _, err := f.client.Verify(ctx, token, jose.Expect{}); err == nil {
+		t.Fatal("stale JWKS past the bound must fail closed")
+	}
 }
 
 func TestClientVerifyOnlyNoToken(t *testing.T) {
