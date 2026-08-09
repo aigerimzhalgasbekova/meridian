@@ -22,9 +22,9 @@ import (
 // Implementations must not store the anchor on the same filesystem as the
 // keystore; an anchor the same attacker can roll back detects nothing.
 type Anchor interface {
-	// Get returns the anchored generation. ok is false if the anchor has never
-	// been set, which permits first-time initialization.
-	Get(ctx context.Context) (gen int, ok bool, err error)
+	// Get returns the anchored generation; 0 if the anchor has never been set,
+	// which permits first-time initialization.
+	Get(ctx context.Context) (int, error)
 	// Set records gen as the current generation. Called after the document
 	// carrying gen is durable, never before.
 	Set(ctx context.Context, gen int) error
@@ -43,20 +43,27 @@ func NewSSMAnchor(client *ssm.Client, name string) *SSMAnchor {
 	return &SSMAnchor{client: client, name: name}
 }
 
-func (a *SSMAnchor) Get(ctx context.Context) (int, bool, error) {
-	out, err := a.client.GetParameter(ctx, &ssm.GetParameterInput{Name: aws.String(a.name)})
+func (a *SSMAnchor) Get(ctx context.Context) (int, error) {
+	out, err := a.client.GetParameter(ctx, &ssm.GetParameterInput{
+		Name: aws.String(a.name),
+		// Terraform creates the parameter as String, but tolerate an operator
+		// recreating it as SecureString (every other keysmith parameter is one):
+		// decryption is a no-op for String, and without it a SecureString comes
+		// back as KMS ciphertext that reads as a corrupt generation.
+		WithDecryption: aws.Bool(true),
+	})
 	var notFound *types.ParameterNotFound
 	if errors.As(err, &notFound) {
-		return 0, false, nil
+		return 0, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("get %s: %w", a.name, err)
+		return 0, fmt.Errorf("get %s: %w", a.name, err)
 	}
 	gen, err := strconv.Atoi(aws.ToString(out.Parameter.Value))
 	if err != nil {
-		return 0, false, fmt.Errorf("parameter %s does not hold a generation: %w", a.name, err)
+		return 0, fmt.Errorf("parameter %s does not hold a generation: %w", a.name, err)
 	}
-	return gen, true, nil
+	return gen, nil
 }
 
 func (a *SSMAnchor) Set(ctx context.Context, gen int) error {

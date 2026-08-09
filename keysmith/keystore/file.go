@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -25,8 +26,9 @@ import (
 // open: back-compat on read, upgrade on write, no env var and no operator step.
 // The residual downgrade path — a KEK-less attacker replaying a *retained*
 // pre-upgrade copy whose lifecycle fields are unauthenticated — is closed by
-// the generation Anchor when one is configured: the retained copy necessarily
-// carries a generation below the anchored one and is refused on open. An
+// the generation Anchor when one is configured: any v1 document under a
+// non-zero anchor is refused outright (its generation field is plaintext the
+// attacker can bump, so it is never compared). An
 // operator-set opt-in did not close it, it only converted the exposure into a
 // way to brick the platform's only signer on deploy. Documented in
 // THREAT_MODEL.md.
@@ -42,6 +44,16 @@ type FileStore struct {
 	kek    KEK
 	anchor Anchor // nil disables rollback detection (dev / no external store)
 	lock   *os.File
+
+	// Anchor advances run in goroutines off the store (and manager) locks so
+	// reads never wait on SSM; anchorMu serializes them and anchorHigh keeps the
+	// anchor monotonic when persists overlap. anchorOK false means the open-time
+	// read failed and the store is running degraded: the next advance re-reads
+	// the anchor before writing it (see advanceAnchor).
+	anchorMu   sync.Mutex
+	anchorHigh int
+	anchorOK   bool
+	anchorWG   sync.WaitGroup
 
 	mu    sync.RWMutex
 	keys  map[string]Key
@@ -84,10 +96,14 @@ type fileDoc struct {
 // holds an exclusive advisory lock until Close.
 //
 // A non-nil anchor closes the whole-file rollback hole: opening fails if the
-// document's generation is below the anchored one, or if the file is missing
-// while the anchor says writes happened. Both failures mean the keystore an
-// attacker (or a bad restore) put in place is older than the one last written
-// — refusing to start is the detection this store otherwise cannot provide.
+// document's generation is below the anchored one, if the document is v1 while
+// the anchor records writes (every anchored write was v2, and a v1 generation
+// is unauthenticated), or if the file is missing while the anchor says writes
+// happened. All three mean the keystore an attacker (or a bad restore) put in
+// place is older than the one last written — refusing to start is the
+// detection this store otherwise cannot provide. An *unreadable* anchor over
+// an existing file opens degraded (loud log, check re-run before the next
+// anchor advance) rather than turning an SSM outage into a signing outage.
 // nil skips the check and matches the pre-anchor behavior.
 func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*FileStore, error) {
 	s := &FileStore{path: path, kek: kek, anchor: anchor, keys: make(map[string]Key)}
@@ -109,13 +125,18 @@ func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*F
 
 	anchored := 0
 	if anchor != nil {
-		gen, ok, err := anchor.Get(ctx)
+		gen, err := anchor.Get(ctx)
 		if err != nil {
-			s.Close()
-			return nil, fmt.Errorf("keystore: read generation anchor: %w", err)
-		}
-		if ok {
+			// Fail open, loudly: refusing to start on an anchor outage would turn
+			// any SSM blip, throttle or IAM drift into a platform-wide signing
+			// outage over an intact keystore. The rollback check is skipped for
+			// this start only, and the first write re-reads the anchor before
+			// advancing it, so a rollback masked here is still caught then.
+			slog.Error("keystore: generation anchor unreadable, rollback detection degraded for this start", "err", err)
+		} else {
 			anchored = gen
+			s.anchorOK = true
+			s.anchorHigh = gen
 		}
 	}
 
@@ -123,8 +144,15 @@ func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*F
 	if errors.Is(err, os.ErrNotExist) {
 		if anchored > 0 {
 			s.Close()
-			return nil, fmt.Errorf("keystore: %s is missing but the generation anchor records %d writes: refusing to initialize a fresh store over a rolled-back one",
+			return nil, fmt.Errorf("keystore: %s is missing but the generation anchor records %d writes: refusing to initialize a fresh store over a rolled-back one (if the data volume was replaced on purpose, reset the anchor parameter to 0 to accept a fresh store)",
 				path, anchored)
+		}
+		if anchor != nil && !s.anchorOK {
+			// No file and no anchor reading: a fresh install and a wiped store
+			// look identical. Unlike the existing-file case above there is
+			// nothing to serve degraded, so wait out the outage.
+			s.Close()
+			return nil, fmt.Errorf("keystore: %s is missing and the generation anchor is unreadable: cannot tell a fresh install from a wiped store, refusing to initialize", path)
 		}
 		return s, nil
 	}
@@ -141,6 +169,16 @@ func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*F
 		s.Close()
 		return nil, fmt.Errorf("keystore: %s has document version %d, this build understands 1..%d",
 			path, doc.Version, fileVersion)
+	}
+	if doc.Version < 2 && anchored > 0 {
+		// Every anchored write was a v2 document (persist always writes
+		// fileVersion), so a v1 file under a non-zero anchor is necessarily a
+		// retained pre-upgrade copy put back — and its generation field is
+		// unauthenticated plaintext (the v1 AAD does not bind it), so the
+		// generation comparison below proves nothing for it. Refuse outright.
+		s.Close()
+		return nil, fmt.Errorf("keystore: %s is a v%d document but the anchor records %d writes at v%d: whole-file rollback detected, refusing to open",
+			path, doc.Version, anchored, fileVersion)
 	}
 	if doc.Generation < anchored {
 		s.Close()
@@ -175,8 +213,10 @@ func OpenFileStore(ctx context.Context, path string, kek KEK, anchor Anchor) (*F
 	return s, nil
 }
 
-// Close releases the keystore lock.
+// Close waits for in-flight anchor advances (each bounded by its own timeout)
+// and releases the keystore lock.
 func (s *FileStore) Close() error {
+	s.anchorWG.Wait()
 	if s.lock == nil {
 		return nil
 	}
@@ -330,15 +370,60 @@ func (s *FileStore) persist(ctx context.Context) error {
 	// Anchor strictly after the document is durable, never before: an anchor
 	// ahead of the file would make the next open refuse a legitimate store —
 	// a self-inflicted brick of the platform's only signer. An anchor *behind*
-	// the file is safe (the open check is doc.Generation >= anchor), so a
-	// failed Set costs one generation of rollback-detection lag and a loud
-	// error, nothing more.
-	if s.anchor != nil {
-		if err := s.anchor.Set(ctx, next); err != nil {
-			return fmt.Errorf("advance generation anchor: %w", err)
-		}
-	}
+	// the file is safe (the open check is doc.Generation >= anchor), so the
+	// advance is asynchronous and best-effort: failing this write for an anchor
+	// error would desync memory from the durable file (the caller rolls back
+	// state a restart resurrects), and blocking on SSM here would stall every
+	// read behind the locks the callers hold. A failed advance costs one
+	// generation of rollback-detection lag and a loud error, nothing more.
+	s.advanceAnchor(next)
 	return nil
+}
+
+// advanceAnchor records gen in the anchor from a goroutine: best-effort (the
+// document is already durable; the anchor lagging is the safe direction),
+// monotonic across overlapping persists, and off every lock a reader can wait
+// on. Close waits for in-flight advances.
+func (s *FileStore) advanceAnchor(gen int) {
+	if s.anchor == nil {
+		return
+	}
+	s.anchorWG.Add(1)
+	go func() {
+		defer s.anchorWG.Done()
+		s.anchorMu.Lock()
+		defer s.anchorMu.Unlock()
+		if gen <= s.anchorHigh {
+			return // a later persist already anchored past this write
+		}
+		// Fresh bounded context: the caller's may already be gone, and Close
+		// must never wait on a hung SSM call longer than this.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if !s.anchorOK {
+			// The store opened degraded (anchor unreadable). Re-read before
+			// writing: blindly Setting could overwrite an anchor recording more
+			// writes than this store has seen — destroying the one piece of
+			// evidence of a rollback the open could not check for.
+			current, err := s.anchor.Get(ctx)
+			if err != nil {
+				slog.Error("keystore: generation anchor still unreadable, rollback detection stays degraded", "err", err)
+				return
+			}
+			if current > gen {
+				slog.Error("keystore: anchor records more writes than this store has seen: the keystore was likely rolled back before the degraded open; refusing to advance the anchor",
+					"anchored", current, "generation", gen)
+				return
+			}
+			s.anchorOK = true
+			s.anchorHigh = current
+		}
+		if err := s.anchor.Set(ctx, gen); err != nil {
+			slog.Error("keystore: advance generation anchor failed, rollback detection lags until the next successful advance", "generation", gen, "err", err)
+			return
+		}
+		s.anchorHigh = gen
+	}()
 }
 
 func (s *FileStore) Put(ctx context.Context, k Key) error {

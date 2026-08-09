@@ -21,8 +21,11 @@ locals {
   ephemeral = !local.is_prod # RDS: no deletion protection, no final snapshot
   cheap     = !local.is_prod # no NAT/WAF/Container Insights
 
-  # SSM SecureString parameters created out-of-band (runbook step 3).
-  ssm = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/meridian/${var.environment}"
+  # One source of truth for the SSM parameter namespace: the SecureString
+  # secrets (created out-of-band, runbook step 3) reference it as an ARN, the
+  # Terraform-owned generation anchor as a name.
+  ssm_prefix = "/meridian/${var.environment}"
+  ssm        = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter${local.ssm_prefix}"
 
   sd_domain = "meridian.local"
 }
@@ -295,6 +298,9 @@ module "keysmith" {
     # attacker with EFS write access replaying a retained copy) is a startup
     # failure instead of a silent key-state downgrade.
     KEYSMITH_GENERATION_ANCHOR = aws_ssm_parameter.keysmith_generation.name
+    # The anchor's SSM client resolves its region from the environment; nothing
+    # else in this task definition injects one.
+    AWS_REGION = var.region
   }
   # ONE-WAY DEPLOY: the first v2 keysmith to start rewrites /data/keys.json at
   # document version 2, and a pre-v2 image refuses to open it ("understands
@@ -340,8 +346,13 @@ module "keysmith" {
 # out-of-band by the runbook), Terraform owns this parameter: it is not a
 # secret, and seeding it at 0 lets a fresh environment initialize. keysmithd
 # overwrites the value on every keystore write, hence ignore_changes.
+#
+# Recovery: if the EFS keystore is lost or replaced ON PURPOSE (disaster
+# recovery, environment rebuild), keysmithd refuses to initialize a fresh
+# store while this parameter is non-zero. Accept the fresh start explicitly:
+#   aws ssm put-parameter --name <this parameter> --value 0 --overwrite
 resource "aws_ssm_parameter" "keysmith_generation" {
-  name  = "/meridian/${var.environment}/keysmith/generation"
+  name  = "${local.ssm_prefix}/keysmith/generation"
   type  = "String"
   value = "0"
 

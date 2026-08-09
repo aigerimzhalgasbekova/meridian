@@ -31,7 +31,7 @@ with signer services (idp), verifiers (every other service), and operators.
 | 2 | Stolen keystore file | AES-256-GCM envelope; useless without KEK |
 | 3 | Keystore record shuffling by attacker with file write | AAD mismatch → fails closed (tested) |
 | 3b | Lifecycle rewrite by attacker with file write (retired key flipped back to `active`, `created_at` backdated past the dwell) | AAD covers state, all four timestamps and the document generation (v2). A v1 document — whose lifecycle fields are unauthenticated — is accepted on read and rewritten at v2 on that same start, so the deployed file self-upgrades with no operator step; a *retained* pre-upgrade copy is replayable with forged lifecycle state only where no generation anchor is configured (see 3c; residual risk below). The generation stops an authentic record kept from while the key was active being spliced over its retired successor (tested) |
-| 3c | Whole-file rollback: an attacker with file write (or a bad restore) puts back an entire older keystore — internally consistent, opens cleanly, and in its v1 form carries forgeable lifecycle fields | Generation anchor (SSM parameter via `keystore.Anchor`, deployed by Terraform): the current generation is persisted outside the keystore after every write, and the store refuses to open a document below the anchored generation — or a missing file the anchor knows was written. Anchor advances strictly *after* the file is durable, so anchor failure can delay detection by one write but can never brick a legitimate store (tested) |
+| 3c | Whole-file rollback: an attacker with file write (or a bad restore) puts back an entire older keystore — internally consistent, opens cleanly, and in its v1 form carries forgeable lifecycle fields | Generation anchor (SSM parameter via `keystore.Anchor`, deployed by Terraform): the current generation is persisted outside the keystore after every write, and the store refuses to open a document below the anchored generation, *any* v1 document while the anchor records writes (a v1 generation is unauthenticated plaintext, so it is refused rather than compared), or a missing file the anchor knows was written. The anchor advances asynchronously, best-effort, strictly *after* the file is durable: a failed advance costs one write of detection lag and a loud error but never fails a durable write and never bricks a legitimate store. An anchor that cannot be *read* at startup opens an intact keystore degraded (loud error) and re-runs the check before the next advance, refusing to lower an anchor that records more writes than the store has seen (tested) |
 | 4 | Signer-token holder mints long-lived tokens | `MaxTokenTTL` cap server-side; `exp`/`iat` are server-set, client-supplied values rejected |
 | 5 | Token survives its key's retirement | `MaxTokenTTL ≤ RetireAfter` enforced at construction |
 | 6 | Verifier cache poisoning window during rotation | `JWKSMaxAge ≤ PendingDwell/2` enforced; pending keys published before signing |
@@ -56,7 +56,17 @@ with signer services (idp), verifiers (every other service), and operators.
   opens. The deployed Terraform wires the anchor unconditionally; the residual
   is the unanchored configuration itself, plus an adversary who can write both
   the keystore *and* the SSM parameter (that requires the task role or IAM
-  access, a different compromise class than EFS file write). Gating v1
+  access, a different compromise class than EFS file write). Two further
+  windows are accepted with the anchor wired: the advance is best-effort after
+  each durable write, so a write whose advance failed is unprotected until the
+  next successful one; and an anchor that cannot be *read* at startup opens an
+  existing keystore degraded — availability over fail-closed for the
+  platform's only signer — with the check re-run before the next advance. An
+  adversary who can make the task's SSM reads fail sits in the IAM/network
+  compromise class, not the file-write class. A fresh store is never
+  initialized while the anchor is non-zero or unreadable; deliberate data
+  replacement requires resetting the parameter to 0 (documented in
+  Terraform). Gating v1
   acceptance on an operator-set variable was tried and removed: it did not
   close the window (nothing forces the variable back off) and it gave the
   upgrade deploy a way to brick the platform's only signer.
