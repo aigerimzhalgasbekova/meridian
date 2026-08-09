@@ -34,7 +34,7 @@ func TestFileStorePersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "keys.json")
 	kek := testKEK(t)
 
-	s1, err := OpenFileStore(ctx, path, kek)
+	s1, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestFileStorePersistsAcrossReopen(t *testing.T) {
 	}
 
 	// Reopen: key must round-trip through envelope encryption and sign.
-	s2, err := OpenFileStore(ctx, path, kek)
+	s2, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestFileStorePersistsAcrossReopen(t *testing.T) {
 func TestFileStoreNoPlaintextKeyMaterialOnDisk(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "keys.json")
-	s, err := OpenFileStore(ctx, path, testKEK(t))
+	s, err := OpenFileStore(ctx, path, testKEK(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestFileStoreNoPlaintextKeyMaterialOnDisk(t *testing.T) {
 func TestFileStoreWrongKEKFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "keys.json")
-	s, err := OpenFileStore(ctx, path, testKEK(t))
+	s, err := OpenFileStore(ctx, path, testKEK(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestFileStoreWrongKEKFailsClosed(t *testing.T) {
 
 	t.Run("different KEK id", func(t *testing.T) {
 		other := testKEK(t)
-		if _, err := OpenFileStore(ctx, path, other); err == nil {
+		if _, err := OpenFileStore(ctx, path, other, nil); err == nil {
 			t.Fatal("store opened with wrong KEK")
 		}
 	})
@@ -147,7 +147,7 @@ func TestFileStoreWrongKEKFailsClosed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenFileStore(ctx, path, imposter); err == nil {
+		if _, err := OpenFileStore(ctx, path, imposter, nil); err == nil {
 			t.Fatal("store opened with imposter KEK")
 		}
 	})
@@ -157,7 +157,7 @@ func TestFileStoreTamperDetection(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "keys.json")
 	kek := testKEK(t)
-	s, err := OpenFileStore(ctx, path, kek)
+	s, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestFileStoreTamperDetection(t *testing.T) {
 	if err := os.WriteFile(path, swapped, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenFileStore(ctx, path, kek); err == nil {
+	if _, err := OpenFileStore(ctx, path, kek, nil); err == nil {
 		t.Fatal("record swap between key IDs went undetected")
 	}
 }
@@ -209,7 +209,7 @@ func TestFileStorePublicKeyTamperRejected(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "keys.json")
 	kek := testKEK(t)
-	s, err := OpenFileStore(ctx, path, kek)
+	s, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestFileStorePublicKeyTamperRejected(t *testing.T) {
 	// public_jwk is not the source of truth: it is ignored and the public key
 	// is re-derived from the encrypted private material, so the attacker's key
 	// never gets published under the legitimate kid.
-	s2, err := OpenFileStore(ctx, path, kek)
+	s2, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatalf("reopen after public_jwk swap: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestFileStorePublicKeyTamperRejected(t *testing.T) {
 	if err := os.WriteFile(path, badKid, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenFileStore(ctx, path, kek); err == nil {
+	if _, err := OpenFileStore(ctx, path, kek, nil); err == nil {
 		t.Fatal("kid/thumbprint mismatch went undetected")
 	}
 }
@@ -330,7 +330,7 @@ func TestFileStoreLifecycleTamperRejected(t *testing.T) {
 	for _, tc := range mutations {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "keys.json")
-			s, err := OpenFileStore(ctx, path, kek)
+			s, err := OpenFileStore(ctx, path, kek, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -350,7 +350,7 @@ func TestFileStoreLifecycleTamperRejected(t *testing.T) {
 			tc.edit(&doc.Keys[0])
 			writeDoc(t, path, doc)
 
-			s2, err := OpenFileStore(ctx, path, kek)
+			s2, err := OpenFileStore(ctx, path, kek, nil)
 			if err == nil {
 				s2.Close()
 				t.Fatal("lifecycle metadata edited in plaintext went undetected")
@@ -371,7 +371,7 @@ func TestFileStoreRecordReplayRejected(t *testing.T) {
 	kek := testKEK(t)
 	now := time.Now().UTC()
 
-	s, err := OpenFileStore(ctx, path, kek)
+	s, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +416,7 @@ func TestFileStoreRecordReplayRejected(t *testing.T) {
 			}
 			writeDoc(t, path, doc)
 
-			s2, err := OpenFileStore(ctx, path, kek)
+			s2, err := OpenFileStore(ctx, path, kek, nil)
 			if err == nil {
 				got, _ := s2.Get(ctx, k1.ID)
 				s2.Close()
@@ -459,7 +459,7 @@ func TestFileStoreV1LoadsAndUpgrades(t *testing.T) {
 		KEKID: kek.ID(), WrappedDEK: wrapped, PrivateCT: ct, PublicJWK: pubJWK,
 	}}})
 
-	s, err := OpenFileStore(ctx, path, kek)
+	s, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatalf("v1 keystore does not open — this bricks live deployments: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestFileStoreV1LoadsAndUpgrades(t *testing.T) {
 	doc := readDoc(t, path)
 	doc.Keys[0].State = string(StateRetired)
 	writeDoc(t, path, doc)
-	if s2, err := OpenFileStore(ctx, path, kek); err == nil {
+	if s2, err := OpenFileStore(ctx, path, kek, nil); err == nil {
 		s2.Close()
 		t.Fatal("state edit accepted after the v2 upgrade")
 	}
@@ -502,7 +502,7 @@ func TestPersistDoesNotReuseAGenerationAfterDirSyncFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "keys.json")
 	kek := testKEK(t)
-	s, err := OpenFileStore(ctx, path, kek)
+	s, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +549,7 @@ func TestOpenFileStoreRejectsCorruptDocuments(t *testing.T) {
 	newStore := func(t *testing.T) (string, fileDoc) {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "keys.json")
-		s, err := OpenFileStore(ctx, path, kek)
+		s, err := OpenFileStore(ctx, path, kek, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -574,7 +574,7 @@ func TestOpenFileStoreRejectsCorruptDocuments(t *testing.T) {
 		path, doc := newStore(t)
 		doc.Keys = append(doc.Keys, doc.Keys[0])
 		writeDoc(t, path, doc)
-		s, err := OpenFileStore(ctx, path, kek)
+		s, err := OpenFileStore(ctx, path, kek, nil)
 		if err == nil {
 			s.Close()
 			t.Fatal("duplicate key record accepted")
@@ -588,7 +588,7 @@ func TestOpenFileStoreRejectsCorruptDocuments(t *testing.T) {
 		path, doc := newStore(t)
 		doc.Version = fileVersion + 1
 		writeDoc(t, path, doc)
-		s, err := OpenFileStore(ctx, path, kek)
+		s, err := OpenFileStore(ctx, path, kek, nil)
 		if err == nil {
 			s.Close()
 			t.Fatal("future document version accepted")
@@ -602,12 +602,12 @@ func TestFileStoreRefusesASecondWriter(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "keys.json")
 	kek := testKEK(t)
-	s1, err := OpenFileStore(ctx, path, kek)
+	s1, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s1.Close()
-	if s2, err := OpenFileStore(ctx, path, kek); err == nil {
+	if s2, err := OpenFileStore(ctx, path, kek, nil); err == nil {
 		s2.Close()
 		t.Fatal("a second writer opened the same keystore")
 	}
@@ -615,7 +615,7 @@ func TestFileStoreRefusesASecondWriter(t *testing.T) {
 	if err := s1.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s3, err := OpenFileStore(ctx, path, kek)
+	s3, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatalf("lock not released on Close: %v", err)
 	}
@@ -639,7 +639,7 @@ func TestManagerOnFileStore(t *testing.T) {
 	kek := testKEK(t)
 	clock := newFakeClock()
 
-	s1, err := OpenFileStore(ctx, path, kek)
+	s1, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -659,7 +659,7 @@ func TestManagerOnFileStore(t *testing.T) {
 	if err := s1.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s2, err := OpenFileStore(ctx, path, kek)
+	s2, err := OpenFileStore(ctx, path, kek, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

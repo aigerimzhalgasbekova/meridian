@@ -30,7 +30,8 @@ with signer services (idp), verifiers (every other service), and operators.
 | 1 | Forged token via `alg:none` / HS256 confusion / embedded `jwk` | Structurally impossible in the JOSE profile (ADR 0001); regression-tested per CVE class |
 | 2 | Stolen keystore file | AES-256-GCM envelope; useless without KEK |
 | 3 | Keystore record shuffling by attacker with file write | AAD mismatch → fails closed (tested) |
-| 3b | Lifecycle rewrite by attacker with file write (retired key flipped back to `active`, `created_at` backdated past the dwell) | AAD covers state, all four timestamps and the document generation (v2). A v1 document — whose lifecycle fields are unauthenticated — is accepted on read and rewritten at v2 on that same start, so the deployed file self-upgrades with no operator step; a *retained* pre-upgrade copy stays replayable with forged lifecycle state until the document version is anchored outside the keystore (residual risk below). The generation stops an authentic record kept from while the key was active being spliced over its retired successor (tested) |
+| 3b | Lifecycle rewrite by attacker with file write (retired key flipped back to `active`, `created_at` backdated past the dwell) | AAD covers state, all four timestamps and the document generation (v2). A v1 document — whose lifecycle fields are unauthenticated — is accepted on read and rewritten at v2 on that same start, so the deployed file self-upgrades with no operator step; a *retained* pre-upgrade copy is replayable with forged lifecycle state only where no generation anchor is configured (see 3c; residual risk below). The generation stops an authentic record kept from while the key was active being spliced over its retired successor (tested) |
+| 3c | Whole-file rollback: an attacker with file write (or a bad restore) puts back an entire older keystore — internally consistent, opens cleanly, and in its v1 form carries forgeable lifecycle fields | Generation anchor (SSM parameter via `keystore.Anchor`, deployed by Terraform): the current generation is persisted outside the keystore after every write, and the store refuses to open a document below the anchored generation — or a missing file the anchor knows was written. Anchor advances strictly *after* the file is durable, so anchor failure can delay detection by one write but can never brick a legitimate store (tested) |
 | 4 | Signer-token holder mints long-lived tokens | `MaxTokenTTL` cap server-side; `exp`/`iat` are server-set, client-supplied values rejected |
 | 5 | Token survives its key's retirement | `MaxTokenTTL ≤ RetireAfter` enforced at construction |
 | 6 | Verifier cache poisoning window during rotation | `JWKSMaxAge ≤ PendingDwell/2` enforced; pending keys published before signing |
@@ -46,18 +47,18 @@ with signer services (idp), verifiers (every other service), and operators.
 - **LocalKEK master key lives in process memory and env/secret configuration.**
   Accepted for dev/single-node. Production: KMS-backed KEK (interface seam
   exists); memory-scraping adversaries are out of scope.
-- **Whole-file rollback of the keystore, including downgrade to version 1.** The
-  generation counter that binds a record to a particular write lives *in* the
-  document, so restoring an entire older file (record set plus its generation) is
-  internally consistent and opens. A version 1 document is the stronger form of
-  the same attack: its lifecycle fields sit outside the AEAD, so a retained
-  pre-upgrade copy can be replayed with `state` and the timestamps rewritten, and
-  the upgrade-on-open would then re-seal the forged lifecycle as a valid v2
-  record. Both need the same fix — an anchor outside the keystore (current
-  generation and minimum document version in an SSM parameter, or the KMS
-  encryption context once the KMS KEK lands) and a refusal to open below it.
-  Gating v1 acceptance on an operator-set variable was tried and removed: it did
-  not close the window (nothing forces the variable back off) and it gave the
+- **Whole-file rollback where no generation anchor is configured** (row 3c).
+  Detection exists only when `KEYSMITH_GENERATION_ANCHOR` points at an SSM
+  parameter; without it (dev, or any deployment that skips the wiring) the
+  generation counter lives *in* the document and restoring an entire older file
+  — including a retained v1 copy with rewritten lifecycle fields, which the
+  upgrade-on-open would re-seal as valid v2 — is internally consistent and
+  opens. The deployed Terraform wires the anchor unconditionally; the residual
+  is the unanchored configuration itself, plus an adversary who can write both
+  the keystore *and* the SSM parameter (that requires the task role or IAM
+  access, a different compromise class than EFS file write). Gating v1
+  acceptance on an operator-set variable was tried and removed: it did not
+  close the window (nothing forces the variable back off) and it gave the
   upgrade deploy a way to brick the platform's only signer.
 - **The v1 → v2 keystore upgrade is one-way.** keysmithd rewrites the store at
   v2 on the first start that reads a v1 document, and builds from before v2

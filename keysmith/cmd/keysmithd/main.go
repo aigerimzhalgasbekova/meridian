@@ -7,6 +7,11 @@
 //	KEYSMITH_MASTER_KEY      base64 (std) 32-byte KEK master key. REQUIRED unless
 //	                         KEYSMITH_DEV_MODE=1, which generates an ephemeral
 //	                         in-memory store (keys lost on exit — dev only).
+//	KEYSMITH_GENERATION_ANCHOR  SSM parameter name holding the keystore's
+//	                         current generation. When set, the store refuses to
+//	                         open a keystore rolled back below the anchored
+//	                         generation (whole-file rollback detection). Unset:
+//	                         detection off — dev only.
 //	KEYSMITH_SIGNER_TOKENS   comma-separated bearer tokens for the sign API
 //	KEYSMITH_ADMIN_TOKENS    comma-separated bearer tokens for the admin API
 //	KEYSMITH_ALGS            comma-separated algorithms (default EdDSA,RS256)
@@ -29,6 +34,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 
 	"github.com/aikazzh/portfolio/keysmith/jose"
 	"github.com/aikazzh/portfolio/keysmith/keystore"
@@ -121,7 +129,17 @@ func run(logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-		fs, err := keystore.OpenFileStore(ctx, env("KEYSMITH_STORE_PATH", "./keysmith-keys.json"), kek)
+		var anchor keystore.Anchor
+		if name := os.Getenv("KEYSMITH_GENERATION_ANCHOR"); name != "" {
+			awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
+			if err != nil {
+				return fmt.Errorf("KEYSMITH_GENERATION_ANCHOR: load AWS config: %w", err)
+			}
+			anchor = keystore.NewSSMAnchor(ssm.NewFromConfig(awsCfg), name)
+		} else {
+			logger.Warn("KEYSMITH_GENERATION_ANCHOR unset: keystore rollback detection disabled")
+		}
+		fs, err := keystore.OpenFileStore(ctx, env("KEYSMITH_STORE_PATH", "./keysmith-keys.json"), kek, anchor)
 		if err != nil {
 			return err
 		}

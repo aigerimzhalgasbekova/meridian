@@ -14,3 +14,8 @@ output "dns_name" {
   description = "Cloud Map name inside the VPC (append the namespace)."
   value       = aws_service_discovery_service.this.name
 }
+
+output "task_role_name" {
+  description = "Task role, for attaching service-specific runtime policies in the composition."
+  value       = aws_iam_role.task.name
+}

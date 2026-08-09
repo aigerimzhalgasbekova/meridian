@@ -290,6 +290,11 @@ module "keysmith" {
   env = {
     KEYSMITH_ADDR       = ":8081"
     KEYSMITH_STORE_PATH = "/data/keys.json"
+    # Generation anchor: keysmithd refuses a keystore rolled back below the
+    # generation recorded here, so restoring an older /data/keys.json (or an
+    # attacker with EFS write access replaying a retained copy) is a startup
+    # failure instead of a silent key-state downgrade.
+    KEYSMITH_GENERATION_ANCHOR = aws_ssm_parameter.keysmith_generation.name
   }
   # ONE-WAY DEPLOY: the first v2 keysmith to start rewrites /data/keys.json at
   # document version 2, and a pre-v2 image refuses to open it ("understands
@@ -329,6 +334,34 @@ module "keysmith" {
   assign_public_ip               = local.common.assign_public_ip
   service_discovery_namespace_id = local.common.service_discovery_namespace_id
   region                         = local.common.region
+}
+
+# Keystore generation anchor. Unlike the SecureString secrets (created
+# out-of-band by the runbook), Terraform owns this parameter: it is not a
+# secret, and seeding it at 0 lets a fresh environment initialize. keysmithd
+# overwrites the value on every keystore write, hence ignore_changes.
+resource "aws_ssm_parameter" "keysmith_generation" {
+  name  = "/meridian/${var.environment}/keysmith/generation"
+  type  = "String"
+  value = "0"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_iam_role_policy" "keysmith_generation_anchor" {
+  name = "generation-anchor"
+  role = module.keysmith.task_role_name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameter", "ssm:PutParameter"]
+      Resource = aws_ssm_parameter.keysmith_generation.arn
+    }]
+  })
 }
 
 # idp — public OAuth2/OIDC authorization server.
