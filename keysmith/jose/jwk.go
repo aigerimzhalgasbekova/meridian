@@ -82,25 +82,18 @@ func (j JWK) PublicKey() (VerificationKey, error) {
 	if j.Kid == "" {
 		return VerificationKey{}, errors.New("jose: JWK has no kid")
 	}
-	alg := Algorithm(j.Alg)
-	if err := alg.check(); err != nil {
-		return VerificationKey{}, err
-	}
 	var pub crypto.PublicKey
+	var alg Algorithm
 	switch {
 	case j.Kty == "OKP" && j.Crv == "Ed25519":
-		if alg != AlgEdDSA {
-			return VerificationKey{}, fmt.Errorf("%w: OKP key with alg %q", ErrAlgMismatch, j.Alg)
-		}
+		alg = AlgEdDSA
 		x, err := b64.DecodeString(j.X)
 		if err != nil || len(x) != ed25519.PublicKeySize {
 			return VerificationKey{}, errors.New("jose: invalid Ed25519 x coordinate")
 		}
 		pub = ed25519.PublicKey(x)
 	case j.Kty == "EC" && j.Crv == "P-256":
-		if alg != AlgES256 {
-			return VerificationKey{}, fmt.Errorf("%w: EC key with alg %q", ErrAlgMismatch, j.Alg)
-		}
+		alg = AlgES256
 		xb, err1 := b64.DecodeString(j.X)
 		yb, err2 := b64.DecodeString(j.Y)
 		if err1 != nil || err2 != nil {
@@ -113,9 +106,7 @@ func (j JWK) PublicKey() (VerificationKey, error) {
 		}
 		pub = &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
 	case j.Kty == "RSA":
-		if alg != AlgRS256 {
-			return VerificationKey{}, fmt.Errorf("%w: RSA key with alg %q", ErrAlgMismatch, j.Alg)
-		}
+		alg = AlgRS256
 		nb, err1 := b64.DecodeString(j.N)
 		eb, err2 := b64.DecodeString(j.E)
 		if err1 != nil || err2 != nil {
@@ -132,6 +123,14 @@ func (j JWK) PublicKey() (VerificationKey, error) {
 		pub = &rsa.PublicKey{N: n, E: int(e.Int64())}
 	default:
 		return VerificationKey{}, fmt.Errorf("jose: unsupported kty/crv %q/%q", j.Kty, j.Crv)
+	}
+	// RFC 7517 makes `alg` optional, and real providers (Microsoft Entra ID)
+	// omit it — so the key type, not the JWK's alg member, fixes the algorithm
+	// here. This package binds exactly one alg per kty/crv, matching its stance
+	// that the key set (never the token) decides the algorithm. When alg *is*
+	// present it must agree, or the JWK is self-contradictory (kty=RSA, alg=ES256).
+	if j.Alg != "" && Algorithm(j.Alg) != alg {
+		return VerificationKey{}, fmt.Errorf("%w: %s key with alg %q", ErrAlgMismatch, j.Kty, j.Alg)
 	}
 	return VerificationKey{ID: j.Kid, Alg: alg, Public: pub}, nil
 }
@@ -170,6 +169,7 @@ func ParseJWKS(doc []byte) (*KeySet, error) {
 		return nil, fmt.Errorf("jose: parse JWKS: %w", err)
 	}
 	keys := make([]VerificationKey, 0, len(set.Keys))
+	seen := make(map[string]bool, len(set.Keys))
 	var rejected int
 	var firstErr error
 	for _, j := range set.Keys {
@@ -181,6 +181,18 @@ func ParseJWKS(doc []byte) (*KeySet, error) {
 			}
 			continue
 		}
+		// RFC 7517 §4.5 only says kid SHOULD be distinct, so a JWKS we do not
+		// control may repeat one. Skip the duplicate (first-seen wins) under the
+		// same skip-don't-fail contract as an unusable key, rather than letting
+		// NewKeySet reject the whole set — which would fail every login closed.
+		if seen[k.ID] {
+			rejected++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("jose: JWKS key %q: duplicate kid", k.ID)
+			}
+			continue
+		}
+		seen[k.ID] = true
 		keys = append(keys, k)
 	}
 	if len(keys) == 0 && rejected > 0 {

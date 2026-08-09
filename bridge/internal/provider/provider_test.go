@@ -342,6 +342,39 @@ func TestJWKSStaleTolerance(t *testing.T) {
 	})
 }
 
+func TestMetadataStaleTolerance(t *testing.T) {
+	s := fakeidp.New(clientID, clientSecret, alice)
+	defer s.Close()
+	ctx := context.Background()
+
+	clock := time.Now()
+	now := func() time.Time { return clock }
+	p := newProvider(t, s, WithClock(now),
+		WithBreaker(health.New(1000, time.Minute, now))) // keep breaker out of this test
+
+	if _, err := p.Metadata(ctx); err != nil {
+		t.Fatalf("prime the cache: %v", err)
+	}
+
+	t.Run("metadata survives upstream outage within the bound", func(t *testing.T) {
+		s.SetFailing(true)
+		defer s.SetFailing(false)
+		clock = clock.Add(time.Hour) // cache stale, discovery down, within 24h bound
+		if _, err := p.Metadata(ctx); err != nil {
+			t.Fatalf("stale metadata should still serve within the bound: %v", err)
+		}
+	})
+
+	t.Run("fails closed past the staleness bound", func(t *testing.T) {
+		s.SetFailing(true)
+		defer s.SetFailing(false)
+		clock = clock.Add(25 * time.Hour) // 26h past the prime, beyond metaStaleLimit
+		if _, err := p.Metadata(ctx); err == nil {
+			t.Fatal("stale metadata past the bound must fail closed, not keep leaking the client_secret")
+		}
+	})
+}
+
 func TestDiscoveryValidation(t *testing.T) {
 	s := fakeidp.New(clientID, clientSecret, alice)
 	defer s.Close()

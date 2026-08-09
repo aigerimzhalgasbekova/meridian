@@ -99,10 +99,17 @@ func TestParseJWKSRejectsBadKeys(t *testing.T) {
 		}
 	})
 
-	t.Run("duplicate kid", func(t *testing.T) {
+	t.Run("duplicate kid collapses, does not fail the set", func(t *testing.T) {
+		// RFC 7517 §4.5 only says kid SHOULD be distinct; a JWKS we do not
+		// control may repeat one. The duplicate is skipped (first-seen wins)
+		// rather than failing every login closed.
 		doc, _ := json.Marshal(JWKS{Keys: []JWK{good, good}})
-		if _, err := ParseJWKS(doc); err == nil {
-			t.Error("duplicate kid accepted")
+		set, err := ParseJWKS(doc)
+		if err != nil {
+			t.Fatalf("duplicate kid took the whole set down: %v", err)
+		}
+		if set.Len() != 1 {
+			t.Errorf("set has %d keys, want 1", set.Len())
 		}
 	})
 
@@ -130,7 +137,9 @@ func TestParseJWKSKeepsUsableKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	noAlg := good // RFC 7517 makes `alg` optional
+	// RFC 7517 makes `alg` optional and real providers (Entra ID) omit it: an
+	// alg-less key is usable, its algorithm fixed by kty/crv.
+	noAlg := good
 	noAlg.Kid, noAlg.Alg = "no-alg", ""
 	unsupported := good // e.g. an upstream rotating in P-384
 	unsupported.Kid, unsupported.Crv = "p384", "P-384"
@@ -143,20 +152,22 @@ func TestParseJWKSKeepsUsableKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("one unusable key discarded the whole set: %v", err)
 	}
-	if set.Len() != 1 {
-		t.Errorf("set has %d keys, want 1", set.Len())
+	if set.Len() != 2 {
+		t.Errorf("set has %d keys, want 2", set.Len())
 	}
-	if _, err := set.VerificationKey("good-1"); err != nil {
-		t.Errorf("usable key missing: %v", err)
-	}
-	for _, kid := range []string{"no-alg", "p384"} {
-		if _, err := set.VerificationKey(kid); err == nil {
-			t.Errorf("unusable key %q was accepted", kid)
+	for _, kid := range []string{"good-1", "no-alg"} {
+		if _, err := set.VerificationKey(kid); err != nil {
+			t.Errorf("usable key %q missing: %v", kid, err)
 		}
+	}
+	if _, err := set.VerificationKey("p384"); err == nil {
+		t.Error("unsupported key \"p384\" was accepted")
 	}
 
 	// Zero survivors is still an error: a genuinely broken provider must show.
-	doc, err = json.Marshal(JWKS{Keys: []JWK{noAlg, unsupported}})
+	other := unsupported
+	other.Kid = "p384-2"
+	doc, err = json.Marshal(JWKS{Keys: []JWK{unsupported, other}})
 	if err != nil {
 		t.Fatal(err)
 	}

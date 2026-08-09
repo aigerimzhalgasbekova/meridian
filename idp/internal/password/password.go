@@ -88,5 +88,5 @@ func NeedsRehash(encoded string, p Params) bool {
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &cur.MemoryKiB, &cur.Iterations, &cur.Parallelism); err != nil {
 		return true
 	}
-	return cur.MemoryKiB < p.MemoryKiB || cur.Iterations < p.Iterations
+	return cur.MemoryKiB < p.MemoryKiB || cur.Iterations < p.Iterations || cur.Parallelism < p.Parallelism
 }

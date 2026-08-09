@@ -143,6 +143,14 @@ var upstreamAlgs = []jose.Algorithm{jose.AlgRS256, jose.AlgES256}
 // because a key revoked after compromise must eventually stop verifying.
 const jwksStaleLimit = 24 * time.Hour
 
+// metaStaleLimit bounds how long cached discovery metadata may be served past
+// its freshness window when the discovery endpoint is unreachable. Mirrors
+// jwksStaleLimit: endpoints move rarely, so a login should survive a brief
+// outage — but unbounded, a token_endpoint hostname the upstream has since
+// decommissioned or re-registered would keep receiving the client_secret and
+// live authorization codes forever. Past the bound we fail closed.
+const metaStaleLimit = 24 * time.Hour
+
 const (
 	defaultMaxAge = 5 * time.Minute
 	maxBody       = 1 << 20
@@ -221,20 +229,21 @@ func (p *Provider) Breaker() *health.Breaker { return p.breaker }
 // Healthy reports whether the breaker currently admits calls.
 func (p *Provider) Healthy() bool { return p.breaker.State() != health.Open }
 
-// Metadata returns the discovery document, from cache when fresh. Stale
-// metadata is served on refresh failure (endpoints move rarely; a login that
-// can proceed on 10-minute-old endpoint URLs should).
+// Metadata returns the discovery document, from cache when fresh. On refresh
+// failure a stale document is served up to metaStaleLimit (endpoints move
+// rarely; a login that can proceed on hours-old endpoint URLs should), then we
+// fail closed rather than POST credentials to an endpoint that may have moved.
 func (p *Provider) Metadata(ctx context.Context) (*Metadata, error) {
 	p.mu.Lock()
 	fresh := p.meta != nil && p.now().Sub(p.metaFetched) < p.maxAgeOr(p.metaMaxAge)
-	meta := p.meta
+	meta, fetched := p.meta, p.metaFetched
 	p.mu.Unlock()
 	if fresh {
 		return meta, nil
 	}
 	if err := p.breaker.Do(func() error { return p.refreshMetadata(ctx) }); err != nil {
-		if meta != nil {
-			return meta, nil // stale beats broken
+		if meta != nil && p.now().Sub(fetched) < metaStaleLimit {
+			return meta, nil // bounded stale tolerance
 		}
 		return nil, err
 	}
